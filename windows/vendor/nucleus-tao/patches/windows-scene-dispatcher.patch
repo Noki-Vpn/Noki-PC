@@ -1,0 +1,84 @@
+--- a/decorated-window-tao/src/main/kotlin/dev/nucleusframework/window/tao/scene/TaoComposeSceneHostWindows.kt
++++ b/decorated-window-tao/src/main/kotlin/dev/nucleusframework/window/tao/scene/TaoComposeSceneHostWindows.kt
+@@ -47,7 +47,6 @@
+ import dev.nucleusframework.window.tao.popup.TaoPopupHostWindows
+ import dev.nucleusframework.window.tao.popup.TaoPopupSceneLayerWindows
+ import dev.nucleusframework.window.tao.releaseWindowsTextureImports
+-import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.SupervisorJob
+@@ -67,11 +66,9 @@
+ import org.jetbrains.skia.SurfaceColorFormat
+ import org.jetbrains.skia.SurfaceOrigin
+ import org.jetbrains.skia.makeGLWithInterface
+-import java.util.concurrent.ConcurrentLinkedQueue
+ import kotlin.coroutines.CoroutineContext
+ import kotlin.coroutines.EmptyCoroutineContext
+ import kotlin.time.Duration.Companion.milliseconds
+-import kotlin.coroutines.CoroutineContext as KCoroutineContext
+ 
+ /**
+  * Windows variant of [TaoComposeSceneHost]. Drives a Compose scene onto the
+@@ -193,7 +190,7 @@
+ 
+     /** Parent locals bridged via [setSceneCompositionLocalContext]; applied to the scene once created. */
+     private var pendingCompositionLocalContext: androidx.compose.runtime.CompositionLocalContext? = null
+-    private val flushingDispatcher = FlushingMainDispatcher()
++    private val flushingDispatcher = SceneMainDispatcher()
+ 
+     /**
+      * Scope for host-owned gesture work (trackpad-pinch idle-end debounce).
+@@ -1341,8 +1338,8 @@
+         // threshold, and the cadence stays flat.
+         //
+         // Bounded by the queue snapshot, so a self-redispatching continuation
+-        // cannot spin this thread — it just keeps requesting redraws, which
+-        // `dispatch` already did before this drain existed.
++        // cannot spin this thread — what it re-queues runs on the next
++        // off-frame drain (see SceneMainDispatcher).
+         flushingDispatcher.drain()
+ 
+         // Drain overlay/popup renderers. Cross-surface sync:
+@@ -1902,10 +1899,9 @@
+     }
+ 
+     // Hop the debounced semantics walk onto the render thread (it touches
+-    // Compose state) and request a redraw. See AbstractTaoComposeSceneHost.
++    // Compose state); it runs between frames. See AbstractTaoComposeSceneHost.
+     override fun dispatchA11yWalk(block: () -> Unit) {
+         flushingDispatcher.enqueue(Runnable { block() })
+-        window.requestRedraw()
+     }
+ 
+     /**
+@@ -2079,29 +2075,6 @@
+                 .AtomicInteger(0)
+     }
+ 
+-    private inner class FlushingMainDispatcher : CoroutineDispatcher() {
+-        private val queue = ConcurrentLinkedQueue<Runnable>()
+-
+-        override fun dispatch(
+-            context: KCoroutineContext,
+-            block: Runnable,
+-        ) {
+-            queue.add(block)
+-            window.requestRedraw()
+-        }
+-
+-        fun enqueue(block: Runnable) {
+-            queue.add(block)
+-        }
+-
+-        fun drain() {
+-            var remaining = queue.size
+-            while (remaining-- > 0) {
+-                val runnable = queue.poll() ?: break
+-                runnable.run()
+-            }
+-        }
+-    }
+ }
+ 
+ @OptIn(InternalComposeUiApi::class)

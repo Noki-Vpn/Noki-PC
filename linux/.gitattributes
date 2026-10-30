@@ -1,0 +1,5 @@
+src/main/resources/noki/vpn/geosite.dat binary
+packaging/linux/* text eol=lf
+scripts/build-linux.sh text eol=lf
+scripts/*linux*.py text eol=lf
+gradlew text eol=lf

@@ -1,0 +1,505 @@
+{
+  "reflection": [
+    {
+      "type": "com.sun.jna.platform.win32.WinDef$WORD",
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinBase$STARTUPINFO",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinBase$PROCESS_INFORMATION",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.SingBoxRuntime$ConsoleControlHandler",
+      "allPublicMethods": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinUser$HMONITOR",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinDef$BOOL",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinDef$DWORD",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinBase$FILETIME",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.IPHlpAPI$MIB_IFROW",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.IPHlpAPI",
+      "allPublicMethods": true
+    },
+    {
+      "type": {
+        "proxy": [
+          "com.sun.jna.platform.win32.IPHlpAPI"
+        ]
+      }
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Action",
+      "fields": [
+        {
+          "name": "key"
+        },
+        {
+          "name": "type"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Blob",
+      "fields": [
+        {
+          "name": "data"
+        },
+        {
+          "name": "size"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Condition",
+      "fields": [
+        {
+          "name": "key"
+        },
+        {
+          "name": "match"
+        },
+        {
+          "name": "value"
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Context",
+      "fields": [
+        {
+          "name": "key"
+        },
+        {
+          "name": "number"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Display",
+      "fields": [
+        {
+          "name": "description"
+        },
+        {
+          "name": "name"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Filter",
+      "fields": [
+        {
+          "name": "action"
+        },
+        {
+          "name": "conditionCount"
+        },
+        {
+          "name": "conditions"
+        },
+        {
+          "name": "context"
+        },
+        {
+          "name": "display"
+        },
+        {
+          "name": "effectiveWeight"
+        },
+        {
+          "name": "flags"
+        },
+        {
+          "name": "id"
+        },
+        {
+          "name": "key"
+        },
+        {
+          "name": "layer"
+        },
+        {
+          "name": "provider"
+        },
+        {
+          "name": "providerData"
+        },
+        {
+          "name": "reserved"
+        },
+        {
+          "name": "subLayer"
+        },
+        {
+          "name": "weight"
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$SubLayer",
+      "fields": [
+        {
+          "name": "display"
+        },
+        {
+          "name": "flags"
+        },
+        {
+          "name": "key"
+        },
+        {
+          "name": "provider"
+        },
+        {
+          "name": "providerData"
+        },
+        {
+          "name": "weight"
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$Value",
+      "fields": [
+        {
+          "name": "type"
+        },
+        {
+          "name": "value"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.noki.desktop.WindowsNetworkGuard$ValueUnion",
+      "fields": [
+        {
+          "name": "number"
+        },
+        {
+          "name": "pointer"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.Native",
+      "methods": [
+        {
+          "name": "dispose",
+          "parameterTypes": []
+        },
+        {
+          "name": "fromNative",
+          "parameterTypes": [
+            "com.sun.jna.FromNativeConverter",
+            "java.lang.Object",
+            "java.lang.reflect.Method"
+          ]
+        },
+        {
+          "name": "fromNative",
+          "parameterTypes": [
+            "java.lang.Class",
+            "java.lang.Object"
+          ]
+        },
+        {
+          "name": "fromNative",
+          "parameterTypes": [
+            "java.lang.reflect.Method",
+            "java.lang.Object"
+          ]
+        },
+        {
+          "name": "nativeType",
+          "parameterTypes": [
+            "java.lang.Class"
+          ]
+        },
+        {
+          "name": "toNative",
+          "parameterTypes": [
+            "com.sun.jna.ToNativeConverter",
+            "java.lang.Object"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.Union"
+    },
+    {
+      "type": "com.sun.jna.platform.win32.Guid$GUID",
+      "fields": [
+        {
+          "name": "Data1"
+        },
+        {
+          "name": "Data2"
+        },
+        {
+          "name": "Data3"
+        },
+        {
+          "name": "Data4"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "com.sun.jna.Pointer"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinCrypt$DATA_BLOB",
+      "fields": [
+        {
+          "name": "cbData"
+        },
+        {
+          "name": "pbData"
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinNT$HANDLEByReference",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinNT$PSID",
+      "fields": [
+        {
+          "name": "sid"
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinNT$PSID$ByReference",
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinNT$SID_AND_ATTRIBUTES",
+      "fields": [
+        {
+          "name": "Attributes"
+        },
+        {
+          "name": "Sid"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "com.sun.jna.Pointer"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinNT$TOKEN_USER",
+      "fields": [
+        {
+          "name": "User"
+        }
+      ]
+    },
+    {
+      "type": "com.sun.jna.win32.DLLCallback"
+    },
+    {
+      "type": {
+        "proxy": [
+          "com.noki.desktop.WindowsNetworkGuard$Wfp"
+        ]
+      }
+    },
+    {
+      "type": {
+        "proxy": [
+          "com.sun.jna.platform.win32.Crypt32"
+        ]
+      }
+    },
+    {
+      "type": {
+        "lambda": {
+          "declaringClass": "com.noki.desktop.DesktopTray",
+          "interfaces": [
+            "com.sun.jna.platform.win32.WinUser$WindowProc"
+          ]
+        }
+      }
+    },
+    {
+      "type": {
+        "proxy": [
+          "com.noki.desktop.WindowsNetworkGuard$Security"
+        ]
+      }
+    },
+    {
+      "type": {
+        "proxy": [
+          "com.noki.desktop.WindowsNetworkGuard$IpHelper"
+        ]
+      }
+    },
+    {
+      "type": "com.sun.jna.platform.win32.ShellAPI$SHELLEXECUTEINFO",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinUser$MONITORINFO",
+      "allDeclaredFields": true,
+      "allDeclaredMethods": true,
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinDef$POINT$ByValue",
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinDef$RECT",
+      "fields": [
+        {
+          "name": "left"
+        },
+        {
+          "name": "top"
+        },
+        {
+          "name": "right"
+        },
+        {
+          "name": "bottom"
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.WinDef$POINT",
+      "fields": [
+        {
+          "name": "x"
+        },
+        {
+          "name": "y"
+        }
+      ],
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.ShellAPI",
+      "fields": [
+        {
+          "name": "STRUCTURE_ALIGNMENT"
+        },
+        {
+          "name": "TYPE_MAPPER"
+        }
+      ]
+    },
+    {
+      "type": "com.noki.desktop.VelopackProgress",
+      "allDeclaredMethods": true
+    }
+  ]
+}

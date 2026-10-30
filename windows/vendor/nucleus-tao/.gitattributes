@@ -1,0 +1,4 @@
+*.jar binary
+patches/* text eol=lf
+# Empty context lines in a unified patch contain one required space.
+patches/*.patch whitespace=-blank-at-eol

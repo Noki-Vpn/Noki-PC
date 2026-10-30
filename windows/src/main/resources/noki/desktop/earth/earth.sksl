@@ -1,0 +1,115 @@
+uniform float2 viewport;
+uniform float3 eye;
+uniform float3 right;
+uniform float3 up;
+uniform float3 forward;
+uniform float3 light;
+uniform float lens;
+uniform float2 shift;
+uniform float2 atlasSize;
+uniform float heightRange;
+uniform float landLinear;
+uniform float oceanLinear;
+uniform float roughness;
+uniform float rimIor;
+uniform float4 atmosphere;
+uniform shader relief;
+
+float2 uv(float3 p) {
+    float3 n = normalize(p);
+    return float2(atan(n.y, n.x) / 6.28318530718 + 0.5,
+                  0.5 - asin(clamp(n.z, -1.0, 1.0)) / 3.14159265359);
+}
+
+float2 terrain(float3 p) {
+    half4 value = relief.eval(uv(p) * atlasSize);
+    return float2((float(value.r) * 65280.0 + float(value.g) * 255.0) / 65535.0 * heightRange,
+                  float(value.b));
+}
+
+float field(float3 p) { return length(p) - 1.0 - terrain(p).x; }
+
+half4 main(float2 pixel) {
+    float2 plane = float2(pixel.x - viewport.x * 0.5, viewport.y * 0.5 - pixel.y) / viewport.y + shift;
+    float3 ray = normalize(forward + (right * plane.x + up * plane.y) * (2.0 * lens));
+    float b = dot(eye, ray);
+    float3 closest = eye - ray * b;
+    float missDistance = length(closest);
+    // A thin shell follows the projected globe limb at every camera pose and zoom.
+    float shellDistance = max(missDistance - 1.0 - heightRange, 0.0);
+    float shellLight = 0.25 + 0.75 * max(dot(closest / max(missDistance, 0.0001), light), 0.0);
+    float haloAlpha = atmosphere.a * 0.12 * shellLight * exp(-shellDistance * shellDistance / 0.0018)
+        * (1.0 - smoothstep(0.10, 0.14, shellDistance));
+    half4 halo = half4(half3(atmosphere.rgb * haloAlpha), half(haloAlpha));
+    float pixelWidth = 2.0 * lens * length(eye) / viewport.y;
+    float outer = 1.0 + heightRange + pixelWidth;
+    float discriminant = b * b - dot(eye, eye) + outer * outer;
+    if (discriminant <= 0.0) return halo;
+    float footprint = pixelWidth / pow(1.0 + 4.0 * lens * lens * dot(plane, plane), 1.5);
+    float edgeRadius = 1.0;
+    float coverage = 1.0;
+    if (missDistance > 1.0 - footprint) {
+        edgeRadius += terrain(closest).x;
+        coverage = smoothstep(-0.75 * footprint, 0.75 * footprint, edgeRadius - missDistance);
+        if (coverage <= 0.0) return halo;
+    }
+    float start = -b - sqrt(discriminant);
+    float end = -b + sqrt(discriminant);
+    float base = b * b - dot(eye, eye) + 1.0;
+    if (base > 0.0) end = -b - sqrt(base) + 0.00005;
+    float t = max(start, 0.0);
+    bool hit = false;
+    // shortcut: Direct3D unrolls texture sampling; increase this budget only after profiling cold compilation.
+    for (int i = 0; i < 16; i++) {
+        float d = field(eye + ray * t);
+        if (d < 0.00002) { hit = true; break; }
+        t += max(d * 0.25, 0.00002);
+        if (t > end) break;
+    }
+    // Grazing rays may exhaust the march; the outer/base sphere interval still brackets the surface.
+    if (!hit && base > 0.0) {
+        float low = max(start, 0.0);
+        float high = end;
+        for (int i = 0; i < 16; i++) {
+            float middle = (low + high) * 0.5;
+            if (field(eye + ray * middle) > 0.0) low = middle; else high = middle;
+        }
+        t = high;
+        hit = true;
+    }
+    // Tangent coverage also fills grazing terrain gaps left by the bounded ray solver.
+    float3 p = hit ? eye + ray * t : closest * (edgeRadius / missDistance);
+    // Match the footprint at overview scale while retaining close-up terrain gradients.
+    float e = max(1.57079632679 / atlasSize.x, 1.2 * lens * t / viewport.y);
+    float3 normal = normalize(float3(
+        field(p + float3(e, 0.0, 0.0)) - field(p - float3(e, 0.0, 0.0)),
+        field(p + float3(0.0, e, 0.0)) - field(p - float3(0.0, e, 0.0)),
+        field(p + float3(0.0, 0.0, e)) - field(p - float3(0.0, 0.0, e))));
+    float land = terrain(p).y;
+    float diffuse = max(dot(normal, light), 0.0);
+    float visibility = 1.0;
+    if (land > 0.02 && diffuse > 0.0) {
+        // Local terrain occlusion under the small grazing key light.
+        float step = 0.0006;
+        for (int i = 0; i < 6; i++) {
+            visibility = min(visibility, clamp(20.0 * field(p + normal * 0.00008 + light * step) / step, 0.0, 1.0));
+            step *= 2.4;
+        }
+    }
+    // Broad fill keeps local terrain shadows from becoming black cutouts.
+    visibility = mix(0.45, 1.0, visibility);
+    // Match the master's separate matte ocean without the land's grazing-light gain.
+    float material = mix(oceanLinear * 0.25, landLinear, land);
+    float specular = pow(max(dot(reflect(-light, normal), -ray), 0.0), 4.0 / (roughness * roughness)) * 0.028 * land * visibility;
+    float f0 = (rimIor - 1.0) / (rimIor + 1.0);
+    f0 *= f0;
+    float fresnel = f0 + (1.0 - f0) * pow(1.0 - max(dot(normalize(p), -ray), 0.0), 5.0);
+    float rim = 1.1 * pow(fresnel, 2.5) * max(dot(normalize(p), light), 0.0);
+    float linear = material * (mix(0.025, 0.20, land) + 3.5 * diffuse * visibility) + specular + rim;
+    // Linear lighting with a soft highlight shoulder; Cycles/AgX are offline master references.
+    linear *= 1.10957; // Master exposure +0.15 EV.
+    linear /= 1.0 + linear;
+    // The existing untagged Skiko window expects display sRGB values.
+    float gray = linear <= 0.0031308 ? 12.92 * linear : 1.055 * pow(linear, 1.0 / 2.4) - 0.055;
+    return half4(half3(gray * coverage), half(coverage)) + halo * half(1.0 - coverage);
+}

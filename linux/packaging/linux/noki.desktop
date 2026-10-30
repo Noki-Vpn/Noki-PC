@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Noki VPN
+Comment=VPN client
+Exec=noki
+Icon=noki
+Terminal=false
+Categories=Network;Security;
+StartupWMClass=tech.ykino.noki

@@ -1,0 +1,69 @@
+{
+  "can_connect": true,
+  "profile_code": "auto",
+  "location_code": "lv",
+  "location_name": "Latvia",
+  "endpoint_code": "lv-nokinv",
+  "entry_host": "8.8.8.8",
+  "connect_ip": "8.8.8.8",
+  "entry_port": 20000,
+  "server_name": "lv.example.com",
+  "proxy_type": "nokinv",
+  "transport": "nokinv",
+  "security": "tls",
+  "nokinv_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "nokinv_credential_generation": 2,
+  "fingerprint": "chrome",
+  "path": "/tunnel",
+  "vpn_username": "test-user",
+  "vpn_secret": "00000000-0000-0000-0000-000000000099",
+  "dns_mode": "node",
+  "ad_block_included": false,
+  "ad_block_active": false,
+  "dedicated_ip_included": false,
+  "dedicated_ip_active": false,
+  "route_mode": "multihop",
+  "multihop": {
+    "version": 2,
+    "selection": {
+      "version": 2,
+      "entry": {"kind": "node", "node_id": "00000000-0000-0000-0000-000000000001"},
+      "exit": {"kind": "node", "node_id": "00000000-0000-0000-0000-000000000002"},
+      "excluded_pairs": []
+    },
+    "entry_node_id": "00000000-0000-0000-0000-000000000001",
+    "exit_node_id": "00000000-0000-0000-0000-000000000002",
+    "entry_ip": "8.8.8.8",
+    "policy_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "youtube_cascade": {
+    "host": "9.9.9.9", "port": 443,
+    "uuid": "00000000-0000-0000-0000-000000000077",
+    "server_name": "youtube.example.com", "public_key": "cascade-key",
+    "short_id": "ff", "fingerprint": "chrome", "flow": ""
+  },
+  "endpoint_candidates": [
+    {
+      "code": "lv-nokinv", "node_id": "00000000-0000-0000-0000-000000000002",
+      "label": "NokiNV", "location_code": "lv", "location_name": "Latvia",
+      "entry_host": "8.8.8.8", "connect_ip": "8.8.8.8", "entry_port": 20000,
+      "server_name": "lv.example.com", "proxy_type": "nokinv", "transport": "nokinv",
+      "security": "tls", "path": "/tunnel"
+    },
+    {
+      "code": "lv-reality-xhttp", "node_id": "00000000-0000-0000-0000-000000000002",
+      "label": "Reality XHTTP", "location_code": "lv", "location_name": "Latvia",
+      "entry_host": "8.8.8.8", "connect_ip": "8.8.8.8", "entry_port": 20002,
+      "server_name": "lv.example.com", "proxy_type": "vless", "transport": "xhttp",
+      "transport_mode": "stream-up", "security": "reality", "fingerprint": "chrome",
+      "public_key": "exit-public-key", "short_id": "abcd", "path": "/noki"
+    },
+    {
+      "code": "lv-hysteria", "node_id": "00000000-0000-0000-0000-000000000002",
+      "label": "Hysteria", "location_code": "lv", "location_name": "Latvia",
+      "entry_host": "8.8.8.8", "connect_ip": "8.8.8.8", "entry_port": 20003,
+      "server_name": "lv.example.com", "proxy_type": "hysteria", "transport": "hysteria",
+      "security": "tls", "alpn": "h3"
+    }
+  ]
+}

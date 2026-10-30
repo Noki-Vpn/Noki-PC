@@ -1,0 +1,129 @@
+{
+  "schema": 1,
+  "purpose": "live 3D heightfield runtime",
+  "masterSha256": "72d7b0f20636b7b7fdb6dbe36b670920c7bd23079463600dd06b37f468806a4a",
+  "blender": "5.1.2",
+  "atlas": {
+    "file": "relief.png",
+    "sha256": "29c6030106d8b84845ebd05b1dab44150135b5353aa222a0c36e56888b591412",
+    "width": 8192,
+    "height": 4096,
+    "heightRange": 0.016,
+    "encoding": "RG uint16 big-endian radial displacement / heightRange; B coast; A 255",
+    "sampling": "cubic B-spline source sampling; bilinear runtime",
+    "uv": "u=(longitude+180)/360; v=(latitude+90)/180; PNG rows north to south; Blender XYZ"
+  },
+  "elevationSource": {
+    "name": "NOAA ETOPO 2022 v1 global ice-surface elevation",
+    "source": "https://www.ngdc.noaa.gov/mgg/global/relief/ETOPO2022/data/60s/60s_surface_elev_gtif/ETOPO_2022_v1_60s_N90W180_surface.tif",
+    "sourceFile": "ETOPO_2022_v1_60s_N90W180_surface.tif",
+    "sourceSha256": "9d27d4b8ea8e76977e2988bca667d7c8fa68b927355feffcddd6b4875a7fd08e",
+    "arraySha256": "ad6d139fab9238d8c09b1fccea3c1554eda7ffe257a7b0ccb5ca3fe3ea57e3e9",
+    "size": [
+      21600,
+      10800
+    ],
+    "arcSeconds": 60,
+    "encoding": "float32 metres, cell-centred EPSG:4326; rows north to south; longitude -180 to 180"
+  },
+  "sourceImages": [
+    {
+      "name": "Solar System Scope — inverted specular coast mask",
+      "sha256": "6de0f98ddd45d54d314d6fbaffdf139207baca7a8fa6a35dd2ba09ce03d667c3",
+      "size": [
+        8192,
+        4096
+      ]
+    },
+    {
+      "name": "ETOPO 2022 continuous raw elevation — visible hemisphere",
+      "sha256": "ae3b807eda695031d77c169a0742d04d19e2c0a59d4e10a869880dea5559fada",
+      "size": [
+        5400,
+        4500
+      ]
+    }
+  ],
+  "heightProfile": "1000*(max(raw_metres,0)/1000)^0.78*8/6371000+coast*0.00035",
+  "cameras": {
+    "overview": {
+      "position": [
+        4.07183313369751,
+        0.7179740071296692,
+        1.504888653755188
+      ],
+      "right": [
+        -0.17364825308322906,
+        0.9848077893257141,
+        0.0
+      ],
+      "up": [
+        -0.33682411909103394,
+        -0.05939126014709473,
+        0.9396926760673523
+      ],
+      "forward": [
+        -0.9254165887832642,
+        -0.163176029920578,
+        -0.3420201539993286
+      ],
+      "sensorFit": "VERTICAL",
+      "fovY": 0.5759586095809937,
+      "shift": [
+        0.08500000089406967,
+        0.02500000037252903
+      ]
+    },
+    "close": {
+      "position": [
+        1.6566524505615234,
+        1.0758426189422607,
+        1.2730143070220947
+      ],
+      "right": [
+        -0.544638991355896,
+        0.8386706113815308,
+        5.960464477539063e-08
+      ],
+      "up": [
+        -0.4543147385120392,
+        -0.2950354814529419,
+        0.8405665755271912
+      ],
+      "forward": [
+        -0.7049584984779358,
+        -0.457805335521698,
+        -0.54170823097229
+      ],
+      "sensorFit": "VERTICAL",
+      "fovY": 0.5759586095809937,
+      "shift": [
+        -0.41257089376449585,
+        0.49243855476379395
+      ]
+    }
+  },
+  "keyDirection": [
+    0.020278699696063995,
+    -0.712123453617096,
+    0.7017613649368286
+  ],
+  "material": {
+    "landLinear": 0.085,
+    "oceanLinear": 0.025,
+    "metallic": 0.14,
+    "roughness": 0.68,
+    "rimRadius": 1.002,
+    "rimIor": 1.06
+  },
+  "masterOutput": {
+    "transform": "AgX",
+    "look": "AgX - Medium High Contrast",
+    "exposure": 0.15000000596046448
+  },
+  "limits": [
+    "8K atlas resamples global ETOPO2022 60s; the unchanged packed Europe regional elevation is blended in its original area",
+    "Runtime lighting and local terrain shadows approximate the master; no Cycles or AgX equivalence",
+    "Amsterdam marker from the scene is not a backend node and is not exported"
+  ]
+}

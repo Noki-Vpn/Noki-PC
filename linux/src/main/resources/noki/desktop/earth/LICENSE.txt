@@ -1,0 +1,31 @@
+Earth runtime relief atlas
+
+Numeric elevations: NOAA ETOPO 2022, US federal environmental data.
+ETOPO 2022: NOAA National Centers for Environmental Information (2022),
+ETOPO 2022 15 Arc-Second Global Relief Model, DOI https://doi.org/10.25921/fd45-gt74
+SPDX: CC0-1.0. Metadata (verified 2026-10-12):
+https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=gov.noaa.ngdc.mgg.dem:etopo_2022
+Policy: https://www.ncei.noaa.gov/data-submission/data-licensing
+Global input: ETOPO_2022_v1_60s_N90W180_surface.tif, 60 arc-second ice-surface elevation.
+https://www.ngdc.noaa.gov/mgg/global/relief/ETOPO2022/data/60s/60s_surface_elev_gtif/ETOPO_2022_v1_60s_N90W180_surface.tif
+Changes: cubic B-spline resampling to 8192x4096, the original packed ETOPO 2022
+Europe region blended at its original extent, and the Noki master-scene numeric
+height profile. The source, converted float32 array and atlas SHA256 are in manifest.json.
+
+Coast mask: Solar System Scope / INOVE, CC BY 4.0.
+Source: https://www.solarsystemscope.com/textures/
+License: https://creativecommons.org/licenses/by/4.0/
+Changes: inverted specular mask, reduced to 2048x1024, combined with numeric
+height using the Noki master-scene height profile and artistic coast emboss.
+No endorsement by NOAA, INOVE or Solar System Scope is implied.
+
+The atlas supplies a numeric displaced 3D surface; it is not a rendered globe image.
+
+Country marker and outline geography: Natural Earth 1:50m Admin 0 map units 5.1.1, public domain.
+https://www.naturalearthdata.com/about/terms-of-use/
+https://naturalearth.s3.amazonaws.com/50m_cultural/ne_50m_admin_0_map_units.zip
+Changes: ISO country label coordinates and polygon rings, with height sampled from
+this atlas; shared map-unit edges cancelled and artificial dateline cuts stitched
+without replacing coast endpoints; outline edges densified to at most 0.5 degrees on the sphere.
+These are representative country points, not verified city or VPN-server coordinates.
+The source/atlas SHA256 and precision are recorded in countries.json.

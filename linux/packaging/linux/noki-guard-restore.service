@@ -1,0 +1,14 @@
+[Unit]
+Description=Restore Noki VPN network protection
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/noki/core-helper restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+--- a/decorated-window-tao/src/main/native/windows/nucleus_tao_gl.c
++++ b/decorated-window-tao/src/main/native/windows/nucleus_tao_gl.c
+@@ -77,6 +77,7 @@
+ static PFNEGLGETPLATFORMDISPLAYEXTPROC pEglGetPlatformDisplayEXT = NULL;
+ static PFNEGLGETDISPLAYPROC            pEglGetDisplay            = NULL;
+ static PFNEGLINITIALIZEPROC            pEglInitialize            = NULL;
++static PFNEGLTERMINATEPROC             pEglTerminate             = NULL;
+ static PFNEGLBINDAPIPROC               pEglBindAPI               = NULL;
+ static PFNEGLCHOOSECONFIGPROC          pEglChooseConfig          = NULL;
+ static PFNEGLCREATEWINDOWSURFACEPROC   pEglCreateWindowSurface   = NULL;
+@@ -104,6 +105,7 @@
+     pEglGetProcAddress      = (PFNEGLGETPROCADDRESSPROC)      GetProcAddress(sLibEGL, "eglGetProcAddress");
+     pEglGetDisplay          = (PFNEGLGETDISPLAYPROC)          GetProcAddress(sLibEGL, "eglGetDisplay");
+     pEglInitialize          = (PFNEGLINITIALIZEPROC)          GetProcAddress(sLibEGL, "eglInitialize");
++    pEglTerminate           = (PFNEGLTERMINATEPROC)           GetProcAddress(sLibEGL, "eglTerminate");
+     pEglBindAPI             = (PFNEGLBINDAPIPROC)             GetProcAddress(sLibEGL, "eglBindAPI");
+     pEglChooseConfig        = (PFNEGLCHOOSECONFIGPROC)        GetProcAddress(sLibEGL, "eglChooseConfig");
+     pEglCreateWindowSurface = (PFNEGLCREATEWINDOWSURFACEPROC) GetProcAddress(sLibEGL, "eglCreateWindowSurface");
+@@ -134,7 +136,7 @@
+         if (!pglDisable)    pglDisable    = (PFN_glDisable)    pEglGetProcAddress("glDisable");
+     }
+ 
+-    eglAvailable = (pEglInitialize && pEglChooseConfig && pEglCreateContext &&
++    eglAvailable = (pEglInitialize && pEglTerminate && pEglChooseConfig && pEglCreateContext &&
+                     pEglCreateWindowSurface && pEglMakeCurrent && pEglSwapBuffers &&
+                     pEglDestroyContext && pEglDestroySurface);
+ }
+@@ -549,8 +551,8 @@
+     if (!att) return;
+ 
+     HWND hostHwnd = att->hwnd;
+-    /* The EGLDisplay is process-wide (shared with overlays); never
+-     * eglTerminate it here — just drop this window's context + surface. */
++    EGLDisplay display = att->eglDisplay;
++    /* The display is shared: keep it while any window or headless owner lives. */
+     pEglMakeCurrent(att->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+     pEglDestroyContext(att->eglDisplay, att->eglContext);
+     pEglDestroySurface(att->eglDisplay, att->eglSurface);
+@@ -561,6 +563,10 @@
+      * context (a DecoratedDialog detaching must not wipe the main
+      * window's). */
+     unregisterHostEgl(hostHwnd);
++    /* Release ANGLE/device caches after the last consumer; attach initializes again. */
++    if (!sHostEglList && sHeadlessEglContext == EGL_NO_CONTEXT) {
++        pEglTerminate(display);
++    }
+ }
+ 
+ JNIEXPORT void JNICALL

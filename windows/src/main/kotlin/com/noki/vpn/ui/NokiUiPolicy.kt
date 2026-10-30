@@ -1,0 +1,52 @@
+package com.noki.vpn.ui
+
+internal object NokiUiKitPolicy {
+    const val panelCornerRadiusDp = 24f
+    const val actionCornerRadiusDp = 18f
+    const val simpleSurfaceShadowAlpha = 0.08f
+    const val homeLocationHeightDp = 90f
+    const val homeLocationRadiusDp = 20f
+    const val homeLocationPaddingDp = 20f
+    const val homeLocationFlagSizeDp = 50f
+    const val homeServerItemHeightDp = 90f
+    const val homeServerItemFlagSizeDp = 50f
+    const val homeServerItemHorizontalPaddingDp = 20f
+    const val homeServerItemGapDp = 12f
+    const val homeServerItemNameTextSp = 20f
+    const val homeServerItemMetricTextSp = 16f
+    const val homeServerDropdownSheetBottomRadiusDp = 20f
+    const val homeServerDropdownSheetBlurDp = 14f
+    const val homeServerDropdownSheetBottomSpaceDp = 10f
+    const val homeServerDropdownSheetLensRadiusDp = 24f
+    const val homeServerDropdownSheetLensRefractionDp = 24f
+    const val homeServerDropdownSheetShadowBlurDp = 4f
+    const val homeServerDropdownSheetShadowOffsetYDp = 2f
+    const val homeServerDropdownSheetShadowAlpha = 0.20f
+    const val homeServerDropdownSheetSurfaceAlpha = 0.50f
+    const val homeServerDropdownHandleWidthDp = 185f
+    const val homeServerDropdownHandleHeightDp = 5f
+    const val homeServerDropdownHandleTouchHeightDp = 56f
+    const val homeServerDropdownHandleBottomPaddingDp = 20f
+    const val homeServerDropdownContentHandleGapDp = 24f
+    const val homeServerLazyItemSurfaceAlpha = 0.05f
+    const val homeMetricsHeightDp = 120f
+    const val homeMetricsColumnWidthDp = 174.1467f
+    const val homeMetricsColumnGapDp = 21f
+    const val homeMetricsRowHeightDp = 60f
+    const val homeMetricsRowRadiusDp = 15f
+    const val homeMetricsDividerInsetDp = 4.71f
+    const val homeQuickPillHeightDp = 48f
+    const val advancedProtocolToggleCardHeightDp = 70f
+    const val advancedManualProtocolCardHeightDp = 76f
+    const val settingsInlineActionHeightDp = 42f
+    const val planActionButtonHeightDp = 56f
+    const val advancedFilterOptionHeightDp = 50f
+    const val advancedFilterOptionGapDp = 10f
+    const val advancedFilterOptionRadiusDp = actionCornerRadiusDp
+    const val appFilterApplyBottomClearanceDp = 20f
+    const val appFilterContentBottomExtensionDp = 8f
+    const val settingsDialogGlassBlurRadiusDp = 16f
+    const val bottomProgressiveBlurRadiusDp = 16f
+    const val primaryNavigationContentGapDp = 14f
+    const val appFilterUsesSharedLiquidToggle = true
+}

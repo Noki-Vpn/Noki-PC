@@ -1,0 +1,7 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Noki PC client source code is licensed under the GNU General Public License,
+version 3 or (at your option) any later version. See COPYING for the full text.
+
+Third-party code, dependencies and assets retain their respective licenses.
+See vendor/sing-box/ and src/main/resources/licenses/.

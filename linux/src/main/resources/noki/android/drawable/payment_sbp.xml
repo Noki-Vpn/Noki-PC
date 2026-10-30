@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="21dp" android:height="24.5dp"
+    android:viewportWidth="42" android:viewportHeight="49">
+    <!-- Geometry and colors from site/public/assets/payment/sbp-logo.svg. -->
+    <path android:pathData="M12.1929 24.4954 5.86836 28.1832 0 38.4605l23.9386-13.9651H12.1929Z" android:fillColor="#874691" />
+    <path android:pathData="m30.263 13.9651-6.3246 3.6879-5.8683 10.2772 23.9296-13.9651H30.263Z" android:fillColor="#da1844" />
+    <path android:pathData="M23.9384 10.2773 18.0701 0v49l5.8683-10.2773V10.2773Z" android:fillColor="#f9b229" />
+    <path android:pathData="m18.0701 0 5.8683 10.2773 6.3246 3.6878h11.7367L18.0701 0Z" android:fillColor="#f07f1a" />
+    <path android:pathData="M18.0701 21.0696v27.9303l5.8683-10.2773v-7.3848l-5.8683-10.2682Z" android:fillColor="#72b22c" />
+    <path android:pathData="m30.263 35.0347-6.3246 3.6878-5.8683 10.2773 23.9296-13.9651H30.263Z" android:fillColor="#00743e" />
+    <path android:pathData="M0 10.5303v27.9302l5.86836-10.2772v-7.3758L0 10.5303Z" android:fillColor="#5f5a94" />
+    <path android:pathData="M18.0702 21.0697v.009L0 10.5303l5.86836 10.2772L30.2632 35.0348h11.7367L18.0702 21.0697Z" android:fillColor="#0d90cd" />
+</vector>

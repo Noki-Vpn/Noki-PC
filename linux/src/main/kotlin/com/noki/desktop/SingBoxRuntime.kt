@@ -47,7 +47,8 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 open class SingBoxRuntime(private val vault: WindowsVault,
-    private val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(3, TimeUnit.SECONDS).callTimeout(4, TimeUnit.SECONDS).build()) {
+    private val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(3, TimeUnit.SECONDS).callTimeout(4, TimeUnit.SECONDS).build(),
+    private val canRecoverRuntime: () -> Boolean = { !DesktopBuild.IS_LINUX && windowsCoreProcessesStopped() }) {
     data class Running(val pid: Int, val startedAt: Long, val controlPort: Int, val controlSecret: String, val probePort: Int, val label: String, val serverId: String? = null)
     internal class StartupFailure(message: String, cause: Throwable) : IOException(message, cause)
     internal class ProbeFailure(message: String, cause: Throwable) : IOException(message, cause)
@@ -129,11 +130,11 @@ open class SingBoxRuntime(private val vault: WindowsVault,
         }
     }
     @Volatile private var running: Running? = loadRunning()
-    private fun loadRunning(): Running? = vault.readEncrypted("runtime.dpapi")?.let {
+    private fun loadRunning(): Running? = vault.loadRuntimeRecord(canRecoverRuntime) { raw -> raw?.let {
         val json = JSONObject(it)
         Running(json.getInt("pid"), json.getLong("started_at"), json.getInt("control_port"),
             json.getString("control_secret"), json.getInt("probe_port"), json.getString("label"), json.optString("server_id").ifBlank { null })
-    }
+    } }
 
     open fun restored(): Running? = running?.takeIf(::matches)
         ?: loadRunning()?.takeIf(::matches)?.also { running = it }
@@ -432,6 +433,26 @@ open class SingBoxRuntime(private val vault: WindowsVault,
     private fun clearRecord() { running = null; Files.deleteIfExists(vault.directory.resolve("runtime.dpapi")) }
 
     companion object {
+        internal fun windowsCoreProcessesStopped(kernel: Kernel32 = Kernel32.INSTANCE): Boolean {
+            val snapshot = kernel.CreateToolhelp32Snapshot(com.sun.jna.platform.win32.Tlhelp32.TH32CS_SNAPPROCESS,
+                com.sun.jna.platform.win32.WinDef.DWORD(0))
+            if (snapshot == WinBase.INVALID_HANDLE_VALUE || snapshot == null)
+                throw com.sun.jna.platform.win32.Win32Exception(kernel.GetLastError())
+            try {
+                val process = com.sun.jna.platform.win32.Tlhelp32.PROCESSENTRY32()
+                var found = kernel.Process32First(snapshot, process)
+                while (found) {
+                    // An inaccessible or unrelated sing-box is also a reason to leave the record intact.
+                    if (com.sun.jna.Native.toString(process.szExeFile).equals("sing-box.exe", ignoreCase = true)) return false
+                    found = kernel.Process32Next(snapshot, process)
+                }
+                val error = kernel.GetLastError()
+                if (error != com.sun.jna.platform.win32.WinError.ERROR_NO_MORE_FILES)
+                    throw com.sun.jna.platform.win32.Win32Exception(error)
+                return true
+            } finally { kernel.CloseHandle(snapshot) }
+        }
+
         internal suspend fun <T> withGuardHelperProcess(timeoutMillis: Long = 20_000,
             launch: (WinNT.HANDLE) -> WinNT.HANDLE, accept: () -> T): T {
             val job = WindowsShell.createStartupJob()

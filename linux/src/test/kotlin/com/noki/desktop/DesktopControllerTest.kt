@@ -25,6 +25,47 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class DesktopControllerTest {
+    @Test fun `corrupt local caches do not block startup or change the selected route`() = runBlocking {
+        org.junit.Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-startup-caches").toAbsolutePath().normalize()
+        var app: DesktopController? = null
+        try {
+            val vault = WindowsVault(sandbox) { "smbios:startup-caches-fixture" }
+            val settings = vault.loadSettings().let { it.copy(advancedSettings = it.advancedSettings.copy(
+                protocol = VpnProtocol.REALITY, killSwitchEnabled = true, autoConnectOnLaunch = false)) }
+            vault.saveSettings(settings)
+            val rules = listOf(DesktopRoutingRule("fixture", "Work", false, domains = listOf("example.org")).normalized())
+            vault.saveRoutingRules(rules)
+            val originalSettings = Files.readAllBytes(sandbox.resolve("settings.dpapi"))
+            val originalSession = Files.readAllBytes(sandbox.resolve("session.dpapi"))
+            for (name in listOf("stats.dpapi", "account-local.dpapi", "endpoint-health.dpapi", "window.dpapi")) {
+                vault.writeEncrypted(name, "{")
+            }
+            Files.write(sandbox.resolve("runtime.dpapi"), ByteArray(64) { 42 })
+            app = DesktopController(vault, SingBoxRuntime(vault, canRecoverRuntime = { true }), networkSnapshot = {
+                WindowsNetworkSnapshot("fixture-offline", EndpointRankingPolicy.NetworkKind.OTHER, false, null)
+            })
+            val state = withTimeout(5_000) { app.state.first { !it.loading } }
+            assertEquals(settings, state.settings)
+            assertEquals(VpnProtocol.REALITY, state.settings.advancedSettings.protocol)
+            assertEquals(rules, state.routingRules.filter { it.id == "fixture" })
+            assertTrue(state.dailyStats.isEmpty())
+            assertFalse(state.running)
+            assertNull(app.loadWindowBounds())
+            app.saveWindowBounds(JSONObject().put("width", 960))
+            assertEquals(960, app.loadWindowBounds()!!.getInt("width"))
+            val backups = Files.newDirectoryStream(sandbox, "*.unreadable-*.bak").use { it.toList() }
+            assertEquals(5, backups.size)
+            assertArrayEquals(originalSession, Files.readAllBytes(sandbox.resolve("session.dpapi")))
+            assertArrayEquals(originalSettings, Files.readAllBytes(sandbox.resolve("settings.dpapi")))
+        } finally {
+            app?.closeAndJoin()
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
     @get:org.junit.Rule val mainDispatcher: org.junit.rules.TestRule = DesktopMainDispatcherRule()
 
     @Test fun `parallel authorized calls run together and share one refresh after simultaneous 401 responses`() = runBlocking {

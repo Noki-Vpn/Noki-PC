@@ -309,7 +309,10 @@ class DesktopController internal constructor(
     private var latencyMeasuredAt = 0L
     private var activeConnection = vault.readEncrypted("connection.dpapi")?.let(::JSONObject)
     private val endpointHealthLock = Any()
-    private var endpointHealth = EndpointHealthStore.decode(vault.readEncrypted("endpoint-health.dpapi"))
+    private var endpointHealth = vault.loadCache("endpoint-health.dpapi") { raw ->
+        raw?.let { org.json.JSONArray(it) }
+        EndpointHealthStore.decode(raw)
+    }
     private val watchdogJobs = mutableMapOf<Any, Job>()
     @Volatile private var connectionGeneration = 0L
     private var recoveryJob: Job? = null
@@ -374,6 +377,7 @@ class DesktopController internal constructor(
 
     init {
         recordLog("app_started", category = "app")
+        recordStorageRecovery()
         runCatching {
             Files.newDirectoryStream(vault.directory, "avatar-*.cache*").use { paths ->
                 for (path in paths) {
@@ -726,8 +730,13 @@ class DesktopController internal constructor(
     fun attachWindow(handle: Long?) {
         windowHandle = handle?.takeIf { it != 0L }?.let { com.sun.jna.Pointer(it) }
     }
-    internal fun loadWindowBounds(): JSONObject? = vault.readEncrypted("window.dpapi")?.let(::JSONObject)
+    internal fun loadWindowBounds(): JSONObject? = vault.loadCache("window.dpapi") { it?.let(::JSONObject) }.also { recordStorageRecovery() }
     internal fun saveWindowBounds(value: JSONObject) = vault.writeEncrypted("window.dpapi", value.toString())
+    private fun recordStorageRecovery() {
+        vault.takeRecoveredFiles().forEach { (name, error) ->
+            recordLog("local_storage_recovered:$name", error = true, cause = error, category = "app")
+        }
+    }
     private fun denyOwner() = reportMessage("Это действие доступно только владельцу аккаунта")
     private fun ownerAction(block: suspend () -> Unit) { if (state.value.invited) denyOwner() else action {
         check(!state.value.invited) { "owner_device_required" }

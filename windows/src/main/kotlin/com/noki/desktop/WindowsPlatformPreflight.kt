@@ -94,6 +94,8 @@ internal fun runWindowsPlatformPreflight() {
     check(ShellAPI.SHELLEXECUTEINFO().size() == 112)
     println("platform-preflight: process-admin=${WindowsShell.isAdministrator()}")
     println("platform-preflight: process=ok")
+    SingBoxRuntime.windowsCoreProcessesStopped()
+    println("platform-preflight: process-snapshot=ok")
 
     val startupJob = WindowsShell.createStartupJob()
     var child: com.sun.jna.platform.win32.WinNT.HANDLE? = null
@@ -134,6 +136,28 @@ internal fun runWindowsPlatformPreflight() {
     println("platform-preflight: network-read=ok")
     val plaintext = "Noki platform preflight".toByteArray()
     check(Crypt32Util.cryptUnprotectData(Crypt32Util.cryptProtectData(plaintext)).contentEquals(plaintext))
+    val storage = java.nio.file.Files.createTempDirectory("noki-vault-preflight").toAbsolutePath().normalize()
+    try {
+        val directory = storage.resolve("Desktop")
+        val vault = WindowsVault(directory) { "preflight-fixture" }
+        val settings = vault.loadSettings()
+        vault.saveSettings(settings)
+        val verifier = java.security.Signature.getInstance("SHA256withRSA")
+        verifier.initVerify(java.security.KeyFactory.getInstance("RSA").generatePublic(
+            java.security.spec.X509EncodedKeySpec(java.util.Base64.getDecoder().decode(vault.publicKey))))
+        verifier.update(plaintext)
+        check(verifier.verify(java.util.Base64.getDecoder().decode(vault.signChallenge(plaintext.toString(Charsets.UTF_8)))))
+        java.nio.file.Files.move(directory, storage.resolve("moved"))
+        java.nio.file.Files.move(storage.resolve("moved"), directory)
+        val restored = WindowsVault(directory) { "preflight-fixture" }
+        check(restored.publicKey == vault.publicKey && restored.deviceKey == vault.deviceKey)
+        check(restored.loadSettings() == settings)
+    } finally {
+        java.nio.file.Files.walk(storage).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+            check(it.toAbsolutePath().normalize().startsWith(storage)); java.nio.file.Files.delete(it)
+        } }
+    }
+    println("platform-preflight: vault-restore-rsa=ok")
     check(WindowsNetworkGuard.currentUserSid().startsWith("S-1-"))
     check(WindowsNetworkGuard.Filter().size() == 200)
     check(WindowsNetworkGuard.Condition().size() == 40)

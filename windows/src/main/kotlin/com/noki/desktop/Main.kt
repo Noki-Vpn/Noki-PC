@@ -89,7 +89,8 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
     val ownership = remember { runCatching { acquireDesktopOwnership() } }
     DisposableEffect(Unit) { onDispose { ownership.getOrNull()?.close() } }
     var controller by remember { mutableStateOf<Result<DesktopController>?>(null) }
-    LaunchedEffect(ownership) {
+    var startupAttempt by remember { mutableIntStateOf(0) }
+    LaunchedEffect(ownership, startupAttempt) {
         var created: DesktopController? = null
         try {
             controller = withContext(Dispatchers.IO) { ownership.mapCatching {
@@ -234,9 +235,9 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
             }
             val failure = if (controller?.isFailure == true) {
                 if (ownership.isFailure) ownership.exceptionOrNull()?.message ?: "Не удалось открыть папку приложения Windows"
-                else if (DesktopBuild.IS_LINUX) "Не удалось открыть хранилище Noki. Разблокируйте системную связку ключей Secret Service."
-                else "Не удалось открыть защищённое хранилище Windows. Данные не перезаписаны. Проверьте доступ к папке %LOCALAPPDATA%\\Noki\\Desktop."
+                else tr(state, "Не удалось запустить Noki", "Could not start Noki")
             } else null
+            val failureDetails = controller?.exceptionOrNull()?.let(::desktopStartupFailureDetails)
             val clipboard = remember(nativeWindow) { WindowsClipboard(com.sun.jna.Pointer(nativeWindow.nativeHandle)) }
             CompositionLocalProvider(androidx.compose.ui.platform.LocalClipboard provides clipboard,
                 androidx.compose.ui.platform.LocalClipboardManager provides clipboard) {
@@ -269,6 +270,9 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
                     DesktopUpdateUi(it) { updater.download() }
                 }) {
                     DesktopContent(state, app, failure, earthVisible = !minimized, reducedMotion = reducedMotion,
+                        failureDetails = failureDetails, onRetry = if (ownership.isSuccess) ({
+                            if (controller?.isFailure == true) { controller = null; startupAttempt++ }
+                        }) else null,
                         titlebar = { Spacer(Modifier.height(40.dp)) })
                 }
             }
@@ -354,6 +358,8 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
     initialPage: DesktopPage = DesktopPage.HOME,
     earthVisible: Boolean = true,
     reducedMotion: Boolean = false,
+    failureDetails: String? = null,
+    onRetry: (() -> Unit)? = null,
     titlebar: @Composable () -> Unit = { PcTitlebar() },
 ) {
     val backdrop = rememberLayerBackdrop()
@@ -368,7 +374,21 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
                     titlebar()
                     Box(Modifier.weight(1f).fillMaxWidth()) {
                         when {
-                            failure != null -> PcText(failure, Modifier.align(Alignment.Center).padding(30.dp), color = DesktopUiKit.Error)
+                            failure != null -> Column(Modifier.align(Alignment.Center).padding(30.dp).widthIn(max = 480.dp),
+                                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                PcText(failure, size = 20)
+                                PcText(tr(state, "Повторите попытку или отправьте сведения об ошибке в поддержку.",
+                                    "Try again or send the error details to support."), color = DesktopUiKit.Muted)
+                                onRetry?.let { PcButton(tr(state, "Повторить", "Try again"), Modifier.fillMaxWidth(), selected = true, onClick = it) }
+                                failureDetails?.let { details ->
+                                    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+                                    var copied by remember(details) { mutableStateOf(false) }
+                                    PcButton(tr(state, if (copied) "Скопировано" else "Копировать ошибку",
+                                        if (copied) "Copied" else "Copy error details"), Modifier.fillMaxWidth()) {
+                                        copied = runCatching { clipboard.setText(androidx.compose.ui.text.AnnotatedString(details)) }.isSuccess
+                                    }
+                                }
+                            }
                             app == null -> PcText("Открываем Noki Vpn…", Modifier.align(Alignment.Center), color = DesktopUiKit.Muted)
                             state.user == null -> DesktopLoginScreen(state, app)
                         }
@@ -383,6 +403,11 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
         }
     }
 }
+
+internal fun desktopStartupFailureDetails(error: Throwable): String =
+    DesktopDiagnostics.render(DesktopDiagnostics.entry("startup_failed", true, error, null, "startup")) +
+        generateSequence(error) { it.cause }.take(8).filterIsInstance<com.sun.jna.platform.win32.Win32Exception>()
+            .joinToString("") { "Windows error code: ${it.errorCode}\n" }
 
 @Composable internal fun DesktopGraphicsCache(earthNeeded: Boolean) {
     var cleanupPending by remember(earthNeeded) { mutableStateOf(true) }

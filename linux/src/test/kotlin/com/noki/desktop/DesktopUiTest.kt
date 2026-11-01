@@ -60,6 +60,67 @@ import javax.imageio.ImageIO
 
 class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun startupFailureProvidesSafeDetailsAndRetry() {
+        val secret = "private-value-must-not-be-copied"
+        val details = desktopStartupFailureDetails(IllegalStateException(secret, com.sun.jna.platform.win32.Win32Exception(13)))
+        assertTrue(details.contains("startup_failed"))
+        assertTrue(details.contains("Windows error code: 13"))
+        assertFalse(details.contains(secret))
+        var copied: androidx.compose.ui.text.AnnotatedString? = null
+        var clipboardBusy = true
+        val clipboard = object : androidx.compose.ui.platform.ClipboardManager {
+            override val nativeClipboard: Any get() = this
+            override fun getText() = copied
+            override fun setText(annotatedString: androidx.compose.ui.text.AnnotatedString) {
+                check(!clipboardBusy) { "clipboard_busy" }; copied = annotatedString
+            }
+            override fun getClip(): androidx.compose.ui.platform.ClipEntry? = null
+            override fun setClip(clipEntry: androidx.compose.ui.platform.ClipEntry?) = Unit
+        }
+        var failed by mutableStateOf(true)
+        var retries = 0
+        val scene = ImageComposeScene(1050, 674, density = Density(1f)) {
+            CompositionLocalProvider(androidx.compose.ui.platform.LocalClipboardManager provides clipboard) {
+                DesktopContent(DesktopState(), null, failure = if (failed) "Не удалось запустить Noki" else null,
+                    failureDetails = if (failed) details else null, onRetry = { retries++; failed = false })
+            }
+        }
+        fun descendants(node: SemanticsNode): Sequence<SemanticsNode> = sequence {
+            yield(node); for (child in node.children) yieldAll(descendants(child))
+        }
+        fun label(text: String) = scene.semanticsOwners.asSequence().flatMap { descendants(it.rootSemanticsNode) }
+            .firstOrNull { it.config.getOrNull(SemanticsProperties.Text)?.any { value -> value.text == text } == true }
+        fun render() { repeat(4) { scene.render().close() } }
+        fun click(text: String) {
+            val point = checkNotNull(label(text)).boundsInRoot.center
+            scene.sendPointerEvent(PointerEventType.Press, point, buttons = PointerButtons(isPrimaryPressed = true), button = PointerButton.Primary)
+            scene.sendPointerEvent(PointerEventType.Release, point, buttons = PointerButtons(), button = PointerButton.Primary)
+            render()
+        }
+        try {
+            render()
+            assertNotNull(label("Повторить"))
+            assertNotNull(label("Копировать ошибку"))
+            assertNull(copied)
+            val output = java.nio.file.Path.of("build/screenshots/startup-failure.png")
+            Files.createDirectories(output.parent)
+            scene.render().use { it.encodeToData(EncodedImageFormat.PNG)!!.use { data -> Files.write(output, data.bytes) } }
+            click("Копировать ошибку")
+            assertNull(copied)
+            assertNotNull(label("Копировать ошибку"))
+            clipboardBusy = false
+            click("Копировать ошибку")
+            assertEquals(details, copied?.text)
+            assertNotNull(label("Скопировано"))
+            click("Повторить")
+            assertEquals(1, retries)
+            assertNull(label("Копировать ошибку"))
+            assertNotNull(label("Открываем Noki Vpn…"))
+        } finally { scene.close() }
+    }
+
+
+    @OptIn(ExperimentalComposeUiApi::class)
     @Test fun externalAccountLinksUseTrailingVectorIcons() {
         val vault = WindowsVault(Files.createTempDirectory("noki-external-links"), hardwareIdentity = { "fixture" })
         val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))

@@ -26,7 +26,7 @@ class LinuxPlatformTest {
         assertThrows(Exception::class.java) { LinuxPlatform.crypt(first, ByteArray(32), false) }
         first[first.lastIndex] = (first.last().toInt() xor 1).toByte()
         assertThrows(Exception::class.java) { LinuxPlatform.crypt(first, key, false) }
-        assertThrows(IllegalArgumentException::class.java) { LinuxPlatform.crypt(byteArrayOf(1), key, false) }
+        assertThrows(javax.crypto.BadPaddingException::class.java) { LinuxPlatform.crypt(byteArrayOf(1), key, false) }
     }
 }
 

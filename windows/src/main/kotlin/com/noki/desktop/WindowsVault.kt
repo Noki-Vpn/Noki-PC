@@ -6,14 +6,22 @@ import com.sun.jna.Native
 import com.sun.jna.WString
 import com.sun.jna.platform.win32.Kernel32
 import com.sun.jna.platform.win32.WinNT
+import com.sun.jna.platform.win32.Win32Exception
+import com.sun.jna.platform.win32.WinError
 import com.sun.jna.ptr.IntByReference
 import com.sun.jna.ptr.PointerByReference
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import org.json.JSONException
+import java.io.EOFException
 import java.nio.file.Files
+import java.nio.file.AccessDeniedException
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
@@ -72,6 +80,9 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
     private val file = directory.resolve("session.dpapi")
     private val document: JSONObject
     private val challengeMutex = Mutex()
+    private val cacheLock = Any()
+    private val runtimeLock = runtimeLocks.computeIfAbsent(directory.toAbsolutePath().normalize()) { Any() }
+    private val recoveredFiles = linkedMapOf<String, Exception>()
     // Keep the existing namespace so dual-boot Windows/Linux identifies the same physical PC.
     private val hardwareDeviceKey = runCatching(hardwareIdentity).getOrNull()?.let { "dev_" + sha256("noki-windows-hardware-v1:$it") }
 
@@ -81,7 +92,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
         Files.createDirectories(directory.resolve("geosite"))
         Files.createDirectories(directory.resolve("geoip"))
         restrict(directory, inherit = true)
-        document = if (Files.exists(file)) {
+        document = if (!Files.notExists(file)) {
             restrict(file)
             JSONObject(unprotect(Files.readAllBytes(file)).toString(Charsets.UTF_8))
         } else {
@@ -153,17 +164,79 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
 
     fun writeEncrypted(name: String, value: String) {
         require(name.matches(Regex("[a-zA-Z0-9.-]+")))
+        if (name in CACHE_FILES) synchronized(cacheLock) { writeEncryptedFile(name, value) }
+        else if (name == "runtime.dpapi") synchronized(runtimeLock) { writeEncryptedFile(name, value) }
+        else writeEncryptedFile(name, value)
+    }
+
+    private fun writeEncryptedFile(name: String, value: String) {
         val target = directory.resolve(name)
-        val temporary = directory.resolve("$name.tmp")
-        Files.write(temporary, protect(value.toByteArray(Charsets.UTF_8)))
-        restrict(temporary)
-        Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        val temporary = Files.createTempFile(directory, "$name.", ".tmp")
+        try {
+            Files.write(temporary, protect(value.toByteArray(Charsets.UTF_8)))
+            restrict(temporary)
+            var retries = 0
+            while (true) try {
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                break
+            } catch (error: AccessDeniedException) {
+                // Windows can briefly deny replacement while another reader or replacement closes its handle.
+                if (DesktopBuild.IS_LINUX || retries++ == 3) throw error
+                Thread.sleep(25L * retries)
+            }
+        } finally { Files.deleteIfExists(temporary) }
     }
 
     fun readEncrypted(name: String): String? {
         require(name.matches(Regex("[a-zA-Z0-9.-]+")))
+        return if (name == "runtime.dpapi") synchronized(runtimeLock) { readEncryptedFile(name) }
+        else readEncryptedFile(name)
+    }
+
+    private fun readEncryptedFile(name: String): String? {
         val target = directory.resolve(name)
-        return if (Files.exists(target)) unprotect(Files.readAllBytes(target)).toString(Charsets.UTF_8) else null
+        val bytes = try { Files.readAllBytes(target) } catch (_: NoSuchFileException) { return null }
+        return unprotect(bytes).toString(Charsets.UTF_8)
+    }
+
+    internal fun <T> loadCache(name: String, decode: (String?) -> T): T = synchronized(cacheLock) {
+        require(name in CACHE_FILES)
+        val target = directory.resolve(name)
+        val bytes = try {
+            check(Files.readAttributes(target, BasicFileAttributes::class.java, NOFOLLOW_LINKS).isRegularFile) { "Invalid cache file" }
+            Files.newInputStream(target, NOFOLLOW_LINKS).use { it.readNBytes(MAX_CACHE_BYTES + 1) }
+        } catch (_: NoSuchFileException) { return@synchronized decode(null) }
+        try {
+            if (bytes.isEmpty() || bytes.size > MAX_CACHE_BYTES) throw EOFException("Invalid cache size")
+            decode(unprotect(bytes).toString(Charsets.UTF_8))
+        } catch (error: Exception) {
+            if (error !is EOFException && !invalidStoredData(error)) throw error
+            // Only disposable caches may be rebuilt; keep the encrypted original before allowing new writes.
+            preserveUnreadableFile(name, error)
+            decode(null)
+        }
+    }
+
+    internal fun <T> loadRuntimeRecord(canRecover: () -> Boolean, decode: (String?) -> T): T = synchronized(runtimeLock) {
+        try { decode(readEncrypted("runtime.dpapi")) }
+        catch (error: Exception) {
+            // A lost process identity is recoverable only after the runtime proves no core is running.
+            if (!invalidStoredData(error) || !canRecover()) throw error
+            synchronized(cacheLock) { preserveUnreadableFile("runtime.dpapi", error) }
+            decode(null)
+        }
+    }
+
+    private fun preserveUnreadableFile(name: String, error: Exception) {
+        val target = directory.resolve(name)
+        check(Files.readAttributes(target, BasicFileAttributes::class.java, NOFOLLOW_LINKS).isRegularFile) { "Invalid stored file" }
+        restrict(target)
+        Files.move(target, target.resolveSibling("$name.unreadable-${UUID.randomUUID()}.bak"), StandardCopyOption.ATOMIC_MOVE)
+        recoveredFiles[name] = error
+    }
+
+    internal fun takeRecoveredFiles(): Map<String, Exception> = synchronized(cacheLock) {
+        recoveredFiles.toMap().also { recoveredFiles.clear() }
     }
 
     private val settingsCodec = StoredSettingsCodec {
@@ -278,11 +351,11 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
     private fun saveDesktopPreference(key: String, enabled: Boolean) = writeEncrypted("settings.dpapi",
         JSONObject(readEncrypted("settings.dpapi") ?: settingsCodec.encode(loadSettings())).put(key, enabled)
             .also { it.remove("desktop_transparent_window") }.toString())
-    fun loadStats(): List<DailyStats> = DailyStatsStore.decode(readEncrypted("stats.dpapi")?.let(::JSONObject)?.optJSONArray("days")?.toString())
-    fun loadStatsCursor(): JSONObject? = readEncrypted("stats.dpapi")?.let(::JSONObject)?.optJSONObject("cursor")
+    fun loadStats(): List<DailyStats> = loadCache("stats.dpapi") { DailyStatsStore.decode(it?.let(::JSONObject)?.optJSONArray("days")?.toString()) }
+    fun loadStatsCursor(): JSONObject? = loadCache("stats.dpapi") { it?.let(::JSONObject)?.optJSONObject("cursor") }
     fun saveStats(stats: List<DailyStats>, cursor: JSONObject? = null) = writeEncrypted("stats.dpapi", JSONObject()
         .put("days", org.json.JSONArray(DailyStatsStore.encode(DailyStatsStore.prune(stats)))).put("cursor", cursor).toString())
-    fun loadAccountLocal(): JSONObject = readEncrypted("account-local.dpapi")?.let(::JSONObject) ?: JSONObject()
+    fun loadAccountLocal(): JSONObject = loadCache("account-local.dpapi") { it?.let(::JSONObject) ?: JSONObject() }
     fun saveAccountLocal(value: JSONObject) = writeEncrypted("account-local.dpapi", value.toString())
 
     fun wireGuardKeyPair(): Pair<ByteArray, String> {
@@ -312,17 +385,22 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
         val descriptor = PointerByReference()
         val sid = WindowsNetworkGuard.currentUserSid()
         val flags = if (inherit) "OICI" else ""
-        check(security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            WString("D:P(A;$flags;FA;;;$sid)"), 1, descriptor, IntByReference())) { "Private ACL: ${Native.getLastError()}" }
+        if (!security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            WString("D:P(A;$flags;FA;;;$sid)"), 1, descriptor, IntByReference())) throw Win32Exception(Native.getLastError())
         try {
-            check(security.SetFileSecurityW(WString(path.toAbsolutePath().toString()),
-                WinNT.DACL_SECURITY_INFORMATION or WinNT.PROTECTED_DACL_SECURITY_INFORMATION, checkNotNull(descriptor.value))) {
-                "Private ACL: ${Native.getLastError()}"
-            }
+            if (!security.SetFileSecurityW(WString(path.toAbsolutePath().toString()),
+                WinNT.DACL_SECURITY_INFORMATION or WinNT.PROTECTED_DACL_SECURITY_INFORMATION, checkNotNull(descriptor.value)))
+                throw Win32Exception(Native.getLastError())
         } finally { Kernel32.INSTANCE.LocalFree(descriptor.value) }
     }
 
     companion object {
+        private val runtimeLocks = java.util.concurrent.ConcurrentHashMap<Path, Any>()
+        private val CACHE_FILES = setOf("stats.dpapi", "account-local.dpapi", "endpoint-health.dpapi", "window.dpapi")
+        private const val MAX_CACHE_BYTES = 16 * 1024 * 1024
+        private fun invalidStoredData(error: Exception): Boolean = error is JSONException || error is javax.crypto.BadPaddingException ||
+            error is Win32Exception && error.errorCode in setOf(WinError.ERROR_INVALID_DATA, WinError.ERROR_INVALID_PARAMETER)
+
         internal fun windowsHardwareIdentity(): String? {
             val firmware = com.sun.jna.Function.getFunction("kernel32", "GetSystemFirmwareTable", com.sun.jna.Function.ALT_CONVENTION)
             val size = firmware.invokeInt(arrayOf(0x52534D42, 0, null, 0)) // 'RSMB'.

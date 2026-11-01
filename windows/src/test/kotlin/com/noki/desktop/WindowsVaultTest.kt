@@ -9,6 +9,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -19,6 +20,214 @@ import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 
 class WindowsVaultTest {
+    @Test fun `separate vault instances cannot collide while replacing encrypted records`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-vault-writers").toAbsolutePath().normalize()
+        val threads = java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val vaults = listOf(WindowsVault(sandbox), WindowsVault(sandbox))
+            val start = java.util.concurrent.CyclicBarrier(2)
+            val writers = vaults.mapIndexed { index, vault -> threads.submit {
+                start.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                repeat(40) { generation ->
+                    vault.writeEncrypted("runtime.dpapi", JSONObject().put("writer", index).put("generation", generation)
+                        .put("padding", "x".repeat(2000)).toString())
+                    val saved = JSONObject(vault.readEncrypted("runtime.dpapi")!!)
+                    assertTrue(saved.getInt("writer") in 0..1)
+                    assertEquals("x".repeat(2000), saved.getString("padding"))
+                }
+            } }
+            writers.forEach { it.get(15, java.util.concurrent.TimeUnit.SECONDS) }
+            assertEquals(39, JSONObject(vaults.first().readEncrypted("runtime.dpapi")!!).getInt("generation"))
+            assertTrue(Files.newDirectoryStream(sandbox, "*.tmp").use { it.none() })
+        } finally {
+            threads.shutdownNow()
+            assertTrue(threads.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS))
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `damaged disposable caches preserve encrypted originals and leave credentials and settings unchanged`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-cache-recovery").toAbsolutePath().normalize()
+        try {
+            val vault = WindowsVault(sandbox) { "smbios:cache-recovery-fixture" }
+            vault.saveTokens(BackendAuthTokens("fixture-access", "fixture-refresh"))
+            vault.saveSettings(vault.loadSettings())
+            vault.saveEarthDisabled(true)
+            val identity = Files.readAllBytes(sandbox.resolve("session.dpapi"))
+            val settings = Files.readAllBytes(sandbox.resolve("settings.dpapi"))
+            for (name in listOf("stats.dpapi", "account-local.dpapi", "endpoint-health.dpapi", "window.dpapi")) {
+                for (damage in listOf("json", "ciphertext", "empty", "oversized")) {
+                    val target = sandbox.resolve(name)
+                    vault.writeEncrypted(name, if (damage == "json") "{" else "{}")
+                    if (damage == "ciphertext") Files.write(target, ByteArray(64) { 42 })
+                    if (damage == "empty") Files.write(target, byteArrayOf())
+                    if (damage == "oversized") java.io.RandomAccessFile(target.toFile(), "rw").use { it.setLength(16L * 1024 * 1024 + 1) }
+                    val original = Files.readAllBytes(target)
+                    assertNull(vault.loadCache(name) { it?.let(::JSONObject) })
+                    assertFalse(Files.exists(target))
+                    val backups = Files.newDirectoryStream(sandbox, "$name.unreadable-*.bak").use { it.toList() }
+                    assertEquals(listOf("json", "ciphertext", "empty", "oversized").indexOf(damage) + 1, backups.size)
+                    assertTrue(backups.any { Files.readAllBytes(it).contentEquals(original) })
+                    backups.forEach { assertEquals("D:P(A;;FA;;;${WindowsNetworkGuard.currentUserSid()})", dacl(it)) }
+                    assertEquals(setOf(name), vault.takeRecoveredFiles().keys)
+                    assertNull(vault.loadCache(name) { it?.let(::JSONObject) })
+                    assertTrue(vault.takeRecoveredFiles().isEmpty())
+                    vault.writeEncrypted(name, "{\"restored\":true}")
+                    assertTrue(vault.loadCache(name) { it?.let(::JSONObject) }!!.getBoolean("restored"))
+                }
+            }
+            assertArrayEquals(identity, Files.readAllBytes(sandbox.resolve("session.dpapi")))
+            assertArrayEquals(settings, Files.readAllBytes(sandbox.resolve("settings.dpapi")))
+            assertEquals("fixture-access", WindowsVault(sandbox).loadTokens()?.accessToken)
+            assertTrue(WindowsVault(sandbox).loadEarthDisabled())
+        } finally {
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `critical profile failures are not treated as missing or recoverable caches`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-critical-storage").toAbsolutePath().normalize()
+        try {
+            val vault = WindowsVault(sandbox) { "smbios:critical-storage-fixture" }
+            for (name in listOf("settings.dpapi", "runtime.dpapi", "connection.dpapi", "guard.dpapi", "wireguard-key.dpapi")) {
+                val bytes = ByteArray(64) { 42 }
+                Files.write(sandbox.resolve(name), bytes)
+                assertThrows(com.sun.jna.platform.win32.Win32Exception::class.java) { vault.readEncrypted(name) }
+                assertThrows(IllegalArgumentException::class.java) { vault.loadCache(name) { it } }
+                assertArrayEquals(bytes, Files.readAllBytes(sandbox.resolve(name)))
+            }
+            val session = sandbox.resolve("session.dpapi")
+            val original = Files.readAllBytes(session)
+            Files.write(session, ByteArray(64) { 42 })
+            val unreadable = Files.readAllBytes(session)
+            assertThrows(com.sun.jna.platform.win32.Win32Exception::class.java) { WindowsVault(sandbox) }
+            assertArrayEquals(unreadable, Files.readAllBytes(session))
+            Files.write(session, original)
+            val cacheDirectory = Files.createDirectory(sandbox.resolve("stats.dpapi"))
+            Files.writeString(cacheDirectory.resolve("keep.txt"), "keep")
+            assertThrows(IllegalStateException::class.java) { vault.loadStats() }
+            assertEquals("keep", Files.readString(cacheDirectory.resolve("keep.txt")))
+            assertTrue(vault.takeRecoveredFiles().isEmpty())
+        } finally {
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `locked cache is not archived and a failed decode cannot hide an access error`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-locked-cache").toAbsolutePath().normalize()
+        try {
+            val vault = WindowsVault(sandbox)
+            vault.saveStats(emptyList())
+            val target = sandbox.resolve("stats.dpapi")
+            val original = Files.readAllBytes(target)
+            val kernel = com.sun.jna.platform.win32.Kernel32.INSTANCE
+            val handle = kernel.CreateFile(target.toString(), com.sun.jna.platform.win32.WinNT.GENERIC_READ,
+                0, null, com.sun.jna.platform.win32.WinNT.OPEN_EXISTING, 0, null)
+            assertNotEquals(com.sun.jna.platform.win32.WinBase.INVALID_HANDLE_VALUE, handle)
+            try { assertThrows(java.io.IOException::class.java) { vault.loadStats() } }
+            finally { kernel.CloseHandle(handle) }
+            assertThrows(com.sun.jna.platform.win32.Win32Exception::class.java) {
+                vault.loadCache("stats.dpapi") { throw com.sun.jna.platform.win32.Win32Exception(5) }
+            }
+            assertArrayEquals(original, Files.readAllBytes(target))
+            assertTrue(vault.takeRecoveredFiles().isEmpty())
+            vault.writeEncrypted("stats.dpapi", "{")
+            val broken = Files.readAllBytes(target)
+            val noDelete = kernel.CreateFile(target.toString(), com.sun.jna.platform.win32.WinNT.GENERIC_READ,
+                com.sun.jna.platform.win32.WinNT.FILE_SHARE_READ or com.sun.jna.platform.win32.WinNT.FILE_SHARE_WRITE,
+                null, com.sun.jna.platform.win32.WinNT.OPEN_EXISTING, 0, null)
+            assertNotEquals(com.sun.jna.platform.win32.WinBase.INVALID_HANDLE_VALUE, noDelete)
+            try { assertThrows(java.io.IOException::class.java) { vault.loadStats() } }
+            finally { kernel.CloseHandle(noDelete) }
+            assertArrayEquals(broken, Files.readAllBytes(target))
+            assertTrue(vault.takeRecoveredFiles().isEmpty())
+        } finally {
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `recovery cannot archive a concurrent healthy cache write`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-cache-write-race").toAbsolutePath().normalize()
+        val threads = java.util.concurrent.Executors.newFixedThreadPool(2)
+        val decoded = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        try {
+            val vault = WindowsVault(sandbox)
+            vault.writeEncrypted("stats.dpapi", "{")
+            val original = Files.readAllBytes(sandbox.resolve("stats.dpapi"))
+            val read = threads.submit<JSONObject?> {
+                vault.loadCache("stats.dpapi") { raw -> raw?.let {
+                    decoded.countDown()
+                    check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    JSONObject(it)
+                } }
+            }
+            assertTrue(decoded.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val writing = java.util.concurrent.CountDownLatch(1)
+            val write = threads.submit {
+                writing.countDown()
+                vault.writeEncrypted("stats.dpapi", "{\"healthy\":true}")
+            }
+            assertTrue(writing.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertThrows(java.util.concurrent.TimeoutException::class.java) { write.get(100, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            release.countDown()
+            assertNull(read.get(5, java.util.concurrent.TimeUnit.SECONDS))
+            write.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            assertTrue(vault.loadCache("stats.dpapi") { it?.let(::JSONObject) }!!.getBoolean("healthy"))
+            val backups = Files.newDirectoryStream(sandbox, "*.unreadable-*.bak").use { it.toList() }
+            assertEquals(1, backups.size)
+            assertArrayEquals(original, Files.readAllBytes(backups.single()))
+        } finally {
+            release.countDown()
+            threads.shutdownNow()
+            assertTrue(threads.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS))
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `restoring a moved vault preserves identity tokens and settings`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows"))
+        val sandbox = Files.createTempDirectory("noki-restored-vault").toAbsolutePath().normalize()
+        val directory = sandbox.resolve("Desktop")
+        val removed = sandbox.resolve("removed")
+        try {
+            val vault = WindowsVault(directory) { "smbios:fixture-restored" }
+            vault.saveTokens(BackendAuthTokens("fixture-access", "fixture-refresh"))
+            vault.saveSettings(vault.loadSettings())
+            vault.saveEarthDisabled(true)
+            val settings = vault.loadSettings()
+            val encryptedSession = Files.readAllBytes(directory.resolve("session.dpapi"))
+            Files.move(directory, removed)
+            Files.move(removed, directory)
+            val restored = WindowsVault(directory) { "smbios:fixture-restored" }
+            assertEquals(vault.publicKey, restored.publicKey)
+            assertEquals(vault.deviceKey, restored.deviceKey)
+            assertEquals(vault.loadTokens(), restored.loadTokens())
+            assertEquals(settings, restored.loadSettings())
+            assertTrue(restored.loadEarthDisabled())
+            assertArrayEquals(encryptedSession, Files.readAllBytes(directory.resolve("session.dpapi")))
+        } finally {
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
     @Test fun `automatic recovery defaults on and persists across unrelated preference saves`() {
         val directory = Files.createTempDirectory("noki-recovery-preference")
         try {

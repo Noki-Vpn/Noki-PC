@@ -72,7 +72,7 @@ def verify(arguments_file):
     handles = ('WinUser$HMONITOR', 'WinNT$HANDLE', 'WinDef$HWND', 'WinDef$HINSTANCE', 'WinDef$HMODULE',
                'WinDef$HICON', 'WinDef$HCURSOR', 'WinDef$HBRUSH', 'WinDef$ATOM', 'WinDef$WPARAM',
                'WinDef$LPARAM', 'WinDef$LRESULT', 'WinDef$BOOL', 'WinDef$WORD', 'WinDef$DWORD', 'WinReg$HKEY', 'WinNT$HRESULT',
-               'WinDef$POINT$ByValue')
+               'WinDef$POINT$ByValue', 'BaseTSD$ULONG_PTR', 'WinDef$LONG')
     for name in handles:
         registered = registrations(prefix + name)
         assert any(item.get('allDeclaredConstructors') or item.get('allPublicConstructors') or
@@ -86,6 +86,8 @@ def verify(arguments_file):
                               'dwXSize', 'dwYSize', 'dwXCountChars', 'dwYCountChars', 'dwFillAttribute',
                               'dwFlags', 'wShowWindow', 'cbReserved2', 'lpReserved2', 'hStdInput', 'hStdOutput', 'hStdError'},
         'WinBase$PROCESS_INFORMATION': {'hProcess', 'hThread', 'dwProcessId', 'dwThreadId'},
+        'Tlhelp32$PROCESSENTRY32': {'dwSize', 'cntUsage', 'th32ProcessID', 'th32DefaultHeapID', 'th32ModuleID',
+                                  'cntThreads', 'th32ParentProcessID', 'pcPriClassBase', 'dwFlags', 'szExeFile'},
         'IPHlpAPI$MIB_IFROW': {'wszName', 'dwIndex', 'dwType', 'dwMtu', 'dwSpeed', 'dwPhysAddrLen', 'bPhysAddr',
                              'dwAdminStatus', 'dwOperStatus', 'dwLastChange', 'dwInOctets', 'dwInUcastPkts',
                              'dwInNUcastPkts', 'dwInDiscards', 'dwInErrors', 'dwInUnknownProtos', 'dwOutOctets',

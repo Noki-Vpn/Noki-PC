@@ -26,6 +26,108 @@ import java.util.concurrent.TimeUnit
 import java.io.IOException
 
 class SingBoxRuntimeTest {
+    @Test fun `unreadable runtime record recovers only after confirmed core absence`() {
+        assumeWindows()
+        val sandbox = Files.createTempDirectory("noki-runtime-record").toAbsolutePath().normalize()
+        try {
+            val vault = WindowsVault(sandbox)
+            vault.saveTokens(com.noki.vpn.data.BackendAuthTokens("fixture-access", "fixture-refresh"))
+            vault.saveSettings(vault.loadSettings())
+            vault.writeEncrypted("guard.dpapi", "enabled")
+            vault.writeEncrypted("connection.dpapi", "{\"version\":3,\"user_id\":\"fixture\"}")
+            val untouched = listOf("session.dpapi", "settings.dpapi", "guard.dpapi", "connection.dpapi")
+                .associateWith { Files.readAllBytes(sandbox.resolve(it)) }
+            for ((index, failure) in listOf("ciphertext", "json", "empty").withIndex()) {
+                val path = sandbox.resolve("runtime.dpapi")
+                when (failure) {
+                    "ciphertext" -> Files.write(path, ByteArray(64) { 42 })
+                    "empty" -> Files.write(path, byteArrayOf())
+                    else -> vault.writeEncrypted("runtime.dpapi", "{")
+                }
+                val original = Files.readAllBytes(path)
+                var checks = 0
+                assertTrue(runCatching { SingBoxRuntime(vault, canRecoverRuntime = { checks++; false }) }.isFailure)
+                assertEquals(1, checks)
+                assertArrayEquals(original, Files.readAllBytes(path))
+                val denied = com.sun.jna.platform.win32.Win32Exception(5)
+                assertSame(denied, runCatching { SingBoxRuntime(vault, canRecoverRuntime = { throw denied }) }.exceptionOrNull())
+                assertArrayEquals(original, Files.readAllBytes(path))
+                assertTrue(vault.takeRecoveredFiles().isEmpty())
+                val runtime = SingBoxRuntime(vault, canRecoverRuntime = { checks++; true })
+                assertNull(runtime.restored())
+                assertEquals(2, checks)
+                assertFalse(Files.exists(path))
+                val backups = Files.newDirectoryStream(sandbox, "runtime.dpapi.unreadable-*.bak").use { it.toList() }
+                assertEquals(index + 1, backups.size)
+                assertTrue(backups.any { Files.readAllBytes(it).contentEquals(original) })
+                assertEquals(setOf("runtime.dpapi"), vault.takeRecoveredFiles().keys)
+                val current = SingBoxRuntime.Running(12, 34, 12345, "fixture-secret", 12346, "fixture")
+                SingBoxRuntime.persistIdentity(vault, current)
+                SingBoxRuntime(vault, canRecoverRuntime = { error("Valid state must not trigger recovery") })
+                assertEquals(12, JSONObject(vault.readEncrypted("runtime.dpapi")!!).getInt("pid"))
+            }
+            for ((name, bytes) in untouched) assertArrayEquals(name, bytes, Files.readAllBytes(sandbox.resolve(name)))
+        } finally {
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `runtime record access errors and failed preservation cannot clear identity`() {
+        assumeWindows()
+        val sandbox = Files.createTempDirectory("noki-runtime-io").toAbsolutePath().normalize()
+        try {
+            val vault = WindowsVault(sandbox)
+            vault.writeEncrypted("runtime.dpapi", "{")
+            val path = sandbox.resolve("runtime.dpapi")
+            val original = Files.readAllBytes(path)
+            for (share in listOf(0, WinNT.FILE_SHARE_READ or WinNT.FILE_SHARE_WRITE)) {
+                val handle = Kernel32.INSTANCE.CreateFile(path.toString(), WinNT.GENERIC_READ, share, null, WinNT.OPEN_EXISTING, 0, null)
+                assertNotEquals(WinBase.INVALID_HANDLE_VALUE, handle)
+                var checks = 0
+                try {
+                    assertThrows(IOException::class.java) { SingBoxRuntime(vault, canRecoverRuntime = { checks++; true }) }
+                    assertEquals(if (share == 0) 0 else 1, checks)
+                } finally { Kernel32.INSTANCE.CloseHandle(handle) }
+                assertArrayEquals(original, Files.readAllBytes(path))
+                assertTrue(vault.takeRecoveredFiles().isEmpty())
+            }
+        } finally {
+            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
+                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
+            } }
+        }
+    }
+
+    @Test fun `Windows core snapshot never treats partial enumeration as core absence`() {
+        assumeWindows()
+        val handle = WinNT.HANDLE(com.sun.jna.Pointer(1234))
+        for ((names, failure) in listOf(listOf("java.exe", "explorer.exe") to 18,
+            listOf("java.exe", "SiNg-BoX.ExE") to 18, listOf("java.exe") to 5, emptyList<String>() to 5)) {
+            var index = 0
+            var closed = false
+            val kernel = java.lang.reflect.Proxy.newProxyInstance(Kernel32::class.java.classLoader, arrayOf(Kernel32::class.java)) { _, method, args ->
+                when (method.name) {
+                    "CreateToolhelp32Snapshot" -> handle
+                    "Process32First", "Process32Next" -> if (index < names.size) {
+                        (args!![1] as com.sun.jna.platform.win32.Tlhelp32.PROCESSENTRY32).szExeFile.apply {
+                            fill('\u0000'); names[index++].toCharArray().copyInto(this)
+                        }; true
+                    } else false
+                    "GetLastError" -> failure
+                    "CloseHandle" -> { assertEquals(handle, args!![0]); closed = true; true }
+                    else -> error(method.name)
+                }
+            } as Kernel32
+            if (failure == 5) assertThrows(com.sun.jna.platform.win32.Win32Exception::class.java) { SingBoxRuntime.windowsCoreProcessesStopped(kernel) }
+            else assertEquals(names.none { it.equals("sing-box.exe", ignoreCase = true) }, SingBoxRuntime.windowsCoreProcessesStopped(kernel))
+            assertTrue(closed)
+        }
+        // Exercise real structure marshalling without touching any process or network protection.
+        SingBoxRuntime.windowsCoreProcessesStopped()
+    }
+
     @Test fun `uninstall helper preserves its command through elevation and rejects mixed modes`() {
         assertTrue(WindowsShell.ensureAdministrator(arrayOf("--prepare-uninstall"), elevated = true) { error("Unexpected relaunch") })
         var forwarded = emptyList<String>()

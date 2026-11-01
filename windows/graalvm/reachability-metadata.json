@@ -1,6 +1,19 @@
 {
   "reflection": [
     {
+      "type": "com.sun.jna.platform.win32.WinDef$LONG",
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.BaseTSD$ULONG_PTR",
+      "allDeclaredConstructors": true
+    },
+    {
+      "type": "com.sun.jna.platform.win32.Tlhelp32$PROCESSENTRY32",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
       "type": "com.sun.jna.platform.win32.WinDef$WORD",
       "allDeclaredConstructors": true
     },

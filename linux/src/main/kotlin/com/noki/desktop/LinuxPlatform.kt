@@ -75,7 +75,8 @@ internal object LinuxPlatform {
     internal fun crypt(bytes: ByteArray, key: ByteArray, encrypt: Boolean): ByteArray {
         val prefix = byteArrayOf(78, 75, 86, 49)
         val nonce = if (encrypt) ByteArray(12).also(SecureRandom()::nextBytes) else {
-            require(bytes.size >= 32 && bytes.copyOfRange(0, 4).contentEquals(prefix)) { "Неизвестный формат Linux-хранилища Noki" }
+            if (bytes.size < 32 || !bytes.copyOfRange(0, 4).contentEquals(prefix))
+                throw javax.crypto.BadPaddingException("Неизвестный формат Linux-хранилища Noki")
             bytes.copyOfRange(4, 16)
         }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")

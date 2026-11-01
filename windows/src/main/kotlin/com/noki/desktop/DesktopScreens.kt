@@ -44,6 +44,7 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.Forum
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.ui.input.key.*
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.*
@@ -168,7 +169,7 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
 }
 
 @Composable internal fun DesktopWorkspace(state: DesktopState, app: DesktopController, initialPage: DesktopPage, earthVisible: Boolean = true,
-    reducedMotion: Boolean = false, earthRenderer: EarthRenderer? = null, earthFailed: Boolean = false,
+    reducedMotion: Boolean = false,
     titlebar: @Composable () -> Unit = { PcTitlebar() }) {
     var requestedPage by rememberSaveable { mutableStateOf(if (initialPage == DesktopPage.SETTINGS) DesktopPage.DEVICES else initialPage) }
     val isFreePlan = com.noki.vpn.SettingsPreparedStatePolicy.isFreePlan(state.androidState())
@@ -259,6 +260,10 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
     CompositionLocalProvider(LocalDesktopStyle provides style.copy(backdrop = backdrop)) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val sceneVisible = earthVisible && DesktopUiKit.sceneFits(maxWidth, maxHeight)
+            val earthNeeded = sceneVisible && !state.earthDisabled && state.user != null && page in homePages
+            val earth by rememberEarthRenderer(earthNeeded)
+            val earthRenderer = earth?.getOrNull()
+            DesktopGraphicsCache(earthNeeded)
             Box(Modifier.fillMaxSize().layerBackdrop(backdrop)) {
                 Box(Modifier.fillMaxSize().background(DesktopUiKit.Canvas))
                 if (state.earthDisabled) {
@@ -271,7 +276,7 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
                 else EarthViewport(Modifier.fillMaxSize().drawWithContent { clipRect(top = 40.dp.toPx()) { this@drawWithContent.drawContent() } },
                     tr(state, "3D-Земля: выбранная страна и маршрут мультихопа", "3D Earth: selected country and MultiHop route"),
                     tr(state, "Не удалось отобразить 3D-Землю", "Could not render 3D Earth"),
-                    renderer = earthRenderer, failedToLoad = earthFailed,
+                    renderer = earthRenderer, failedToLoad = earth?.isFailure == true,
                     selectedCountryCode = if (routeKnown && displayedMultiHop.enabled) hopCountry(displayedMultiHop.exit) else selectedCountry,
                     entryCountryCode = if (routeKnown && displayedMultiHop.enabled) hopCountry(displayedMultiHop.entry) else null,
                     visible = sceneVisible && page in homePages, reducedMotion = reducedMotion || state.reducedMotion)
@@ -322,7 +327,8 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
                                     if (target == DesktopPage.NOTIFICATIONS) Icon(Icons.Outlined.Notifications, null, Modifier.size(16.dp), tint = DesktopUiKit.Text)
                                     else menuIcon(target)?.let { Image(nokiPainterResource(it), null, Modifier.size(16.dp)) }
                                     PcText(pageTitle(target, state.language), Modifier.weight(1f), size = 13, maxLines = 1, color = Color.White)
-                                    if (target == DesktopPage.PLANS || target == DesktopPage.PAYMENTS) PcText("↗", size = 14, color = DesktopUiKit.Muted)
+                                    if (target == DesktopPage.PLANS || target == DesktopPage.PAYMENTS)
+                                        Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(16.dp), tint = DesktopUiKit.Muted)
                                 }
                                 Spacer(Modifier.weight(1f))
                                 PcText(DesktopDiagnostics.appVersion, Modifier.fillMaxWidth(), size = 11,
@@ -429,7 +435,7 @@ private fun pageTitle(page: DesktopPage, language: AppLanguage): String {
 }
 
 @Composable private fun PcMenuRow(label: String, detail: String? = null, enabled: Boolean = true,
-    iconResource: Int? = null, leadingIcon: (@Composable () -> Unit)? = null, onClick: () -> Unit) {
+    iconResource: Int? = null, leadingIcon: (@Composable () -> Unit)? = null, externalLink: Boolean = false, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = 76.dp).pcCard()
         .pcClickable(enabled = enabled, onClick = onClick).padding(horizontal = 20.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
         if (leadingIcon != null) { leadingIcon(); Spacer(Modifier.width(14.dp)) }
@@ -438,7 +444,9 @@ private fun pageTitle(page: DesktopPage, language: AppLanguage): String {
             PcText(label, size = 14, lineHeight = 20)
             detail?.let { PcText(it, size = 12, lineHeight = 16, color = Color(0xFFB9B9B9)) }
         }
-        Spacer(Modifier.width(14.dp)); PcIcon("chevronRight", null, Modifier.size(14.dp))
+        Spacer(Modifier.width(14.dp))
+        if (externalLink) Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(16.dp), tint = DesktopUiKit.Muted)
+        else PcIcon("chevronRight", null, Modifier.size(14.dp))
     }
 }
 
@@ -570,11 +578,11 @@ private fun copyText(value: String, app: DesktopController) {
         SettingsSection(tr(state, "Вход в аккаунт", "Account sign-in")) {
             PcMenuRow(tr(state, "Имя пользователя", "Username"), state.user?.username, enabled = !state.loading && !state.invited,
                 iconResource = R.raw.account_nav_profile) { app.editCredential("username") }
-            PcMenuRow(tr(state, "Изменить почту ↗", "Change email ↗"), profile.email, enabled = !state.loading && !state.invited,
+            PcMenuRow(tr(state, "Изменить почту", "Change email"), profile.email, enabled = !state.loading && !state.invited, externalLink = true,
                 iconResource = R.drawable.security_email_icon) { app.openAccountWebsite("email") }
-            PcMenuRow(tr(state, "Изменить пароль ↗", "Change password ↗"), enabled = !state.loading && !state.invited,
+            PcMenuRow(tr(state, "Изменить пароль", "Change password"), enabled = !state.loading && !state.invited, externalLink = true,
                 leadingIcon = { com.noki.vpn.ui.SecurityPasswordIcon(Modifier.size(24.dp)) }) { app.openAccountWebsite("password") }
-            PcMenuRow("Telegram ↗", if (state.user?.telegramLinked == true) tr(state, "Привязан", "Linked") else tr(state, "Привязка на сайте Noki", "Link on the Noki website"),
+            PcMenuRow("Telegram", if (state.user?.telegramLinked == true) tr(state, "Привязан", "Linked") else tr(state, "Привязка на сайте Noki", "Link on the Noki website"), externalLink = true,
                 enabled = !state.loading && !state.invited,
                 leadingIcon = { Icon(nokiPainterResource(R.drawable.login_telegram_icon), null, Modifier.size(24.dp), tint = Color.White) }) {
                 app.openAccountWebsite("security")

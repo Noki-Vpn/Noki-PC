@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "com.noki"
-version = "1.7.5"
+version = "1.7.6"
 
 val desktopTarget = providers.gradleProperty("desktopTarget").orElse("windows").get()
 require(desktopTarget in setOf("linux", "windows")) { "desktopTarget must be linux or windows" }
@@ -166,6 +166,9 @@ dependencies {
     implementation(compose.materialIconsExtended)
     implementation("io.github.kyant0:backdrop-desktop:2.0.1")
     implementation("dev.nucleusframework:nucleus.nucleus-application:2.5.18")
+    add(if (linuxHost) "implementation" else "compileOnly", "dev.nucleusframework:composenativetray:2.1.6") {
+        exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core")
+    }
     implementation("dev.nucleusframework:nucleus.decorated-window-tao:2.5.18")
     implementation("dev.nucleusframework:nucleus.graalvm-runtime:2.5.18")
     if (linuxHost) implementation("org.graalvm.sdk:nativeimage:25.0.1") { isTransitive = false }

@@ -59,6 +59,32 @@ import kotlinx.coroutines.test.TestCoroutineScheduler
 import javax.imageio.ImageIO
 
 class DesktopUiTest {
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun externalAccountLinksUseTrailingVectorIcons() {
+        val vault = WindowsVault(Files.createTempDirectory("noki-external-links"), hardwareIdentity = { "fixture" })
+        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val base = DesktopState(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false))
+        val state = base.copy(settings = base.settings.copy(personalizationSettings = base.settings.personalizationSettings.copy(language = AppLanguage.EN)))
+        fun descendants(node: SemanticsNode): Sequence<SemanticsNode> = sequence {
+            yield(node); for (child in node.children) yieldAll(descendants(child))
+        }
+        try {
+            for (page in listOf(DesktopPage.SECURITY, DesktopPage.PROFILE)) {
+                val scene = ImageComposeScene(1050, 674, density = Density(1f)) { DesktopContent(state, app, initialPage = page, earthVisible = false) }
+                try {
+                    repeat(4) { scene.render().close() }
+                    val labels = scene.semanticsOwners.asSequence().flatMap { descendants(it.rootSemanticsNode) }
+                        .flatMap { it.config.getOrNull(SemanticsProperties.Text).orEmpty().asSequence() }.map { it.text }.toSet()
+                    assertFalse(labels.any { "↗" in it })
+                    if (page == DesktopPage.SECURITY) assertTrue(labels.containsAll(listOf("Change email", "Change password", "Telegram")))
+                    val output = java.nio.file.Path.of("build/screenshots/linux-links"); Files.createDirectories(output)
+                    scene.render().use { it.encodeToData(EncodedImageFormat.PNG)!!.use { data -> Files.write(output.resolve("${page.name.lowercase()}.png"), data.bytes) } }
+                } finally { scene.close() }
+            }
+        } finally { runBlocking { app.closeAndJoin() }; app.close() }
+    }
+
+
 
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun freePlanHidesAdvancedRoutingControls() {
@@ -834,11 +860,10 @@ class DesktopUiTest {
     @Test fun `near minimum size both background choices leave only the plain canvas`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-compact-canvas"))
         val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
-        EarthRenderer(4096).use { renderer ->
             var disabled by mutableStateOf(false)
             val scene = ImageComposeScene(600, 500, density = Density(1f)) {
                 DesktopTheme(null) { DesktopWorkspace(DesktopState(earthDisabled = disabled,
-                    user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false)), app, DesktopPage.HOME, earthRenderer = renderer) }
+                    user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false)), app, DesktopPage.HOME) }
             }
             try {
                 for (choice in listOf(false, true)) {
@@ -846,10 +871,11 @@ class DesktopUiTest {
                     repeat(3) { scene.render().close() }
                     val image = scene.render().use { it.encodeToData(EncodedImageFormat.PNG)!!.use { data -> ImageIO.read(data.bytes.inputStream()) } }
                     assertEquals("Compact mode must contain no Earth or site render", 0x131313, image.getRGB(550, 250) and 0xffffff)
-                    assertEquals("Compact mode must not submit the Earth shader", 0, renderer.generation)
+                    fun hasEarth(node: SemanticsNode): Boolean = node.config.getOrNull(SemanticsProperties.ContentDescription)
+                        .orEmpty().any { "3D Earth" in it || "3D-Земля" in it } || node.children.any(::hasEarth)
+                    assertFalse("Compact mode must not create an Earth viewport", scene.semanticsOwners.any { hasEarth(it.rootSemanticsNode) })
                 }
             } finally { scene.close() }
-        }
         app.close()
     }
 

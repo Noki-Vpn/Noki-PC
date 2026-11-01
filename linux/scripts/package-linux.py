@@ -13,9 +13,9 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-DEB_DEPENDS = 'python3 (>= 3.11), systemd (>= 249), polkitd, pkexec, nftables, iproute2, libsecret-tools, zenity, xdg-utils, libgtk-3-0, libgl1, libegl1, libx11-6, xwayland, libstdc++6, libc6 (>= 2.35)'
-RPM_DEPENDS = 'python3 >= 3.11, systemd >= 249, polkit, nftables, iproute, libsecret, zenity, xdg-utils, gtk3, libglvnd-glx, libglvnd-egl, libX11, xorg-x11-server-Xwayland, libstdc++, glibc >= 2.35'
-ARCH_DEPENDS = ('python', 'systemd', 'polkit', 'nftables', 'iproute2', 'libsecret', 'zenity', 'xdg-utils', 'gtk3', 'libglvnd', 'libx11', 'xorg-xwayland', 'gcc-libs', 'glibc')
+DEB_DEPENDS = 'python3 (>= 3.11), systemd (>= 249), polkitd, pkexec, nftables, iproute2, libsecret-tools, zenity, xdg-utils, libglib2.0-bin, libgtk-3-0, libgl1, libegl1, libx11-6, xwayland, libstdc++6, libc6 (>= 2.35)'
+RPM_DEPENDS = 'python3 >= 3.11, systemd >= 249, polkit, nftables, iproute, libsecret, zenity, xdg-utils, glib2, gtk3, libglvnd-glx, libglvnd-egl, libX11, xorg-x11-server-Xwayland, libstdc++, glibc >= 2.35'
+ARCH_DEPENDS = ('python', 'systemd', 'polkit', 'nftables', 'iproute2', 'libsecret', 'zenity', 'xdg-utils', 'glib2', 'gtk3', 'libglvnd', 'libx11', 'xorg-xwayland', 'gcc-libs', 'glibc')
 POST_INSTALL = '''#!/bin/sh
 set -e
 systemctl daemon-reload

@@ -36,7 +36,10 @@ import java.nio.file.StandardOpenOption
 import java.nio.file.Path
 import kotlinx.coroutines.*
 
+internal const val DESKTOP_GPU_CACHE_BYTES = 96L * 1024 * 1024
+
 fun main(args: Array<String>) {
+    System.setProperty("skiko.gpu.resourceCacheLimit", (32L * 1024 * 1024).toString())
     if (DesktopBuild.IS_LINUX) {
         require(args.isEmpty() || args.contentEquals(arrayOf("--tray"))) { "Неизвестный параметр запуска Noki" }
         check(LinuxPlatform.uid != 0) { "Запускайте Noki от обычного пользователя" }
@@ -69,7 +72,6 @@ fun main(args: Array<String>) {
     if (!WindowsShell.ensureAdministrator(args)) return
     SingleInstanceManager.configuration = SingleInstanceManager.Configuration(
         lockFilesDir = Files.createDirectories(WindowsVault.defaultDirectory()), lockIdentifier = "noki-instance")
-    System.setProperty("skiko.gpu.resourceCacheLimit", "201326592")
     runDesktop(initiallyVisible = "--tray" !in args)
     kotlin.system.exitProcess(0)
 }
@@ -143,12 +145,18 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
     }
     if (!DesktopBuild.IS_LINUX) SingleInstanceRestoreEffect { restoreWindow() }
     fun quit() {
-        app?.cancelWebsiteLogin()
-        if (app == null) exitApplication() else app.exit { exitApplication() }
+        val controller = currentApp
+        controller?.cancelWebsiteLogin()
+        if (controller == null) exitApplication() else controller.exit { exitApplication() }
+    }
+    fun toggleConnection() {
+        val controller = currentApp ?: return
+        if (controller.state.value.running || controller.state.value.connecting) controller.disconnect() else controller.connect()
     }
     val open by rememberUpdatedState(::restoreWindow)
     val tray: DesktopTrayHandle? = if (ownership.isSuccess) remember {
-        if (DesktopBuild.IS_LINUX) LinuxDesktopTray({ scope.launch { open() } }, { scope.launch { open() } })
+        if (DesktopBuild.IS_LINUX) LinuxDesktopTray({ scope.launch { open() } },
+            { scope.launch { toggleConnection() } }, { scope.launch { quit() } }, { currentApp?.state?.value ?: DesktopState() })
         else DesktopTray({ scope.launch { open() } }, { point -> scope.launch { menuPoint = point } })
     } else null
     LaunchedEffect(tray) { if (DesktopBuild.IS_LINUX && tray is LinuxDesktopTray && !tray.available) visible = true }
@@ -294,7 +302,7 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
             fun action(block: () -> Unit) { menuPoint = null; block() }
             DesktopTheme(null, language = state.language) {
                 DesktopTrayMenu(state, onOpen = { action(::restoreWindow) },
-                    onToggle = { action { if (state.running || state.connecting) app?.disconnect() else app?.connect() } },
+                    onToggle = { action(::toggleConnection) },
                     onExit = { action(::quit) })
             }
         }
@@ -348,37 +356,13 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
     reducedMotion: Boolean = false,
     titlebar: @Composable () -> Unit = { PcTitlebar() },
 ) {
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-    val sceneVisible = earthVisible && DesktopUiKit.sceneFits(maxWidth, maxHeight)
-    val earthNeeded = sceneVisible && !state.earthDisabled && failure == null && app != null && state.user != null
-    val earth by rememberEarthRenderer(earthNeeded)
-    var gpuCleanupPending by remember(earthNeeded) { mutableStateOf(true) }
-    if (earthNeeded || gpuCleanupPending) {
-    val gpu = dev.nucleusframework.window.tao.rememberTaoGpuRenderContext() as? dev.nucleusframework.window.tao.TaoOpenGlRenderContext
-    LaunchedEffect(gpu, earthNeeded) {
-        if (gpu == null) return@LaunchedEffect
-        // Replay the replacement background before purging textures held by the previous display list.
-        if (!earthNeeded) withFrameNanos { }
-        withFrameNanos {
-            gpu.withContextCurrent {
-                if (!earthNeeded) {
-                    gpu.skiaContext.flush().submit(true)
-                    gpu.skiaContext.resourceCacheLimit = 0
-                    org.jetbrains.skia.Graphics.purgeResourceCache()
-                }
-                gpu.skiaContext.resourceCacheLimit = if (earthNeeded) 192L * 1024 * 1024 else 32L * 1024 * 1024
-            }
-        }
-        gpuCleanupPending = false
-    }
-    }
     val backdrop = rememberLayerBackdrop()
     DesktopTheme(backdrop, language = state.language) {
         Box(Modifier.fillMaxSize().background(DesktopUiKit.Canvas)) {
             if (failure == null && app != null && state.user != null) {
-                DesktopWorkspace(state, app, initialPage, earthVisible, reducedMotion,
-                    earth?.getOrNull(), earth?.isFailure == true, titlebar)
+                DesktopWorkspace(state, app, initialPage, earthVisible, reducedMotion, titlebar)
             } else {
+                DesktopGraphicsCache(earthNeeded = false)
                 Box(Modifier.fillMaxSize().layerBackdrop(backdrop).background(DesktopUiKit.Canvas))
                 Column(Modifier.fillMaxSize()) {
                     titlebar()
@@ -398,6 +382,27 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
             }
         }
     }
+}
+
+@Composable internal fun DesktopGraphicsCache(earthNeeded: Boolean) {
+    var cleanupPending by remember(earthNeeded) { mutableStateOf(true) }
+    if (!earthNeeded && !cleanupPending) return
+    val gpu = dev.nucleusframework.window.tao.rememberTaoGpuRenderContext() as? dev.nucleusframework.window.tao.TaoOpenGlRenderContext
+    LaunchedEffect(gpu, earthNeeded) {
+        if (gpu == null) return@LaunchedEffect
+        // Replay the replacement page before releasing the previous display list's textures.
+        if (!earthNeeded) withFrameNanos { }
+        withFrameNanos {
+            gpu.withContextCurrent {
+                if (!earthNeeded) {
+                    gpu.skiaContext.flush().submit(true)
+                    gpu.skiaContext.resourceCacheLimit = 0
+                    org.jetbrains.skia.Graphics.purgeResourceCache()
+                }
+                gpu.skiaContext.resourceCacheLimit = if (earthNeeded) DESKTOP_GPU_CACHE_BYTES else 32L * 1024 * 1024
+            }
+        }
+        cleanupPending = false
     }
 }
 

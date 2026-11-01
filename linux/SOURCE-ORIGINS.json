@@ -7,5 +7,11 @@
     "upstream_repository": "https://github.com/shtorm-7/sing-box-extended",
     "upstream_commit": "55faa763f986f4ca8a492d9b2719bc6330d2bef5",
     "license": "GPL-3.0-or-later with the additional name/association condition in vendor/sing-box/LICENSE; Xray-derived portions are MPL-2.0. Other dependency notices are retained in vendor/sing-box/NOTICE."
+  },
+  "linux_tray": {
+    "artifact": "dev.nucleusframework:composenativetray:2.1.6",
+    "source": "https://github.com/NucleusFramework/ComposeNativeTray",
+    "scope": "Native StatusNotifierItem and DBusMenu on Linux, compile-only on Windows. The existing Windows tray is unchanged. Uses the existing Noki tray artwork and controller actions.",
+    "license": "MIT; vendor/licenses/ComposeNativeTray-LICENSE.txt"
   }
 }

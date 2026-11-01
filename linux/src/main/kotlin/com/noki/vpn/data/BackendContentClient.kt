@@ -109,13 +109,14 @@ internal class BackendContentClient(
     }
 
     suspend fun appNotifications(token: String, deviceId: String, deviceKey: String): List<BackendAppNotification> {
-        val response = execute(Request.Builder().url(jsonApi.apiUrl("/app/desktop-notifications?limit=50"))
+        val path = if (com.noki.desktop.DesktopBuild.IS_LINUX) "/app/notifications?limit=50" else "/app/desktop-notifications?limit=50"
+        val response = execute(Request.Builder().url(jsonApi.apiUrl(path))
             .header("Authorization", "Bearer $token").currentDeviceHeaders(deviceId, deviceKey).get().build())
         return response.optJSONArray("notifications").toAppNotificationList()
     }
 
     suspend fun acknowledgeAppNotifications(token: String, deviceId: String, deviceKey: String, ids: List<String>) {
-        if (ids.isEmpty()) return
+        if (ids.isEmpty() || com.noki.desktop.DesktopBuild.IS_LINUX) return
         jsonApi.post("/app/desktop-notifications/ack", JSONObject().put("notification_ids", org.json.JSONArray(ids)),
             token, deviceId, deviceKey)
     }

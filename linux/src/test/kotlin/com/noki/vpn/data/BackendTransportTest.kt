@@ -25,6 +25,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BackendTransportTest {
+    @Test fun desktopNotificationsUseTheHostPlatformEndpoint() = runBlocking {
+        val requests = mutableListOf<Request>()
+        val http = OkHttpClient.Builder().addInterceptor { chain ->
+            requests += chain.request()
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body("""{"notifications":[{"id":"notice","title":"Notice","message":"Message","created_at":"2026-11-01T00:00:00Z"}]}"""
+                    .toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        try {
+            val api = BackendApiClient(http, "https://example.invalid")
+            assertEquals(listOf("notice"), api.appNotifications("access", "device", "key").map { it.id })
+            api.acknowledgeAppNotifications("access", "device", "key", listOf("notice"))
+            val expected = if (com.noki.desktop.DesktopBuild.IS_LINUX) listOf("/v1/app/notifications")
+                else listOf("/v1/app/desktop-notifications", "/v1/app/desktop-notifications/ack")
+            assertEquals(expected, requests.map { it.url.encodedPath })
+            assertTrue(requests.all { it.header("X-Device-Id") == "device" && it.header("X-Device-Key") == "key" })
+        } finally { http.connectionPool.evictAll(); http.dispatcher.executorService.shutdownNow() }
+    }
+
+
     @Test
     fun `VPN access sends the release version with authenticated device proof`() = runBlocking {
         var request: Request? = null

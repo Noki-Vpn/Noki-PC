@@ -701,6 +701,80 @@ class EarthHostTest {
 }
 
 /** Own fixture windows only: no account profile, VPN runtime or input automation. */
+internal object EarthMemoryProbe {
+    @JvmStatic fun main(args: Array<String>) {
+        val output = Path.of(args[0])
+        if (DesktopBuild.IS_LINUX) LinuxPlatform::class.java.getDeclaredField("key").apply { isAccessible = true }.set(null, ByteArray(32))
+        val vault = WindowsVault(Files.createTempDirectory(Path.of("build"), "earth-memory-"), hardwareIdentity = { "fixture" })
+        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val user = com.noki.vpn.data.BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false)
+        var gpu: dev.nucleusframework.window.tao.TaoOpenGlRenderContext? = null
+        fun sample(phase: String) {
+            val row = JSONObject().put("phase", phase)
+            if (DesktopBuild.IS_LINUX) {
+                val values = Files.readAllLines(Path.of("/proc/self/smaps_rollup")).filter { ':' in it }
+                    .associate { it.substringBefore(':') to it.substringAfter(':').trim().substringBefore(' ').toLongOrNull() }
+                row.put("rss", checkNotNull(values["Rss"]) * 1024)
+                    .put("private", ((values["Private_Clean"] ?: 0) + (values["Private_Dirty"] ?: 0)) * 1024)
+            } else {
+                // JNA 5.17 lacks PROCESS_MEMORY_COUNTERS_EX; this probe uses the Windows x64 layout.
+                check(com.sun.jna.Native.POINTER_SIZE == 8)
+                val counters = com.sun.jna.Memory(80).apply { clear(); setInt(0, 80) }
+                check(com.sun.jna.Function.getFunction("psapi", "GetProcessMemoryInfo", com.sun.jna.Function.ALT_CONVENTION)
+                    .invokeInt(arrayOf(com.sun.jna.platform.win32.Kernel32.INSTANCE.GetCurrentProcess(), counters, 80)) != 0)
+                row.put("rss", counters.getLong(16)).put("private", counters.getLong(72))
+                counters.close()
+            }
+            val heap = java.lang.management.ManagementFactory.getMemoryMXBean().heapMemoryUsage
+            row.put("heap_used", heap.used).put("heap_committed", heap.committed)
+                .put("skia_resource_used", Graphics.resourceCacheTotalUsed).put("skia_resource_limit", Graphics.resourceCacheTotalLimit)
+                .put("skia_font_used", Graphics.fontCacheUsed)
+            gpu?.withContextCurrent { row.put("gpu_cache_limit", gpu?.skiaContext?.resourceCacheLimit) }
+            Files.writeString(output, row.toString() + "\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)
+        }
+        dev.nucleusframework.application.nucleusApplication(backend = dev.nucleusframework.application.NucleusBackend.Tao,
+            enableSingleInstance = false) {
+            var earth by remember { mutableStateOf(false) }
+            var page by remember { mutableStateOf(DesktopPage.HOME) }
+            var country by remember { mutableStateOf("") }
+            var signedIn by remember { mutableStateOf(true) }
+            val base = DesktopState(user = if (signedIn) user else null, earthDisabled = !earth)
+            val state = base.copy(settings = base.settings.copy(userProfile = base.settings.userProfile.copy(
+                serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.COUNTRY, selectedCountryCode = country)))
+            dev.nucleusframework.application.DecoratedWindow(onCloseRequest = {}, title = "Noki memory probe",
+                hiddenFromDock = true, state = androidx.compose.ui.window.rememberWindowState(width = 1050.dp, height = 674.dp,
+                    position = androidx.compose.ui.window.WindowPosition(-2000.dp, -2000.dp))) {
+                val context = dev.nucleusframework.window.tao.rememberTaoGpuRenderContext() as? dev.nucleusframework.window.tao.TaoOpenGlRenderContext
+                SideEffect { gpu = context }
+                key(page) { DesktopContent(state, app, initialPage = page) }
+                LaunchedEffect(Unit) {
+                    try {
+                        kotlinx.coroutines.delay(5_000); System.gc(); kotlinx.coroutines.delay(1_000); sample("map")
+                        earth = true
+                        kotlinx.coroutines.delay(15_000); sample("earth-active")
+                        System.gc(); kotlinx.coroutines.delay(1_000); sample("earth-after-gc")
+                        kotlinx.coroutines.delay(10_000); sample("earth-active-later")
+                        for (code in listOf("NL", "US", "PL", "FI")) { country = code; kotlinx.coroutines.delay(2_000) }
+                        sample("earth-after-flights")
+                        page = DesktopPage.SECURITY
+                        kotlinx.coroutines.delay(3_000); System.gc(); kotlinx.coroutines.delay(1_000); sample("settings")
+                        earth = false
+                        kotlinx.coroutines.delay(3_000); System.gc(); kotlinx.coroutines.delay(1_000); sample("map-after-earth")
+                        page = DesktopPage.HOME; earth = true
+                        kotlinx.coroutines.delay(3_000)
+                        signedIn = false
+                        kotlinx.coroutines.delay(3_000); System.gc(); kotlinx.coroutines.delay(1_000); sample("logout")
+                        check(gpu?.skiaContext?.resourceCacheLimit == 32L * 1024 * 1024)
+                        exitApplication()
+                    } catch (error: Throwable) { error.printStackTrace(); kotlin.system.exitProcess(1) }
+                }
+            }
+        }
+        app.close()
+        kotlin.system.exitProcess(0)
+    }
+}
+
 internal object EarthGpuLifecycleProbe {
     @JvmStatic fun main(args: Array<String>) {
         val contexts = mutableMapOf<Int, dev.nucleusframework.window.tao.TaoOpenGlRenderContext>()

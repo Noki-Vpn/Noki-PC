@@ -217,25 +217,46 @@ internal interface DesktopTrayHandle : AutoCloseable {
     fun update(connected: Boolean, language: com.noki.vpn.data.AppLanguage)
 }
 
-internal class LinuxDesktopTray(onOpen: () -> Unit, onMenu: (DesktopPoint) -> Unit) : DesktopTrayHandle {
+internal class LinuxDesktopTray(private val onOpen: () -> Unit, private val onToggle: () -> Unit,
+    private val onExit: () -> Unit, private val currentState: () -> DesktopState) : DesktopTrayHandle {
     override val lightTheme = kotlinx.coroutines.flow.MutableStateFlow(false)
-    private val tray = runCatching { if (java.awt.SystemTray.isSupported()) java.awt.SystemTray.getSystemTray() else null }.getOrNull()
-    private val icon = runCatching { tray?.let {
-        val image = javax.imageio.ImageIO.read(checkNotNull(javaClass.getResourceAsStream("/noki/desktop/app-32.png")))
-        java.awt.TrayIcon(image, "Noki VPN").apply {
-            isImageAutoSize = true
-            addActionListener { onOpen() }
-            addMouseListener(object : java.awt.event.MouseAdapter() {
-                override fun mouseReleased(event: java.awt.event.MouseEvent) {
-                    if (event.isPopupTrigger || event.button == 3) onMenu(DesktopPoint(event.xOnScreen, event.yOnScreen)) else if (event.button == 1) onOpen()
-                }
-            })
-            tray.add(this)
-        }
-    } }.getOrNull()
-    val available: Boolean get() = icon != null
-    override fun update(connected: Boolean, language: com.noki.vpn.data.AppLanguage) {
-        icon?.toolTip = "Noki VPN — " + if (connected) "Connected" else "Disconnected"
+    val available: Boolean = listOf("org.kde.StatusNotifierWatcher", "org.freedesktop.StatusNotifierWatcher").any { name ->
+        runCatching {
+            val reply = LinuxPlatform.command(listOf("gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.NameHasOwner", name), timeoutSeconds = 2)
+            reply.first == 0 && reply.second.trim() == "(true,)"
+        }.getOrDefault(false)
     }
-    override fun close() { icon?.let { tray?.remove(it) } }
+    private val tray = if (available) dev.nucleusframework.composenativetray.tray.api.NativeTray() else null
+    private val icons = if (available) listOf(false, true).associateWith { connected ->
+        LinuxPlatform.runtimeDirectory.resolve(if (connected) "tray-connected.png" else "tray-disconnected.png").also { path ->
+            desktopTrayImage(connected, 64).use { image ->
+                checkNotNull(image.encodeToData()).use { Files.write(path, it.bytes) }
+            }
+        }
+    } else emptyMap()
+    private var menuKey: Triple<com.noki.vpn.data.AppLanguage, Boolean, Boolean>? = null
+    private var connected: Boolean? = null
+    override fun update(connected: Boolean, language: com.noki.vpn.data.AppLanguage) {
+        val native = tray ?: return
+        val state = currentState()
+        val active = state.running || state.connecting
+        val enabled = state.user != null && (active || !state.loading)
+        val next = Triple(language, active, enabled)
+        if (this.connected == connected && menuKey == next) return
+        this.connected = connected; menuKey = next
+        native.update(iconPath = icons.getValue(connected).toString(),
+            tooltip = tr(state, if (connected) "Подключено" else "Отключено", if (connected) "Connected" else "Disconnected"),
+            primaryAction = onOpen, menuContent = {
+                Item(tr(state, "Открыть Noki Vpn", "Open Noki Vpn"), onClick = onOpen)
+                Item(tr(state, if (active) "Выключить VPN" else "Включить VPN", if (active) "Turn off VPN" else "Turn on VPN"),
+                    isEnabled = enabled, onClick = onToggle)
+                Divider()
+                Item(tr(state, "Выйти", "Quit"), onClick = onExit)
+            })
+    }
+    override fun close() {
+        tray?.dispose()
+        icons.values.forEach { Files.deleteIfExists(it) }
+    }
 }

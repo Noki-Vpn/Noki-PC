@@ -29,3 +29,28 @@ class LinuxPlatformTest {
         assertThrows(IllegalArgumentException::class.java) { LinuxPlatform.crypt(byteArrayOf(1), key, false) }
     }
 }
+
+internal object LinuxTrayProbe {
+    @JvmStatic fun main(args: Array<String>) {
+        val output = java.nio.file.Path.of(args[0])
+        val opened = java.util.concurrent.CountDownLatch(1)
+        val toggled = java.util.concurrent.CountDownLatch(1)
+        val quit = java.util.concurrent.CountDownLatch(1)
+        val active = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun record(value: String) { java.nio.file.Files.writeString(output, value + "\n",
+            java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND) }
+        LinuxDesktopTray({ record("open"); opened.countDown() }, { active.set(true); record("toggle"); toggled.countDown() },
+            { record("quit"); quit.countDown() }, {
+                val base = DesktopState(user = com.noki.vpn.data.BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false), running = active.get())
+                base.copy(settings = base.settings.copy(personalizationSettings = base.settings.personalizationSettings.copy(language = com.noki.vpn.data.AppLanguage.EN)))
+            }).use { tray ->
+            check(tray.available)
+            tray.update(false, com.noki.vpn.data.AppLanguage.EN)
+            check(opened.await(15, java.util.concurrent.TimeUnit.SECONDS))
+            check(toggled.await(15, java.util.concurrent.TimeUnit.SECONDS))
+            tray.update(true, com.noki.vpn.data.AppLanguage.EN)
+            check(quit.await(15, java.util.concurrent.TimeUnit.SECONDS))
+        }
+        println("linux-native-tray: ok")
+    }
+}

@@ -132,7 +132,6 @@ class WindowsPlatformTest {
         val security = com.sun.jna.Native.load("advapi32", WindowsNetworkGuard.Security::class.java)
         val descriptor = com.sun.jna.ptr.PointerByReference()
         val length = com.sun.jna.ptr.IntByReference()
-        val decoded = com.sun.jna.ptr.PointerByReference()
         val sid = WindowsNetworkGuard.currentUserSid()
         assertTrue(security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             com.sun.jna.WString("D:(A;;CC;;;$sid)"), 1, descriptor, length))
@@ -141,12 +140,12 @@ class WindowsPlatformTest {
             assertTrue(blob.pointer.getInt(0) > 0)
             val readDescriptor = blob.pointer.getPointer(8)
             assertEquals(descriptor.value, readDescriptor)
-            val convert = com.sun.jna.Function.getFunction("advapi32", "ConvertSecurityDescriptorToStringSecurityDescriptorW", com.sun.jna.Function.ALT_CONVENTION)
-            assertNotEquals(0, convert.invokeInt(arrayOf(readDescriptor, 1, 4, decoded, null)))
-            assertTrue(decoded.value.getWideString(0).contains(sid))
+            val ace = com.sun.jna.platform.win32.WinNT.SECURITY_DESCRIPTOR_RELATIVE(readDescriptor)
+                .discretionaryACL.getACEs().single() as com.sun.jna.platform.win32.WinNT.ACCESS_ALLOWED_ACE
+            assertEquals(sid, ace.sidString)
+            assertEquals(1, ace.Mask)
             java.lang.ref.Reference.reachabilityFence(blob)
         } finally {
-            decoded.value?.let { com.sun.jna.platform.win32.Kernel32.INSTANCE.LocalFree(it) }
             com.sun.jna.platform.win32.Kernel32.INSTANCE.LocalFree(descriptor.value)
         }
     }

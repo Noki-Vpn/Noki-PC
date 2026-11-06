@@ -595,15 +595,18 @@ class SingBoxRuntimeTest {
     }
 
     @Test fun `watchdog independent targets do not wait for a blocked first target`() = kotlinx.coroutines.runBlocking {
+        val blockedStarted = java.util.concurrent.CountDownLatch(1)
         val goodStarted = java.util.concurrent.CountDownLatch(1)
         val requested = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val http = OkHttpClient.Builder().addInterceptor { chain ->
             val host = chain.request().url.host
             requested += host
             if (host == "blocked.invalid") {
+                blockedStarted.countDown()
                 goodStarted.await(1_500, TimeUnit.MILLISECONDS)
                 throw IOException("Blocked target")
             }
+            check(blockedStarted.await(1, TimeUnit.SECONDS)) { "The blocked target must start independently" }
             goodStarted.countDown()
             okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1)
                 .code(403).message("fixture").body("".toResponseBody()).build()

@@ -72,7 +72,7 @@ class WindowsVaultTest {
                     val backups = Files.newDirectoryStream(sandbox, "$name.unreadable-*.bak").use { it.toList() }
                     assertEquals(listOf("json", "ciphertext", "empty", "oversized").indexOf(damage) + 1, backups.size)
                     assertTrue(backups.any { Files.readAllBytes(it).contentEquals(original) })
-                    backups.forEach { assertEquals("D:P(A;;FA;;;${WindowsNetworkGuard.currentUserSid()})", dacl(it)) }
+                    backups.forEach { assertPrivateDacl(it) }
                     assertEquals(setOf(name), vault.takeRecoveredFiles().keys)
                     assertNull(vault.loadCache(name) { it?.let(::JSONObject) })
                     assertTrue(vault.takeRecoveredFiles().isEmpty())
@@ -301,17 +301,19 @@ class WindowsVaultTest {
         assertNull(WindowsVault.hardwareIdentityFromSmbios(raw))
     }
 
-    private fun dacl(path: java.nio.file.Path): String {
+    private fun assertPrivateDacl(path: java.nio.file.Path, isProtected: Boolean = true, inherit: Boolean = false) {
         val api = com.sun.jna.platform.win32.Advapi32.INSTANCE
         val length = com.sun.jna.ptr.IntByReference()
         api.GetFileSecurity(path.toString(), 4, null, 0, length)
         com.sun.jna.Memory(length.value.toLong()).use { descriptor ->
             assertTrue(api.GetFileSecurity(path.toString(), 4, descriptor, length.value, length))
-            val text = com.sun.jna.ptr.PointerByReference()
-            val convert = com.sun.jna.Function.getFunction("advapi32", "ConvertSecurityDescriptorToStringSecurityDescriptorW", com.sun.jna.Function.ALT_CONVENTION)
-            assertNotEquals(0, convert.invokeInt(arrayOf(descriptor, 1, 4, text, null)))
-            try { return text.value.getWideString(0) }
-            finally { com.sun.jna.platform.win32.Kernel32.INSTANCE.LocalFree(text.value) }
+            // Binary ACLs preserve numeric SIDs when Windows renders built-in accounts as SDDL aliases.
+            val security = com.sun.jna.platform.win32.WinNT.SECURITY_DESCRIPTOR_RELATIVE(descriptor)
+            assertEquals(isProtected, security.Control.toInt() and 0x1000 != 0)
+            val ace = security.discretionaryACL.getACEs().single() as com.sun.jna.platform.win32.WinNT.ACCESS_ALLOWED_ACE
+            assertEquals(WindowsNetworkGuard.currentUserSid(), ace.sidString)
+            assertEquals(com.sun.jna.platform.win32.WinNT.FILE_ALL_ACCESS, ace.Mask)
+            assertEquals(if (inherit) 3 else 0, ace.AceFlags.toInt() and 15)
         }
     }
 
@@ -320,17 +322,16 @@ class WindowsVaultTest {
         val directory = Files.createTempDirectory("noki-vault-acl")
         try {
             val vault = WindowsVault(directory)
-            val sid = WindowsNetworkGuard.currentUserSid()
-            assertEquals("D:P(A;OICI;FA;;;$sid)", dacl(directory))
+            assertPrivateDacl(directory, inherit = true)
             val child = Files.writeString(directory.resolve("inherited.txt"), "inherit")
-            assertEquals("D:(A;;FA;;;$sid)", dacl(child))
+            assertPrivateDacl(child, isProtected = false)
             val childDirectory = Files.createDirectory(directory.resolve("child"))
-            assertEquals("D:(A;OICI;FA;;;$sid)", dacl(childDirectory))
+            assertPrivateDacl(childDirectory, isProtected = false, inherit = true)
             val privateFile = vault.writePrivate("vpn.json", "private")
-            assertEquals("D:P(A;;FA;;;$sid)", dacl(privateFile))
+            assertPrivateDacl(privateFile)
             vault.writeEncrypted("roundtrip.dpapi", "encrypted")
             assertEquals("encrypted", WindowsVault(directory).readEncrypted("roundtrip.dpapi"))
-            assertEquals("D:P(A;;FA;;;$sid)", dacl(directory.resolve("roundtrip.dpapi")))
+            assertPrivateDacl(directory.resolve("roundtrip.dpapi"))
         } finally { Files.list(directory).use { it.forEach(Files::delete) }; Files.delete(directory) }
     }
 
@@ -741,7 +742,7 @@ class WindowsVaultTest {
             first.saveTokens(BackendAuthTokens("private-access", "private-refresh"))
             first.deviceId = "device-id"
             val privateFile = first.writePrivate("vpn.json", "private-vpn-secret")
-            assertEquals("D:P(A;;FA;;;${WindowsNetworkGuard.currentUserSid()})", dacl(privateFile))
+            assertPrivateDacl(privateFile)
             val pending = first.refreshRequestId("private-refresh")
             val restored = WindowsVault(directory)
             assertEquals(pending, restored.refreshRequestId("private-refresh"))

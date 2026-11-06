@@ -633,9 +633,9 @@ class SingBoxConfigTest {
         val resolved = DesktopController.resolveMultiHop(saved, listOf(
             VpnServer(ENTRY, "Poland", "PL", "pl", "example.invalid", null, true, multiHopEntryAvailable = true),
             VpnServer(EXIT, "Romania", "RO", "ro", "example.invalid", null, true, multiHopExitAvailable = true)), false)
-        val fixture = generateSequence(Path.of(System.getProperty("user.dir"))) { it.parent }
-            .map { it.resolve("contracts/multihop_session_v2.json") }.first { Files.isRegularFile(it) }
-        val payload = JSONObject(Files.readString(fixture))
+        val payload = javaClass.getResourceAsStream("/contracts/multihop_session_v2.json")!!.use {
+            JSONObject(it.reader(Charsets.UTF_8).readText())
+        }
         val route = payload.getJSONObject("multihop")
         route.put("entry_node_id", ENTRY).put("exit_node_id", EXIT)
         val selection = route.getJSONObject("selection")

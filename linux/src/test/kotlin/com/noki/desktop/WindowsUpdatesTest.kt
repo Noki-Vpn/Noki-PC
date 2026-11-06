@@ -49,7 +49,7 @@ class WindowsUpdatesTest {
     }
 
     @Test fun `installed uninstall entry uses Inno and rejects portable or unowned roots`() {
-        val root = Files.createTempDirectory("noki-uninstall-entry")
+        val root = Files.createTempDirectory("noki-uninstall-entry").toRealPath()
         try {
             val current = Files.createDirectory(root.resolve("current"))
             Files.writeString(current.resolve("sq.version"), "<package><id>Noki.Desktop</id></package>")

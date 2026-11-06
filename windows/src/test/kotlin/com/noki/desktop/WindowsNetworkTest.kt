@@ -119,7 +119,7 @@ class WindowsNetworkTest {
         }
         try {
             add(".plain.$suffix", "-NameServers @('192.0.2.53','192.0.2.54')")
-            add("public.plain.$suffix", "")
+            add("public.plain.$suffix", "-NameEncoding 'Punycode'")
             add(".secure.$suffix", "-NameServers '2001:db8::53' -DnsSecEnable -DnsSecValidationRequired")
             val policy = assertNativePolicyMatchesWindows()
             val plain = policy.nrpt.single { it.namespace == ".plain.$suffix" }

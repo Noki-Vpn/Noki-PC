@@ -252,14 +252,15 @@ if (!linuxHost) tasks.withType<Copy>().matching { it.name == "copyGraalvmBinaryT
     from(layout.buildDirectory.file("tools/velopack_libc_win_x64_msvc.dll"))
     from(tasks.named("nativeImageCompile")) { include("*.dll") }
     // Both existing loaders already search the distribution's bin/ directory.
-    val nativeLibraries = configurations.runtimeClasspath.map { runtime ->
-        runtime.filter { it.name.startsWith("nucleus.") && it.extension == "jar" }.flatMap { jar ->
-            zipTree(jar).matching { include("nucleus/native/win32-x64/*.dll") }.files
+    // Keep archive contents lazy until the classpath's producer tasks have built their JARs.
+    val nativeLibraries = files(configurations.runtimeClasspath.map { runtime ->
+        runtime.filter { it.name.startsWith("nucleus.") && it.extension == "jar" }.map { jar ->
+            zipTree(jar).matching { include("nucleus/native/win32-x64/*.dll") }
         }
-    }
+    }).builtBy(configurations.runtimeClasspath)
     from(nativeLibraries) { into("bin") }
     doFirst {
-        val files = nativeLibraries.get()
+        val files = nativeLibraries.files
         check(files.isNotEmpty() && files.map { it.name.lowercase(Locale.ROOT) }.toSet().size == files.size) {
             "Missing or colliding Windows Nucleus native libraries"
         }

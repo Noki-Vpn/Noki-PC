@@ -61,6 +61,8 @@ internal class DesktopSupportChat(
     private val saveFile: suspend (String) -> String? = { null },
 ) {
     private var generation = 0L
+    private var historyGeneration = 0L
+    private var conversationId: Long? = null
     private var accountEpoch: Long? = null
     private var loadJob: Job? = null
     private var sendJob: Job? = null
@@ -153,12 +155,13 @@ internal class DesktopSupportChat(
         if (chat.messages.none { message -> message.id == attachment.messageId && attachment in message.attachments }) return
         val attempt = currentAuthAttempt() ?: return
         val owner = generation
+        val historyOwner = historyGeneration
         update(chat.copy(attachmentLoading = chat.attachmentLoading + attachment.id, attachmentErrors = chat.attachmentErrors - attachment.id))
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val path = chat.attachmentFiles[attachment.id]?.takeIf(isFileAvailable)
                     ?: downloadAttachment(attempt, attachment)
-                if (owner != generation || !isCurrent(attempt)) { deleteFile(path); return@launch }
+                if (owner != generation || historyOwner != historyGeneration || !isCurrent(attempt)) { deleteFile(path); return@launch }
                 update(chat.copy(attachmentFiles = chat.attachmentFiles + (attachment.id to path), attachmentLoading = chat.attachmentLoading - attachment.id))
                 when (action) {
                     SupportAttachmentAction.Preview -> Unit
@@ -166,17 +169,17 @@ internal class DesktopSupportChat(
                     SupportAttachmentAction.Save -> {
                         update(chat.copy(saveRequest = SupportAttachmentSaveRequest(path, attachment.name, attachment.mime)))
                         val destination = saveFile(attachment.name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trimEnd('.', ' ').ifBlank { "attachment" })
-                        if (owner == generation && isCurrent(attempt)) saveAttachmentTo(destination)
+                        if (owner == generation && historyOwner == historyGeneration && isCurrent(attempt)) saveAttachmentTo(destination)
                     }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException && error !is TimeoutCancellationException) throw error
-                if (owner == generation && isCurrent(attempt)) update(chat.copy(
+                if (owner == generation && historyOwner == historyGeneration && isCurrent(attempt)) update(chat.copy(
                     saveRequest = if (action == SupportAttachmentAction.Save) null else chat.saveRequest,
                     attachmentLoading = chat.attachmentLoading - attachment.id,
                     attachmentFiles = if (error.message == "support_attachment_unavailable") chat.attachmentFiles - attachment.id else chat.attachmentFiles,
                     attachmentErrors = chat.attachmentErrors + (attachment.id to readable(error))))
-            } finally { if (owner == generation) fileJobs.remove(attachment.id) }
+            } finally { if (owner == generation && historyOwner == historyGeneration) fileJobs.remove(attachment.id) }
         }
         fileJobs[attachment.id] = job
         job.start()
@@ -188,16 +191,17 @@ internal class DesktopSupportChat(
         if (uri == null) return
         val attempt = currentAuthAttempt() ?: return
         val owner = generation
+        val historyOwner = historyGeneration
         update(chat.copy(isSavingAttachment = true, fileError = null))
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 exportAttachment(request.path, uri)
-                if (owner == generation && isCurrent(attempt)) update(chat.copy(isSavingAttachment = false))
+                if (owner == generation && historyOwner == historyGeneration && isCurrent(attempt)) update(chat.copy(isSavingAttachment = false))
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
-                if (owner == generation && isCurrent(attempt)) update(chat.copy(isSavingAttachment = false,
+                if (owner == generation && historyOwner == historyGeneration && isCurrent(attempt)) update(chat.copy(isSavingAttachment = false,
                     fileError = tr(language(), "Не удалось сохранить файл. Нажмите «Сохранить» ещё раз.", "Could not save the file. Tap Save again.")))
-            } finally { if (owner == generation) exportJob = null }
+            } finally { if (owner == generation && historyOwner == historyGeneration) exportJob = null }
         }
         exportJob = job
         job.start()
@@ -217,12 +221,15 @@ internal class DesktopSupportChat(
             try {
                 val page = load(attempt, before)
                 if (owner != generation || !isCurrent(attempt)) return@launch
+                val conversationChanged = conversationId != null && conversationId != page.conversationId
+                if (conversationChanged) clearHistory()
+                conversationId = page.conversationId
                 val missedPage = !older && chat.messages.isNotEmpty() && page.messages.isNotEmpty() &&
                     page.messages.none { fresh -> chat.messages.any { it.id == fresh.id } } &&
                     page.messages.maxOf { it.id } > chat.messages.maxOf { it.id }
                 update(chat.copy(
                     messages = merge(if (missedPage) emptyList() else chat.messages, page.messages),
-                    nextBefore = if (older || !chat.hasLoaded || missedPage) page.nextBefore else chat.nextBefore,
+                    nextBefore = if (conversationChanged || older || !chat.hasLoaded || missedPage) page.nextBefore else chat.nextBefore,
                     hasLoaded = true,
                     isLoading = false,
                     isLoadingOlder = false,
@@ -249,6 +256,7 @@ internal class DesktopSupportChat(
         if (sendJob != null || chat.isPreparingAttachment || (content.isEmpty() && attachments.isEmpty())) return
         val attempt = currentAuthAttempt() ?: return
         val owner = generation
+        val historyOwner = historyGeneration
         // Retrying an uncertain delivery must reuse the idempotency key.
         val paths = attachments.map { it.path }
         val request = pendingSend?.takeIf { it.content == content && it.attachmentPaths == paths }
@@ -257,7 +265,7 @@ internal class DesktopSupportChat(
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val message = send(attempt, request.content, request.id, attachments)
-                if (owner != generation || !isCurrent(attempt)) return@launch
+                if (owner != generation || historyOwner != historyGeneration || !isCurrent(attempt)) return@launch
                 pendingSend = null
                 attachments.forEach { deleteFile(it.path) }
                 update(chat.copy(messages = merge(chat.messages, listOf(message)),
@@ -266,30 +274,40 @@ internal class DesktopSupportChat(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (owner == generation && isCurrent(attempt)) update(chat.copy(isSending = false, sendError = readable(error)))
+                if (owner == generation && historyOwner == historyGeneration && isCurrent(attempt)) update(chat.copy(isSending = false, sendError = readable(error)))
             } finally {
-                if (owner == generation) sendJob = null
+                if (owner == generation && historyOwner == historyGeneration) sendJob = null
             }
         }
         sendJob = job
         job.start()
     }
 
-    fun invalidate() {
-        generation++
-        loadJob?.cancel()
+    private fun clearHistory() {
+        historyGeneration++
         sendJob?.cancel()
-        stageJob?.cancel()
         exportJob?.cancel()
         fileJobs.values.forEach { it.cancel() }
         fileJobs.clear()
-        (chat.attachmentFiles.values + chat.pendingAttachments.map { it.path } + listOfNotNull(chat.saveRequest?.path)).distinct().forEach(deleteFile)
-        loadJob = null
+        (chat.attachmentFiles.values + listOfNotNull(chat.saveRequest?.path)).distinct().forEach(deleteFile)
         sendJob = null
         pendingSend = null
+        exportJob = null
+        update(chat.copy(messages = emptyList(), nextBefore = null, isSending = false, sendError = null,
+            attachmentFiles = emptyMap(), attachmentLoading = emptySet(), attachmentErrors = emptyMap(),
+            saveRequest = null, isSavingAttachment = false, fileError = null))
+    }
+
+    fun invalidate() {
+        generation++
+        clearHistory()
+        conversationId = null
+        loadJob?.cancel()
+        stageJob?.cancel()
+        chat.pendingAttachments.forEach { deleteFile(it.path) }
+        loadJob = null
         pickerAttempt = null
         stageJob = null
-        exportJob = null
         accountEpoch = null
         update(DesktopSupportChatState())
     }

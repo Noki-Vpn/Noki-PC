@@ -62,9 +62,10 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun startupFailureProvidesSafeDetailsAndRetry() {
         val secret = "private-value-must-not-be-copied"
-        val details = desktopStartupFailureDetails(IllegalStateException(secret, com.sun.jna.platform.win32.Win32Exception(13)))
+        val cause = if (DesktopBuild.IS_LINUX) java.io.IOException(secret) else com.sun.jna.platform.win32.Win32Exception(13)
+        val details = desktopStartupFailureDetails(IllegalStateException(secret, cause))
         assertTrue(details.contains("startup_failed"))
-        assertTrue(details.contains("Windows error code: 13"))
+        assertTrue(details.contains(if (DesktopBuild.IS_LINUX) "java.io.IOException" else "Windows error code: 13"))
         assertFalse(details.contains(secret))
         var copied: androidx.compose.ui.text.AnnotatedString? = null
         var clipboardBusy = true
@@ -123,7 +124,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun externalAccountLinksUseTrailingVectorIcons() {
         val vault = WindowsVault(Files.createTempDirectory("noki-external-links"), hardwareIdentity = { "fixture" })
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val base = DesktopState(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false))
         val state = base.copy(settings = base.settings.copy(personalizationSettings = base.settings.personalizationSettings.copy(language = AppLanguage.EN)))
         fun descendants(node: SemanticsNode): Sequence<SemanticsNode> = sequence {
@@ -154,7 +155,7 @@ class DesktopUiTest {
         try {
             keyField?.set(null, ByteArray(32) { it.toByte() })
             val vault = WindowsVault(Files.createTempDirectory("noki-plan-controls-ui"), hardwareIdentity = { "fixture" })
-            val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+            val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
             fun descendants(node: SemanticsNode): Sequence<SemanticsNode> = sequence {
                 yield(node); for (child in node.children) yieldAll(descendants(child))
             }
@@ -257,7 +258,7 @@ class DesktopUiTest {
     @Test fun `support chat composer and compact bubbles render`() = runBlocking<Unit> {
         val directory = Files.createTempDirectory("noki-support-ui")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         @Suppress("UNCHECKED_CAST")
         val chat = DesktopSupportChat::class.java.getDeclaredField("mutable").apply { isAccessible = true }
             .get(app.support) as kotlinx.coroutines.flow.MutableStateFlow<DesktopSupportChatState>
@@ -347,10 +348,10 @@ class DesktopUiTest {
     }
 
     @OptIn(ExperimentalComposeUiApi::class)
-    @Test fun `release protocol picker works without country and Auto waits for verified connection`() = runBlocking<Unit> {
+    @Test fun `release protocol picker works without country and Auto waits for verified connection`() = runBlocking<Unit>(Dispatchers.Main) {
         val directory = Files.createTempDirectory("noki-release-policy-ui")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         withTimeout(5_000) { app.state.first { !it.loading } }
         @Suppress("UNCHECKED_CAST")
         val mutable = DesktopController::class.java.getDeclaredField("mutable").apply { isAccessible = true }
@@ -461,7 +462,7 @@ class DesktopUiTest {
     @Test fun `advanced settings omit the global DNS protection toggle and keep routing accessible`() = runBlocking<Unit> {
         val directory = Files.createTempDirectory("noki-dns-protection-ui")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         withTimeout(5_000) { app.state.first { !it.loading } }
         @Suppress("UNCHECKED_CAST")
         val mutable = DesktopController::class.java.getDeclaredField("mutable").apply { isAccessible = true }
@@ -562,7 +563,7 @@ class DesktopUiTest {
     @Test fun `promo results appear only in a dismissible modal and preserve the applied promo`() = runBlocking {
         val directory = Files.createTempDirectory("noki-promo-dialog")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         withTimeout(5_000) { app.state.first { !it.loading } }
         @Suppress("UNCHECKED_CAST")
         val mutable = DesktopController::class.java.getDeclaredField("mutable").apply { isAccessible = true }
@@ -676,7 +677,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `update button sits above avatar and starts download with progress and retry`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-update-ui"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val state = DesktopState(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false))
         var update by mutableStateOf<DesktopUpdateUi?>(null)
         var downloads = 0
@@ -730,7 +731,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `login matches the Figma split layout and opens code entry`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-login-figma"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val scene = ImageComposeScene(1000, 650, density = Density(1f)) { DesktopContent(DesktopState(), app) }
         fun descendants(node: SemanticsNode): Sequence<SemanticsNode> = sequence {
             yield(node); for (child in node.children) yieldAll(descendants(child))
@@ -795,7 +796,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `invited devices never display the owners email on account screens`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-invited-email"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val ownerEmail = "private-owner@example.invalid"
         fun texts(node: SemanticsNode): List<String> = node.config.getOrNull(SemanticsProperties.Text).orEmpty().map { it.text } + node.children.flatMap(::texts)
         try {
@@ -890,7 +891,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `home country routing and power share a visible hover above their glass`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-home-hover"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val state = DesktopState(user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false))
         val scene = ImageComposeScene(1050, 650, density = Density(1f)) {
             DesktopTheme(null) { DesktopWorkspace(state, app, DesktopPage.HOME, earthVisible = false) }
@@ -920,7 +921,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `near minimum size both background choices leave only the plain canvas`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-compact-canvas"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
             var disabled by mutableStateOf(false)
             val scene = ImageComposeScene(600, 500, density = Density(1f)) {
                 DesktopTheme(null) { DesktopWorkspace(DesktopState(earthDisabled = disabled,
@@ -944,7 +945,7 @@ class DesktopUiTest {
     @Test fun `country destination follows live multihop state and returns to countries after disable`() {
         val directory = Files.createTempDirectory("noki-route-navigation")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val locations = listOf("LV" to "Латвия", "RO" to "Romania").map { (code, label) ->
             ServerLocation(code, code, label, "", "example.invalid", isOnline = true,
                 servers = listOf(VpnServer(code, "$label 1", code, code, "example.invalid", null, true)))
@@ -1030,7 +1031,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class, kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test fun `connection feedback waits for verification and stops when the UI is hidden`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-connection-feedback"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val scheduler = TestCoroutineScheduler()
         var state by mutableStateOf(DesktopState(earthDisabled = true, user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false)))
         var active by mutableStateOf(true)
@@ -1214,7 +1215,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `extra devices reuse management modal and never offer creation`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-device-pools-ui"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val state = DesktopState(earthDisabled = true,
             user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false), currentDeviceId = "current",
             subscription = BackendSubscription("active", "preview", null, 0.0, null, primaryDeviceLimit = 3,
@@ -1262,7 +1263,7 @@ class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
     @Test fun `today chart exposes hourly samples and week exposes daily samples`() {
         val vault = WindowsVault(Files.createTempDirectory("noki-hourly-chart-ui"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         val today = java.time.LocalDate.now()
         val state = DesktopState(earthDisabled = true, user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false),
             dailyStats = listOf(com.noki.vpn.data.DailyStats(today.toString(), rxBytes = 24_000_000, txBytes = 2_400_000,
@@ -1586,7 +1587,7 @@ class DesktopUiTest {
         check(java.awt.EventQueue.isDispatchThread())
         val directory = Files.createTempDirectory("noki-ui-test")
         val vault = WindowsVault(directory)
-        val controller = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val controller = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         try {
             val login = DesktopState()
             val servers = listOf("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222").mapIndexed { index, id ->
@@ -1698,7 +1699,7 @@ class DesktopUiTest {
                 for ((width, height) in sizes) {
                     val renderedState = mutableStateOf(state)
                     val scene = ImageComposeScene(width, height, density = Density(1f), coroutineContext = Dispatchers.Main) {
-                        DesktopContent(renderedState.value, controller, initialPage = page)
+                        DesktopContent(renderedState.value, controller, initialPage = page, reducedMotion = label == "home-example")
                     }
                     var frameNanos = 0L
                     fun renderFrame(time: Long = 0L): org.jetbrains.skia.Image {
@@ -2119,9 +2120,10 @@ class DesktopUiTest {
                                         repeat(3) { renderFrame(time + it * 100_000_000L).close() }
                                         assertFalse("Earth must stop drawing on ${tab.first}", scene.semanticsOwners.any { hasEarth(it.rootSemanticsNode) })
                                         click(55f, 95f)
+                                         awaitEarth(time + 300_000_000L)
                                         for (frame in 0..2) {
                                             val returned = currentImage(time + 300_000_000L + frame * 100_000_000L)
-                                            assertTrue("The first Home frame retains the loaded renderer", scene.semanticsOwners.any { hasEarth(it.rootSemanticsNode) })
+                                             assertTrue("Home reloads the released renderer", scene.semanticsOwners.any { hasEarth(it.rootSemanticsNode) })
                                             val changed = (70 until 530).sumOf { y -> (520 until 970).count { x -> selectedEarth.getRGB(x, y) != returned.getRGB(x, y) } }
                                             assertEquals("Returning from ${tab.first} retains the selected camera on frame $frame", 0, changed)
                                         }

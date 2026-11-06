@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class DesktopControllerTest {
+    private val notificationsPath = if (DesktopBuild.IS_LINUX) "/v1/app/notifications" else "/v1/app/desktop-notifications"
     @Test fun `corrupt local caches do not block startup or change the selected route`() = runBlocking {
         org.junit.Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"))
         val sandbox = Files.createTempDirectory("noki-startup-caches").toAbsolutePath().normalize()
@@ -80,7 +81,7 @@ class DesktopControllerTest {
             okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("OK")
                 .body("{\"access_token\":\"fresh-access\",\"refresh_token\":\"fresh-refresh\"}".toResponseBody("application/json".toMediaType())).build()
         }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(http, "https://example.invalid"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(http, "https://example.invalid"))
         val bothStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
         val responses = kotlinx.coroutines.CompletableDeferred<Unit>()
         val started = java.util.concurrent.atomic.AtomicInteger()
@@ -134,8 +135,8 @@ class DesktopControllerTest {
             val body = when (chain.request().url.encodedPath) {
                 "/v1/app/bootstrap" -> JSONObject().put("user", JSONObject().put("id", "user").put("username", "User").put("email", "user@example.invalid"))
                     .put("devices", JSONArray().put(JSONObject().put("id", "pc-device").put("device_key", vault.deviceKey)
-                        .put("device_name", "PC").put("platform", "windows").put("is_active", true)))
-                "/v1/app/desktop-notifications" -> {
+                        .put("device_name", "PC").put("platform", DesktopBuild.PLATFORM).put("is_active", true)))
+                notificationsPath -> {
                     assertEquals(vault.deviceId, chain.request().header("X-Device-Id"))
                     assertEquals(vault.deviceKey, chain.request().header("X-Device-Key"))
                     entered.countDown(); assertTrue(release.await(5, TimeUnit.SECONDS))
@@ -144,7 +145,7 @@ class DesktopControllerTest {
                     JSONObject().put("notifications", JSONArray().put(JSONObject().put("id", "unread")
                         .put("title", "Notice").put("message", "New message").put("created_at", "2026-10-15T08:00:00Z")))
                 }
-                "/v1/app/desktop-notifications/ack" -> {
+                "$notificationsPath/ack" -> {
                     assertEquals(vault.deviceId, chain.request().header("X-Device-Id"))
                     assertEquals(vault.deviceKey, chain.request().header("X-Device-Key"))
                     val saved = AppNotificationHistoryStore.decodeState(WindowsVault(directory).loadAccountLocal().getString("notifications_user"))
@@ -159,7 +160,7 @@ class DesktopControllerTest {
             okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1).code(status).message("OK")
                 .body(body.toString().toResponseBody("application/json".toMediaType())).build()
         }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(http, "https://example.invalid"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(http, "https://example.invalid"))
         try {
             withTimeout(3_000) { app.state.first { !it.loading && it.user != null } }
             assertTrue(entered.await(2, TimeUnit.SECONDS))
@@ -169,12 +170,12 @@ class DesktopControllerTest {
             assertEquals(listOf("unread"), state.notifications.map { it.id })
             assertFalse(state.loading)
             app.loadNotifications(markRead = true).join()
-            assertEquals(2, acknowledgements.get())
+            assertEquals(if (DesktopBuild.IS_LINUX) 0 else 2, acknowledgements.get())
             assertEquals(1, app.state.value.notifications.size)
             assertFalse(app.state.value.hasUnreadNotifications)
             readStatus.set(503)
             app.loadNotifications(silent = true).join()
-            assertEquals(2, acknowledgements.get())
+            assertEquals(if (DesktopBuild.IS_LINUX) 0 else 2, acknowledgements.get())
             assertEquals(listOf("unread"), app.state.value.notifications.map { it.id })
             app.clearMessage()
             readStatus.set(404)
@@ -207,7 +208,7 @@ class DesktopControllerTest {
         val client = OkHttpClient.Builder().addInterceptor { chain ->
             val request = chain.request(); calls.add(request.url.encodedPath)
             fun device(key: String) = JSONObject().put("id", "existing-pc").put("device_key", key)
-                .put("access_role", "owner").put("platform", "windows").put("device_name", "PC")
+                .put("access_role", "owner").put("platform", DesktopBuild.PLATFORM).put("device_name", "PC")
             val body = when (request.url.encodedPath) {
                 "/v1/app/bootstrap" -> {
                     assertEquals(if (registered) vault.registrationDeviceKey else legacy.deviceKey, request.header("X-Device-Key"))
@@ -222,13 +223,13 @@ class DesktopControllerTest {
                     registered = true
                     device(vault.registrationDeviceKey)
                 }
-                "/v1/app/desktop-notifications" -> JSONObject().put("notifications", JSONArray())
+                notificationsPath -> JSONObject().put("notifications", JSONArray())
                 else -> throw AssertionError("Unexpected request: ${request.url.encodedPath}")
             }
             okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("OK")
                 .body(body.toString().toResponseBody("application/json".toMediaType())).build()
         }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(client, "https://example.invalid"), {})
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(client, "https://example.invalid"), {})
         try {
             withTimeout(5_000) { app.state.first { !it.loading && it.user != null } }
             assertTrue(registered)
@@ -246,14 +247,14 @@ class DesktopControllerTest {
         val vault = WindowsVault(directory)
         val calls = java.util.concurrent.CopyOnWriteArrayList<String>()
         val device = JSONObject().put("id", "pc-invited").put("device_key", vault.deviceKey)
-            .put("access_role", "invited").put("platform", "windows").put("device_name", "Invited PC")
+            .put("access_role", "invited").put("platform", DesktopBuild.PLATFORM).put("device_name", "Invited PC")
         val client = OkHttpClient.Builder().addInterceptor { chain ->
             val request = chain.request(); calls.add(request.url.encodedPath)
             val body = when (request.url.encodedPath) {
                 "/v1/devices/invites/accept" -> {
                     val sent = JSONObject(okio.Buffer().also { request.body!!.writeTo(it) }.readUtf8())
                     assertEquals("ABCDE-12345", sent.getString("invite_code"))
-                    assertEquals("windows", sent.getString("platform"))
+                    assertEquals(DesktopBuild.PLATFORM, sent.getString("platform"))
                     assertEquals(vault.deviceKey, sent.getString("device_key"))
                     assertEquals(vault.publicKey, sent.getString("public_key"))
                     JSONObject().put("access_token", "invited-access").put("refresh_token", "invite-refresh").put("device", device)
@@ -267,19 +268,19 @@ class DesktopControllerTest {
                 "/v1/app/bootstrap" -> JSONObject().put("user", JSONObject().put("id", "fixture")
                     .put("username", "Fixture").put("email", "fixture@example.invalid"))
                     .put("devices", JSONArray().put(device))
-                "/v1/app/desktop-notifications" -> JSONObject().put("notifications", JSONArray())
+                notificationsPath -> JSONObject().put("notifications", JSONArray())
                 else -> throw AssertionError("Unexpected request: ${request.url.encodedPath}")
             }
             okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("OK")
                 .body(body.toString().toResponseBody("application/json".toMediaType())).build()
         }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(client, "https://example.invalid"), {})
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(client, "https://example.invalid"), {})
         try {
             withTimeout(5_000) { app.state.first { !it.loading } }
             app.loginFromCode("noki://invite/abcde-12345")
             try { withTimeout(5_000) { app.state.first { !it.loading && it.user != null } } }
             catch (error: Exception) { throw AssertionError("Code login requests=$calls, state=${app.state.value}", error) }
-            assertEquals(listOf("/v1/devices/invites/accept", "/v1/auth/refresh", "/v1/app/bootstrap"), calls.filterNot { it == "/v1/app/desktop-notifications" })
+            assertEquals(listOf("/v1/devices/invites/accept", "/v1/auth/refresh", "/v1/app/bootstrap"), calls.filterNot { it == notificationsPath })
             assertTrue(app.state.value.invited)
             assertEquals("pc-invited", vault.deviceId)
             assertEquals("invited-access", vault.loadTokens()?.accessToken)
@@ -292,7 +293,7 @@ class DesktopControllerTest {
 
     @Test fun `top messages expire after two seconds and a repeated message gets its own lifetime`() = runBlocking<Unit> {
         val vault = WindowsVault(Files.createTempDirectory("noki-message-lifetime"))
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         try {
             withTimeout(5_000) { app.state.first { !it.loading } }
             val started = System.nanoTime()
@@ -311,7 +312,7 @@ class DesktopControllerTest {
     @Test fun `tray handoff cancels controller jobs without removing the core journal`() = runBlocking {
         val directory = Files.createTempDirectory("noki-tray-handoff")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(baseUrl = "http://127.0.0.1:9"))
         try {
             withTimeout(5_000) { app.state.first { !it.loading } }
             app.setEarthDisabled(true)
@@ -333,7 +334,7 @@ class DesktopControllerTest {
             okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1)
                 .code(503).message("offline").body("{\"detail\":\"offline\"}".toResponseBody("application/json".toMediaType())).build()
         }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(client, "https://example.invalid"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(client, "https://example.invalid"))
         try {
             withTimeout(5_000) { app.state.first { !it.loading } }
             DesktopController::class.java.getDeclaredField("tokens").also { it.isAccessible = true }
@@ -355,7 +356,7 @@ class DesktopControllerTest {
     @Test fun `queued account operation cannot use a replacement session`() = runBlocking {
         val directory = Files.createTempDirectory("noki-account-race")
         val vault = WindowsVault(directory)
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(OkHttpClient(), "https://example.invalid"))
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(OkHttpClient(), "https://example.invalid"))
         val mutex = DesktopController::class.java.getDeclaredField("authOperation").also { it.isAccessible = true }
             .get(app) as kotlinx.coroutines.sync.Mutex
         val tokenField = DesktopController::class.java.getDeclaredField("tokens").also { it.isAccessible = true }
@@ -421,7 +422,7 @@ class DesktopControllerTest {
         val vault = WindowsVault(directory)
         val opened = java.util.concurrent.CopyOnWriteArrayList<String>()
         val http = OkHttpClient.Builder().addInterceptor { throw AssertionError("Website links must not call the API") }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(http, "https://example.invalid"), { opened.add(it) })
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(http, "https://example.invalid"), { opened.add(it) })
         try {
             withTimeout(5_000) { app.state.first { !it.loading } }
             for (section in listOf("plans", "payments", "username", "password", "email")) {
@@ -464,7 +465,7 @@ class DesktopControllerTest {
             okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("OK")
                 .body(response.toString().toResponseBody("application/json".toMediaType())).build()
         }.build()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(http, "https://example.invalid"), browser::set)
+        val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(http, "https://example.invalid"), browser::set)
         try {
             withTimeout(5_000) { app.state.first { !it.loading } }
             app.loginFromWebsite()
@@ -514,7 +515,7 @@ class DesktopControllerTest {
                     JSONObject().put("user", JSONObject().put("id", "user").put("username", "Test").put("email", "test@example.invalid"))
                         .put("devices", JSONArray())
                 }
-                "/v1/app/desktop-notifications" -> JSONObject().put("notifications", JSONArray())
+                notificationsPath -> JSONObject().put("notifications", JSONArray())
                 else -> throw AssertionError("Unexpected path: $path")
             }.toString().toByteArray()
             exchange.responseHeaders.add("Content-Type", "application/json")
@@ -526,11 +527,11 @@ class DesktopControllerTest {
         var app: DesktopController? = null
         try {
             server.start()
-            val restored = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(http, "https://127.0.0.1:${server.address.port}"), {})
+            val restored = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(http, "https://127.0.0.1:${server.address.port}"), {})
             app = restored
             try { withTimeout(5_000) { restored.state.first { !it.loading && it.user != null } } }
             catch (error: Exception) { throw AssertionError("Requests=$calls, message=${restored.state.value.message}", error) }
-            assertEquals(listOf("/v1/auth/refresh", "/v1/app/bootstrap"), calls.filterNot { it == "/v1/app/desktop-notifications" })
+            assertEquals(listOf("/v1/auth/refresh", "/v1/app/bootstrap"), calls.filterNot { it == notificationsPath })
             assertEquals("new-refresh", vault.loadTokens()!!.refreshToken)
         } finally {
             app?.close(); server.stop(0)
@@ -597,7 +598,7 @@ class DesktopControllerTest {
         val avatarUrl = AtomicReference("/v1/app/profile/avatar/photo-1.jpg")
         val userId = AtomicReference("user")
         val device = JSONObject().put("id", "pc-device").put("device_key", vault.deviceKey)
-            .put("device_name", "PC").put("platform", "windows").put("is_active", true).put("access_role", "owner")
+            .put("device_name", "PC").put("platform", DesktopBuild.PLATFORM).put("is_active", true).put("access_role", "owner")
         val catalog = JSONObject().put("user", JSONObject().put("id", "user").put("username", "Test")
             .put("email", "test@example.invalid"))
             .put("devices", JSONArray().put(device))
@@ -629,7 +630,7 @@ class DesktopControllerTest {
                         bootstrapRequests.incrementAndGet()
                     }
                     "/v1/app/profile/avatar" -> JSONObject().put("avatar_url", JSONObject.NULL)
-                    "/v1/app/desktop-notifications" -> JSONObject().put("notifications", JSONArray())
+                    notificationsPath -> JSONObject().put("notifications", JSONArray())
                     "/v1/auth/logout" -> JSONObject()
                     else -> throw AssertionError("Unexpected path: ${exchange.requestURI.path}")
                 }.toString().toByteArray()
@@ -669,7 +670,7 @@ class DesktopControllerTest {
         }
         try {
             server.start()
-            var app = DesktopController(vault, SingBoxRuntime(vault), api, {})
+            var app = DesktopController(vault, stoppedTestRuntime(vault), api, {})
             controller = app
             withTimeout(5_000) { app.state.first { !it.loading } }
             assertFalse(Files.exists(stalePart))
@@ -695,7 +696,7 @@ class DesktopControllerTest {
             assertEquals(1, avatarRequests.get())
             stop(app)
             controller = null
-            app = DesktopController(vault, SingBoxRuntime(vault), api)
+            app = DesktopController(vault, stoppedTestRuntime(vault), api)
             controller = app
             ready(app)
             assertEquals("Restore must reuse the persisted avatar", cached.toString(), app.state.value.avatarPath)
@@ -736,7 +737,7 @@ class DesktopControllerTest {
             assertEquals("avatar-2", Files.readString(cached))
             avatarGate.set(CountDownLatch(1))
 
-            val restored = DesktopController(vault, SingBoxRuntime(vault), api, {})
+            val restored = DesktopController(vault, stoppedTestRuntime(vault), api, {})
             controller = restored
             assertEquals(4, avatarRequest())
             ready(restored)
@@ -780,7 +781,7 @@ class DesktopControllerTest {
     }
 
     @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
-    @Test fun `Android API binds Windows device and retries refresh with persisted request id`() = runBlocking {
+    @Test fun `desktop API binds the current platform device and retries refresh with persisted request id`() = runBlocking {
         val directory = Files.createTempDirectory("noki-controller-test")
         val vault = WindowsVault(directory)
         val calls = java.util.concurrent.CopyOnWriteArrayList<Pair<String, JSONObject>>()
@@ -795,7 +796,7 @@ class DesktopControllerTest {
         val inviteExpiry = AtomicReference<String?>(null)
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         val device = JSONObject().put("id", "pc-device").put("device_key", vault.deviceKey)
-            .put("device_name", "PC").put("platform", "windows").put("is_active", true)
+            .put("device_name", "PC").put("platform", DesktopBuild.PLATFORM).put("is_active", true)
         val catalog = JSONObject().put("user", JSONObject().put("id", "user").put("username", "Test")
             .put("email", "test@example.invalid")).put("devices", JSONArray().put(device))
             .put("subscription", JSONObject().put("status", "active").put("plan_name", "Test plan"))
@@ -850,8 +851,8 @@ class DesktopControllerTest {
                     } else JSONObject().put("invite_code", "ABCDE-12345").put("expires_at", inviteExpiry.get() ?: JSONObject.NULL)
                 }
                 "/v1/app/security/username" -> catalog.getJSONObject("user").put("username", payload.getString("username"))
-                "/v1/app/desktop-notifications/ack" -> JSONObject()
-                "/v1/app/desktop-notifications" -> JSONObject().put("notifications", JSONArray()
+                "$notificationsPath/ack" -> JSONObject()
+                notificationsPath -> JSONObject().put("notifications", JSONArray()
                     .put(JSONObject().put("id", "n1").put("title", "First").put("message", "One").put("created_at", "2026-10-06T08:00:00Z"))
                     .put(JSONObject().put("id", "n2").put("title", "Second").put("message", "Two").put("created_at", "2026-10-05T08:00:00Z")))
                 else -> { status = 404; JSONObject() }
@@ -864,7 +865,7 @@ class DesktopControllerTest {
         var controller: DesktopController? = null
         try {
             server.start()
-            val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(http, "http://127.0.0.1:${server.address.port}"), {},
+            val app = DesktopController(vault, stoppedTestRuntime(vault), BackendApiClient(http, "http://127.0.0.1:${server.address.port}"), {},
                 dnsPolicySnapshot = { WindowsDnsPolicy(emptyList(), emptyList()) })
             controller = app
             withTimeout(5_000) { app.state.first { !it.loading } }
@@ -877,7 +878,7 @@ class DesktopControllerTest {
             assertNull(app.state.value.locations.single().latencyMs)
             assertEquals("Test plan", app.state.value.subscription!!.planName)
             val register = calls.single { it.first.endsWith("/devices/register") }.second
-            assertEquals("windows", register.getString("platform"))
+            assertEquals(DesktopBuild.PLATFORM, register.getString("platform"))
             assertEquals(vault.publicKey, register.getString("public_key"))
             assertEquals("rsa-sha256", register.getString("key_algorithm"))
             assertEquals(43, calls.first().second.getString("code_challenge").length)
@@ -982,7 +983,7 @@ class DesktopControllerTest {
             assertFalse(app.state.value.settings.advancedSettings.anonymousLogsEnabled)
             assertFalse(WindowsVault(directory).loadSettings().advancedSettings.anonymousLogsEnabled)
 
-            val browserRule = DesktopRoutingRule("browser", "Browser", false, applications = listOf("C:\\Apps\\Browser.exe"))
+            val browserRule = DesktopRoutingRule("browser", "Browser", false, applications = listOf(if (DesktopBuild.IS_LINUX) "/opt/apps/browser" else "C:\\Apps\\Browser.exe"))
             app.saveRoutingRule(browserRule)
             withTimeout(5_000) { app.state.first { !it.loading && it.routingRules.contains(browserRule) } }
             assertEquals(app.state.value.routingRules, WindowsVault(directory).loadRoutingRules())
@@ -1000,12 +1001,12 @@ class DesktopControllerTest {
             withTimeout(5_000) { app.state.first { !it.loading && !it.hasUnreadNotifications } }
             app.hideNotification("n1")
             withTimeout(5_000) { app.state.first { !it.loading && it.notifications.size == 1 } }
-            val before = calls.count { it.first == "/v1/app/desktop-notifications" }
+            val before = calls.count { it.first == notificationsPath }
             app.loadNotifications()
-            withTimeout(5_000) { while (calls.count { it.first == "/v1/app/desktop-notifications" } <= before || app.state.value.loading) kotlinx.coroutines.delay(10) }
+            withTimeout(5_000) { while (calls.count { it.first == notificationsPath } <= before || app.state.value.loading) kotlinx.coroutines.delay(10) }
             assertEquals(listOf("n2"), app.state.value.notifications.map { it.id })
             assertFalse(app.state.value.hasUnreadNotifications)
-            assertEquals("windows", calls.last { it.first == "/v1/app/logs" }.second.getString("platform"))
+            assertEquals(DesktopBuild.PLATFORM, calls.last { it.first == "/v1/app/logs" }.second.getString("platform"))
             BackendApiClient(http, "http://127.0.0.1:${server.address.port}").uploadAppLogs("bound", null, null, "Android", "{}")
             assertEquals("android", calls.last { it.first == "/v1/app/logs" }.second.getString("platform"))
 
@@ -1080,4 +1081,9 @@ class DesktopControllerTest {
             Files.delete(directory)
         }
     }
+}
+
+// These controller/scene fixtures have no active VPN; OS shutdown has its own runtime tests.
+internal fun stoppedTestRuntime(vault: WindowsVault): SingBoxRuntime = object : SingBoxRuntime(vault) {
+    override suspend fun stop(restoreInternet: Boolean) = Unit
 }

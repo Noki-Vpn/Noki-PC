@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "com.noki"
-version = "1.7.8"
+version = "1.9.0"
 
 val desktopTarget = providers.gradleProperty("desktopTarget").orElse("windows").get()
 require(desktopTarget in setOf("linux", "windows")) { "desktopTarget must be linux or windows" }
@@ -240,6 +240,9 @@ tasks.matching { it.name in setOf("test", "run", "createDistributable", "package
 
 tasks.named<Test>("test") {
     if (!linuxHost) dependsOn(":nucleus-tao:test")
+    // Render fixtures assert Russian labels regardless of the build host's locale.
+    systemProperty("user.language", "ru")
+    systemProperty("user.country", "RU")
     systemProperty("noki.test.classpath", sourceSets["test"].runtimeClasspath.asPath)
 }
 

@@ -2,6 +2,7 @@ package com.noki.desktop
 
 import com.noki.vpn.data.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import okhttp3.OkHttpClient
@@ -580,6 +581,7 @@ class DesktopConnectionTest {
     }
 
     @Test fun `a read only journal cannot prevent protection or revive old credentials after restart`() = runBlocking {
+        org.junit.Assume.assumeTrue("Requires Windows DOS read-only file semantics", !DesktopBuild.IS_LINUX)
         for (killSwitch in listOf(false, true)) Fixture().use { f ->
             f.ready()
             f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(killSwitchEnabled = killSwitch)) }.join()
@@ -614,6 +616,7 @@ class DesktopConnectionTest {
     }
 
     @Test fun `a failed settings write still protects and stops the revoked tunnel`() = runBlocking {
+        org.junit.Assume.assumeTrue("Requires Windows DOS read-only file semantics", !DesktopBuild.IS_LINUX)
         Fixture().use { f ->
             f.ready(); f.app.connect()
             val connected = withTimeout(15_000) { f.app.state.first { !it.loading && it.verified } }
@@ -635,6 +638,7 @@ class DesktopConnectionTest {
     }
 
     @Test fun `a statistics checkpoint failure cannot prevent stopping a revoked tunnel`() = runBlocking {
+        org.junit.Assume.assumeTrue("Requires Windows DOS read-only file semantics", !DesktopBuild.IS_LINUX)
         Fixture().use { f ->
             f.ready(); f.app.connect()
             val connected = withTimeout(15_000) { f.app.state.first { !it.loading && it.verified } }
@@ -1951,7 +1955,7 @@ class DesktopConnectionTest {
         private val nodes = (1..nodeCount).map { "00000000-0000-4000-8000-${it.toString().padStart(12, '0')}" }
         val bootstrap = JSONObject().put("user", JSONObject().put("id", "fixture-user").put("username", "Fixture").put("email", "fixture@example.invalid"))
             .put("devices", JSONArray().put(JSONObject().put("id", deviceId).put("device_key", vault.deviceKey).put("device_name", "Fixture")
-                .put("platform", "windows").put("is_active", true).put("traffic_pool", trafficPool)))
+                .put("platform", DesktopBuild.PLATFORM).put("is_active", true).put("traffic_pool", trafficPool)))
             .put("subscription", JSONObject().put("status", "active").put("plan_name", "Fixture"))
             .put("locations", JSONArray(nodes.zip(nodeCountries).groupBy { it.second }.map { (country, members) ->
                 JSONObject().put("id", country.lowercase()).put("code", country.lowercase()).put("country_code", country).put("name", if (country == "DE") "Germany" else country)
@@ -2008,7 +2012,7 @@ class DesktopConnectionTest {
                     incyPoolCalls.incrementAndGet()
                     incyDevices.getJSONObject(0).put("traffic_pool", payload.getString("traffic_pool"))
                 }
-                "/v1/app/desktop-notifications" -> JSONObject().put("notifications", JSONArray())
+                "/v1/app/desktop-notifications", "/v1/app/notifications" -> JSONObject().put("notifications", JSONArray())
                 "/v1/devices/challenge" -> synchronized(proofLock) {
                     challengeNonce = "fixture-device-nonce-${challengeCounter.incrementAndGet()}"
                     JSONObject().put("device_id", deviceId).put("nonce", challengeNonce)
@@ -2114,7 +2118,12 @@ class DesktopConnectionTest {
                 latencySampler = { ClientLatencySampler(tcpConnect = { _, _, _ -> tcpCalls.incrementAndGet(); tcpLatency.get().takeIf { it >= 0 } }, icmpPing = { _, _, _ -> null }) },
                 monotonicMillis = clock::get, dnsPolicySnapshot = { dnsSnapshot() })
         }
-        suspend fun ready() { withTimeout(5_000) { app.state.first { !it.loading && it.user != null } } }
+        suspend fun ready() = withTimeout(5_000) {
+            app.state.first { !it.loading && it.user != null }
+            val operation = DesktopController::class.java.getDeclaredField("operation").apply { isAccessible = true }
+                .get(app) as kotlinx.coroutines.sync.Mutex
+            operation.withLock { }
+        }
         suspend fun measureLatencies() {
             app.refreshServerLatencies()
             (DesktopController::class.java.getDeclaredField("latencyJob").also { it.isAccessible = true }.get(app) as Job?)?.join()

@@ -18,8 +18,11 @@ if (!$JavaHome -or !(Test-Path -LiteralPath (Join-Path $JavaHome 'bin\java.exe')
 Push-Location $root
 try {
     & (Join-Path $PSScriptRoot 'prepare-updater.ps1') -Packaging
+    $ErrorActionPreference = 'Continue'
     & (Join-Path $JavaHome 'bin\java.exe') -classpath 'gradle\wrapper\gradle-wrapper.jar' org.gradle.wrapper.GradleWrapperMain --no-daemon :test createGraalvmNativeDistributable
-    if ($LASTEXITCODE -ne 0) { throw 'Desktop build or tests failed' }
+    $buildExitCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($buildExitCode -ne 0) { throw 'Desktop build or tests failed' }
     # The packaged guard entry point must reject another identity before any vault/WFP access.
     $packageRoot = Join-Path $root 'build\compose\binaries\main\graalvm-app\Noki'
     Copy-Item -LiteralPath (Join-Path $root 'src\main\resources\licenses') -Destination $packageRoot -Recurse -Force

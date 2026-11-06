@@ -8,27 +8,27 @@ VPN client for Windows and Linux.
 
 ### Windows
 
-Download the installer or portable version from the [Noki website](https://noki.ykino.tech). Install Noki or extract the portable archive, then launch the app.
+Download the installer or portable version from [Releases](https://github.com/Noki-Vpn/Noki-PC/releases/latest) or the [Noki website](https://noki.ykino.tech). Install Noki or extract the portable archive, then launch the app.
 
 ### Arch Linux and derivatives (pacman)
 
 ```bash
-curl -fLO https://github.com/Noki-Vpn/Noki-PC/releases/download/v1.7.6/noki-1.7.6-1-x86_64.pkg.tar.zst
-sudo pacman -U ./noki-1.7.6-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/Noki-Vpn/Noki-PC/releases/download/v1.9.0/noki-1.9.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./noki-1.9.0-1-x86_64.pkg.tar.zst
 ```
 
 ### Debian 12+, Ubuntu 24.04+ and derivatives (APT)
 
 ```bash
-curl -fLO https://github.com/Noki-Vpn/Noki-PC/releases/download/v1.7.6/Noki-1.7.6-linux-amd64.deb
-sudo apt install ./Noki-1.7.6-linux-amd64.deb
+curl -fLO https://github.com/Noki-Vpn/Noki-PC/releases/download/v1.9.0/Noki-1.9.0-linux-amd64.deb
+sudo apt install ./Noki-1.9.0-linux-amd64.deb
 ```
 
 ### Fedora (DNF)
 
 ```bash
-curl -fLO https://github.com/Noki-Vpn/Noki-PC/releases/download/v1.7.6/noki-1.7.6-1.x86_64.rpm
-sudo dnf install ./noki-1.7.6-1.x86_64.rpm
+curl -fLO https://github.com/Noki-Vpn/Noki-PC/releases/download/v1.9.0/noki-1.9.0-1.x86_64.rpm
+sudo dnf install ./noki-1.9.0-1.x86_64.rpm
 ```
 
 On Linux, open Noki from the application menu or run:

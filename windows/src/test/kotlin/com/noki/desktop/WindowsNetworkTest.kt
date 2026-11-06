@@ -124,10 +124,7 @@ class WindowsNetworkTest {
             val policy = assertNativePolicyMatchesWindows()
             val plain = policy.nrpt.single { it.namespace == ".plain.$suffix" }
             assertEquals(listOf("192.0.2.53", "192.0.2.54"), plain.servers)
-            if (plain.unsupportedSecurity) {
-                fail("Unexpected security options for the plain test rule: " + powershellReference(
-                    "Get-DnsClientNrptPolicy -Effective -Namespace '.plain.$suffix' | Format-List * | Out-String"))
-            }
+            // Machine-wide query/fallback restrictions are checked against the Windows oracle above.
             assertTrue(policy.nrpt.single { it.namespace == "public.plain.$suffix" }.servers.isEmpty())
             assertTrue(policy.nrpt.single { it.namespace == ".secure.$suffix" }.unsupportedSecurity)
         } finally {
@@ -272,12 +269,15 @@ class WindowsNetworkTest {
     }
 
     @Test fun `NRPT security restrictions cannot silently become ordinary UDP queries`() {
+        assertFalse(parseWindowsNrptPolicy("""[{"Namespace":"corp.test","NameServers":["192.0.2.53"],"NameEncoding":"Punycode","QueryPolicy":"QueryBoth","SecureNameQueryFallback":"Disable"}]""")
+            .single().unsupportedSecurity)
         for (property in listOf("DirectAccessEnabled", "DirectAccessQueryIPsecRequired", "DnsSecQueryIPsecRequired", "DnsSecValidationRequired")) {
             assertTrue(parseWindowsNrptPolicy("""[{"Namespace":"corp.test","$property":true}]""").single().unsupportedSecurity)
             assertFalse(parseWindowsNrptPolicy("""[{"Namespace":"corp.test","$property":false}]""").single().unsupportedSecurity)
         }
         for ((property, value) in listOf("DnsSecQueryIPsecEncryption" to "High", "QueryPolicy" to "QueryIPv6Only",
-            "SecureNameQueryFallback" to "FallbackSecure", "DirectAccessProxyType" to "UseProxyName", "NameEncoding" to "Disable")) {
+            "SecureNameQueryFallback" to "FallbackSecure", "SecureNameQueryFallback" to "FallbackPrivate",
+            "DirectAccessProxyType" to "UseProxyName", "NameEncoding" to "Disable")) {
             assertTrue(parseWindowsNrptPolicy("""[{"Namespace":"corp.test","$property":"$value"}]""").single().unsupportedSecurity)
         }
     }

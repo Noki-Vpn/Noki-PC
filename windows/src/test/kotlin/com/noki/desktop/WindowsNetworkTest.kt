@@ -110,7 +110,7 @@ class WindowsNetworkTest {
         val owned = mutableListOf<String>()
         fun add(namespace: String, options: String) {
             val identifier = powershellReference("""
-                ${'$'}created = Add-DnsClientNrptRule -Namespace '$namespace' -Comment '$suffix' -PassThru $options
+                ${'$'}created = Add-DnsClientNrptRule -Namespace '$namespace' -Comment '$suffix' -NameEncoding Punycode -PassThru $options
                 try { ConvertTo-Json -InputObject @(${'$'}created.Name) -Compress }
                 catch { Remove-DnsClientNrptRule -Name ${'$'}created.Name -Force; throw }
             """.trimIndent()).let { JSONArray(it).getString(0) }
@@ -119,12 +119,15 @@ class WindowsNetworkTest {
         }
         try {
             add(".plain.$suffix", "-NameServers @('192.0.2.53','192.0.2.54')")
-            add("public.plain.$suffix", "-NameEncoding 'Punycode'")
+            add("public.plain.$suffix", "")
             add(".secure.$suffix", "-NameServers '2001:db8::53' -DnsSecEnable -DnsSecValidationRequired")
             val policy = assertNativePolicyMatchesWindows()
             val plain = policy.nrpt.single { it.namespace == ".plain.$suffix" }
             assertEquals(listOf("192.0.2.53", "192.0.2.54"), plain.servers)
-            assertFalse(plain.unsupportedSecurity)
+            if (plain.unsupportedSecurity) {
+                fail("Unexpected security options for the plain test rule: " + powershellReference(
+                    "Get-DnsClientNrptPolicy -Effective -Namespace '.plain.$suffix' | Format-List * | Out-String"))
+            }
             assertTrue(policy.nrpt.single { it.namespace == "public.plain.$suffix" }.servers.isEmpty())
             assertTrue(policy.nrpt.single { it.namespace == ".secure.$suffix" }.unsupportedSecurity)
         } finally {

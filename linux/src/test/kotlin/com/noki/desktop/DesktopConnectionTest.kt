@@ -736,8 +736,9 @@ class DesktopConnectionTest {
             assertFalse(f.app.state.value.displayedSettings.advancedSettings.youtubeAdBlockEnabled)
             assertTrue(f.runtime.starts.last().similar(main))
             assertEquals(1, f.sessionNodes.size)
-            assertTrue(f.youtubeRevokeCalls.get() > 0)
-            assertNull(f.vault.readEncrypted("youtube-revoke.dpapi"))
+            withTimeout(5_000) {
+                while (f.youtubeRevokeCalls.get() == 0 || f.vault.readEncrypted("youtube-revoke.dpapi") != null) delay(10)
+            }
             assertEquals(0, f.proofFailures.get())
         }
     }

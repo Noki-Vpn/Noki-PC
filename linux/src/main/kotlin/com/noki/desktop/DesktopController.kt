@@ -1322,6 +1322,7 @@ class DesktopController internal constructor(
         val multiHop = resolveMultiHop(settings.advancedSettings.multiHop, locations.flatMap { it.servers }, false)
         val nodes: List<VpnServer?> = if (multiHop.enabled) listOf(null) else servers
         check(nodes.isNotEmpty()) { "Нет доступных серверов для выбранного маршрута" }
+        val geositeBytes = geosites.await()
         var lastFailure: Exception = IllegalStateException("Выбранный протокол недоступен. Выберите другой протокол или Auto")
         for ((index, server) in nodes.withIndex()) {
             val session = try { createDirectSession(device, settings, server, multiHop) }
@@ -1333,7 +1334,7 @@ class DesktopController internal constructor(
             }
             check(session.canConnect) { "VPN недоступен для текущей подписки или устройства" }
             if (eligibleCandidates(session, settings).isEmpty()) continue
-            return@coroutineScope DirectPreparation(settings, catalog, locations, multiHop, nodes.drop(index), session, geosites.await(), monotonicMillis())
+            return@coroutineScope DirectPreparation(settings, catalog, locations, multiHop, nodes.drop(index), session, geositeBytes, monotonicMillis())
         }
         throw lastFailure
     }
@@ -2081,6 +2082,7 @@ class DesktopController internal constructor(
         var privateKey: ByteArray? = null
         var reserved: BackendRuWireGuardIdentity? = null
         try {
+            val geositeBytes = geosites.await()
             val (ready, exit, settings) = withTimeoutOrNull(30_000L) {
                 val requestedMultiHop = requestedSettings.advancedSettings.multiHop
                 val requestedHops = if (requestedMultiHop.entry?.kind == ServerSelectionMode.SERVER &&
@@ -2153,7 +2155,6 @@ class DesktopController internal constructor(
             val controlPort = SingBoxRuntime.freePort(); var probePort = SingBoxRuntime.freePort()
             while (controlPort == probePort) probePort = SingBoxRuntime.freePort()
             val secret = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32).also { SecureRandom().nextBytes(it) })
-            val geositeBytes = geosites.await()
             val policy = dnsPolicy.await()
             val config = runInterruptible(Dispatchers.IO) {
                 SingBoxConfig.generateWireGuard(ready, checkNotNull(privateKey), controlPort, secret, probePort,

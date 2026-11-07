@@ -980,9 +980,19 @@ class SingBoxRuntimeTest {
         var fixtureProcess: Process? = null
         try {
             val apiPort = SingBoxRuntime.freePort()
-            var dnsPort = SingBoxRuntime.freePort()
-            while (dnsPort == apiPort || dnsPort == direct.first.localPort || dnsPort == protected.first.localPort)
-                dnsPort = SingBoxRuntime.freePort()
+            fun freeDnsPort(): Int {
+                repeat(20) {
+                    java.net.DatagramSocket(java.net.InetSocketAddress(loopback, 0)).use { udp ->
+                        if (udp.localPort != apiPort) {
+                            try {
+                                java.net.ServerSocket(udp.localPort, 1, loopback).use { return udp.localPort }
+                            } catch (_: java.net.BindException) { }
+                        }
+                    }
+                }
+                error("No free TCP/UDP loopback port for the DNS fixture")
+            }
+            val dnsPort = freeDnsPort()
             val secret = UUID.randomUUID().toString()
             val config = JSONObject()
                 .put("log", JSONObject().put("level", "debug").put("output", directory.resolve("core.log").toString()))

@@ -1602,18 +1602,14 @@ class DesktopController internal constructor(
         if (!activeSettings().advancedSettings.youtubeAdBlockEnabled || !state.value.running) { youtubeJob = null; return }
         val owner = attempt() ?: return
         val device = registered ?: return
-        val primary = activeSettings().let { if (it.advancedSettings.ruRelayEnabled) null else it.profile }
         youtubeJob = scope.launch {
             previous?.join()
             if (!youtubeCurrent(epoch, owner)) return@launch
-            runYoutubeAccess(epoch, owner, device, primary)
+            runYoutubeAccess(epoch, owner, device)
         }
     }
 
-    private suspend fun runYoutubeAccess(epoch: Long, owner: AuthSessionAttempt, device: BackendDevice,
-                                         primary: VlessProfile?) = coroutineScope {
-        var keyBytes: ByteArray? = null
-        var keyId: String? = null
+    private suspend fun runYoutubeAccess(epoch: Long, owner: AuthSessionAttempt, device: BackendDevice) = coroutineScope {
         var grant: BackendYoutubeAccess? = null
         var leaseTimer: Job? = null
         var createAttempted = false
@@ -1631,7 +1627,6 @@ class DesktopController internal constructor(
                     "youtube_access_generation_mismatch"
                 }
             }
-            require(response.mode != "wireguard" || response.status != "ready" || response.publicKeyId == keyId) { "youtube_access_key_mismatch" }
             try { stageYoutubeRevoke(response) } catch (error: Exception) {
                 runCatching { api.revokeYoutubeAccess(response.grantId, response.revokeToken) }
                 throw error
@@ -1643,7 +1638,7 @@ class DesktopController internal constructor(
             withDeviceProof(device.id) { token, nonce, signature ->
                 createAttempted = true
                 api.createYoutubeAccess(token, YoutubeAccessRequest(device.id, device.deviceKey, nonce, signature,
-                    requestId, keyId, primary?.endpointCode?.takeIf(String::isNotBlank)))
+                    requestId))
             }
         }
         suspend fun apply(connection: YoutubeConnectionConfig?, message: String?, confirmed: BackendYoutubeAccess? = null) = operation.withLock {
@@ -1658,21 +1653,15 @@ class DesktopController internal constructor(
         }
         try {
             revokeYoutubePending()
-            val keys = vault.wireGuardKeyPair()
-            keyBytes = keys.first
             while (youtubeCurrent(epoch, owner)) {
                 try {
-                    if (keyId == null) keyId = withContext(NonCancellable) { withDeviceProof(device.id) { token, nonce, signature ->
-                        api.registerRuWireGuardKey(token, device.id, device.deviceKey, nonce, signature, keys.second).id
-                    } }
                     val currentGrant = grant ?: create()
                     currentCoroutineContext().ensureActive()
                     if (!youtubeCurrent(epoch, owner)) break
                     when (currentGrant.status) {
                         "ready" -> {
                             check(currentGrant.expiresAtEpochMillis > System.currentTimeMillis()) { "youtube_access_expired" }
-                            val connection = YoutubeConnectionConfig.fromReady(currentGrant, primary, checkNotNull(keyId), keys.first,
-                                expectedDeviceId = device.id)
+                            val connection = YoutubeConnectionConfig.fromReady(currentGrant)
                             apply(connection, null, currentGrant)
                             leaseTimer?.cancel()
                             leaseTimer = launch {
@@ -1729,10 +1718,9 @@ class DesktopController internal constructor(
             "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
         finally {
             leaseTimer?.cancel()
-            keyBytes?.fill(0)
             withContext(NonCancellable) {
                 // Recover a lost create reply by its stable request ID before capability-only cleanup.
-                if (createAttempted && grant == null && keyId != null && current(owner)) runCatching { create() }
+                if (createAttempted && grant == null && current(owner)) runCatching { create() }
                 if (youtubeEpoch.get() == epoch || youtubeGrantId == grant?.grantId) youtubeGrantId = null
                 runCatching { revokeYoutubePending() }
             }

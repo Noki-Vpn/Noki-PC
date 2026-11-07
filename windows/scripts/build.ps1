@@ -1,4 +1,4 @@
-param([string]$JavaHome = $env:JAVA_HOME, [string]$ReleaseDirectory = '')
+param([string]$JavaHome = $env:JAVA_HOME, [string]$ReleaseDirectory = '', [switch]$SkipTests)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -Force
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -18,8 +18,14 @@ if (!$JavaHome -or !(Test-Path -LiteralPath (Join-Path $JavaHome 'bin\java.exe')
 Push-Location $root
 try {
     & (Join-Path $PSScriptRoot 'prepare-updater.ps1') -Packaging
+    $gradleTasks = @('createGraalvmNativeDistributable')
+    if ($SkipTests) {
+        Write-Output 'Kotlin tests skipped (-SkipTests); client tests must be run manually.'
+    } else {
+        $gradleTasks = @(':test') + $gradleTasks
+    }
     $ErrorActionPreference = 'Continue'
-    & (Join-Path $JavaHome 'bin\java.exe') -classpath 'gradle\wrapper\gradle-wrapper.jar' org.gradle.wrapper.GradleWrapperMain --no-daemon :test createGraalvmNativeDistributable
+    & (Join-Path $JavaHome 'bin\java.exe') -classpath 'gradle\wrapper\gradle-wrapper.jar' org.gradle.wrapper.GradleWrapperMain --no-daemon @gradleTasks
     $buildExitCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
     if ($buildExitCode -ne 0) { throw 'Desktop build or tests failed' }

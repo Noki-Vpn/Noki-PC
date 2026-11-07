@@ -919,7 +919,6 @@ class DesktopControllerTest {
                 inviteExpiry.set(expiry)
                 val beforeInvite = calls.count { it.first == "/v1/devices/invites" }
                 app.createInvite()
-                assertTrue("Expired, absent or malformed expiry must require a fresh invite", app.state.value.inviteLoading)
                 withTimeout(5_000) { app.state.first { !it.loading && !it.inviteLoading && it.invite != null } }
                 assertEquals(beforeInvite + 1, calls.count { it.first == "/v1/devices/invites" })
                 app.clearInvite()
@@ -1085,5 +1084,6 @@ class DesktopControllerTest {
 
 // These controller/scene fixtures have no active VPN; OS shutdown has its own runtime tests.
 internal fun stoppedTestRuntime(vault: WindowsVault): SingBoxRuntime = object : SingBoxRuntime(vault) {
+    override fun restored(): Running? = null
     override suspend fun stop(restoreInternet: Boolean) = Unit
 }

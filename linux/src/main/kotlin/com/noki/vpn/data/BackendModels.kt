@@ -347,8 +347,6 @@ data class YoutubeAccessRequest(
     val deviceNonce: String,
     val deviceSignature: String,
     val requestId: String,
-    val publicKeyId: String? = null,
-    val primaryEndpointCode: String? = null,
 )
 
 data class BackendYoutubeAccess(
@@ -358,13 +356,8 @@ data class BackendYoutubeAccess(
     val generation: Int,
     val expiresAtEpochMillis: Long,
     val revokeToken: String,
-    val publicKeyId: String? = null,
-    val wireguard: BackendRuWireGuardConfig? = null,
     val endpoint: BackendEndpointCandidate? = null,
     val vpnSecret: String? = null,
-    val nokinvDeviceId: String? = null,
-    val nokinvCredentialGeneration: Int = 0,
-    val vpnUsername: String? = null,
 )
 
 sealed interface BackendRuWireGuardSession {

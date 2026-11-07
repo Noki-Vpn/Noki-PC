@@ -712,6 +712,13 @@ class DesktopConnectionTest {
             assertEquals("route", youtubeTcpAction(f.runtime.starts.last()))
             assertEquals(1, f.sessionNodes.size)
             assertEquals(0, f.proofFailures.get())
+            assertEquals(0, f.wireGuardRegistrationCalls.get())
+            for (request in f.youtubeRequests.filter { it.method != "DELETE" })
+                assertEquals("fixed_reality_tcp_v1", request.header("X-Youtube-Transport"))
+            val create = f.youtubeRequests.first { it.method == "POST" && it.url.encodedPath.endsWith("youtube-access") }
+            val body = JSONObject(Buffer().also { create.body!!.writeTo(it) }.readUtf8())
+            assertFalse(body.has("public_key_id"))
+            assertFalse(body.has("primary_endpoint_code"))
             assertFalse("The canonical main config must not retain an expired extra direction",
                 f.mainConfig().toString().contains("youtube-ru"))
         }
@@ -813,7 +820,7 @@ class DesktopConnectionTest {
     }
 
     private companion object {
-        fun youtubeEndpoint(config: JSONObject): JSONObject? = config.optJSONArray("endpoints")?.let { endpoints ->
+        fun youtubeEndpoint(config: JSONObject): JSONObject? = config.optJSONArray("outbounds")?.let { endpoints ->
             (0 until endpoints.length()).map { endpoints.getJSONObject(it) }.firstOrNull { it.optString("tag") == "youtube-ru" }
         }
 
@@ -1921,6 +1928,7 @@ class DesktopConnectionTest {
         @Volatile var bootstrapGate: java.util.concurrent.CountDownLatch? = null
         @Volatile var sessionGate: java.util.concurrent.CountDownLatch? = null
         val youtubeCreateCalls = AtomicInteger()
+        val wireGuardRegistrationCalls = AtomicInteger()
         val youtubePollCalls = AtomicInteger()
         val youtubeRenewCalls = AtomicInteger()
         val youtubeRevokeCalls = AtomicInteger()
@@ -2019,12 +2027,15 @@ class DesktopConnectionTest {
                     JSONObject().put("device_id", deviceId).put("nonce", challengeNonce)
                 }
                 "/v1/vpn/wireguard-keys" -> {
+                    wireGuardRegistrationCalls.incrementAndGet()
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
                     JSONObject().put("id", youtubeKeyId).put("public_key", payload.getString("public_key"))
                 }
                 "/v1/vpn/youtube-access" -> {
                     youtubeRequests += request
                     val create = youtubeCreateCalls.incrementAndGet()
+                    if (request.header("X-Youtube-Transport") != "fixed_reality_tcp_v1" ||
+                        payload.has("public_key_id") || payload.has("primary_endpoint_code")) status = 400
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
                     synchronized(proofLock) {
                         val requestId = payload.getString("request_id")
@@ -2049,6 +2060,7 @@ class DesktopConnectionTest {
                         }
                         JSONObject().put("ok", true)
                     } else {
+                        if (request.header("X-Youtube-Transport") != "fixed_reality_tcp_v1") status = 400
                         youtubePollCalls.incrementAndGet()
                         if (!consumeProof(request.header("X-Device-Nonce"))) status = 403
                         synchronized(proofLock) {
@@ -2058,6 +2070,7 @@ class DesktopConnectionTest {
                     }
                 }
                 "/v1/vpn/youtube-access/$youtubeGrantId/renew" -> {
+                    if (request.header("X-Youtube-Transport") != "fixed_reality_tcp_v1") status = 400
                     youtubeRequests += request
                     youtubeRenewCalls.incrementAndGet()
                     if (!consumeProof(request.header("X-Device-Nonce"))) status = 403
@@ -2158,16 +2171,17 @@ class DesktopConnectionTest {
             }
         }
         private fun youtubeResponse(): JSONObject = synchronized(proofLock) {
-            val response = JSONObject().put("version", 1).put("mode", "wireguard").put("status", youtubeStatus)
+            val response = JSONObject().put("version", 1).put("mode", "selected_transport").put("status", youtubeStatus)
                 .put("grant_id", youtubeGrantId).put("generation", youtubeGeneration)
                 .put("expires_at", java.time.Instant.ofEpochMilli(youtubeExpiresAt).toString()).put("revoke_token", "r".repeat(43))
             if (youtubeStatus == "ready") {
                 if (youtubeFirstReadyExpiresAt == 0L) youtubeFirstReadyExpiresAt = youtubeExpiresAt
                 youtubeReadyReplies.incrementAndGet()
-                response.put("public_key_id", youtubeKeyId).put("wireguard", JSONObject()
-                    .put("endpoint", "192.0.2.50:51820").put("address", "10.89.0.2/32")
-                    .put("server_public_key", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 }))
-                    .put("mtu", 1280).put("dns", JSONArray().put("1.1.1.1")).put("allowed_ips", JSONArray().put("0.0.0.0/0")))
+                response.put("vpn_secret", "99999999-9999-4999-8999-999999999999").put("endpoint", JSONObject()
+                    .put("code", "youtube-reality").put("node_id", deviceId)
+                    .put("entry_host", "yt1.noki.ykino.tech").put("server_name", "yt1.noki.ykino.tech").put("entry_port", 443)
+                    .put("proxy_type", "vless").put("security", "reality").put("transport", "tcp")
+                    .put("flow", "xtls-rprx-vision").put("public_key", "p".repeat(43)).put("short_id", "0123456789abcdef"))
             }
             response
         }

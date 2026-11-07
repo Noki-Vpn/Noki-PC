@@ -489,15 +489,14 @@ class BackendApiClient(
         }
     }
 
-    suspend fun createYoutubeAccess(token: String, request: YoutubeAccessRequest): BackendYoutubeAccess =
-        BackendYoutubeAccessJsonParser.parse(postJson("/vpn/youtube-access", request.toBackendJson(),
-            token, request.deviceId, request.deviceKey)).also { access ->
-            if (access.status == "ready" && access.mode == "wireguard") {
-                require(access.publicKeyId == request.publicKeyId?.let(::canonicalRuUuid)) {
-                    "youtube_access_key_mismatch"
-                }
-            }
-        }
+    suspend fun createYoutubeAccess(token: String, request: YoutubeAccessRequest): BackendYoutubeAccess = withContext(Dispatchers.IO) {
+        BackendYoutubeAccessJsonParser.parse(execute(Request.Builder()
+            .url(jsonApi.apiUrl("/vpn/youtube-access"))
+            .header("Authorization", "Bearer $token")
+            .header("X-Youtube-Transport", "fixed_reality_tcp_v1")
+            .currentDeviceHeaders(request.deviceId, request.deviceKey)
+            .post(request.toBackendJson().toString().toRequestBody(JSON_MEDIA_TYPE)).build()))
+    }
 
     suspend fun pollYoutubeAccess(
         token: String, deviceId: String, deviceKey: String?, deviceNonce: String,
@@ -520,6 +519,7 @@ class BackendApiClient(
         val url = jsonApi.apiUrl("/vpn/youtube-access/${canonicalRuUuid(grantId)}$suffix").toHttpUrl().newBuilder()
             .addQueryParameter("device_id", canonicalRuUuid(deviceId)).build()
         val builder = Request.Builder().url(url).header("Authorization", "Bearer $token")
+            .header("X-Youtube-Transport", "fixed_reality_tcp_v1")
             .currentDeviceHeaders(deviceId, deviceKey, deviceNonce, deviceSignature)
         if (generation == null) builder.get() else builder.post(JSONObject().put("generation", generation)
             .toString().toRequestBody(JSON_MEDIA_TYPE))

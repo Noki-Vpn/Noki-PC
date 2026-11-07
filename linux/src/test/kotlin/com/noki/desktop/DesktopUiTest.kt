@@ -255,7 +255,7 @@ class DesktopUiTest {
     }
 
     @OptIn(ExperimentalComposeUiApi::class)
-    @Test fun `support chat composer and compact bubbles render`() = runBlocking<Unit> {
+    @Test fun `support chat composer and compact bubbles render`() = runBlocking<Unit>(Dispatchers.Main) {
         val directory = Files.createTempDirectory("noki-support-ui")
         val vault = WindowsVault(directory)
         val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
@@ -266,7 +266,7 @@ class DesktopUiTest {
             com.noki.vpn.data.BackendSupportMessage(1, "Здравствуйте!", "outgoing", 1),
             com.noki.vpn.data.BackendSupportMessage(2, "какой ещё боб", "incoming", 2, status = "read")))
         val state = DesktopState(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false))
-        val scene = ImageComposeScene(1100, 850, density = Density(1f)) {
+        val scene = ImageComposeScene(1100, 850, density = Density(1f), coroutineContext = Dispatchers.Main) {
             DesktopContent(state, app, initialPage = DesktopPage.SUPPORT, earthVisible = false)
         }
         fun descendants(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); for (child in node.children) yieldAll(descendants(child)) }
@@ -1721,12 +1721,13 @@ class DesktopUiTest {
                             fun hasRender(node: SemanticsNode): Boolean =
                                 node.config.getOrNull(SemanticsProperties.ContentDescription)?.contains("Рендер с сайта Noki") == true || node.children.any(::hasRender)
                             var loaded = false
-                            for (frame in 0 until 100) {
+                            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                            while (System.nanoTime() < deadline) {
                                 renderFrame().close()
                                 if (scene.semanticsOwners.any { hasRender(it.rootSemanticsNode) }) { loaded = true; break }
                                 delay(10)
                             }
-                            assertTrue("Login must display the site render", loaded)
+                            assertTrue("$label ${width}x$height: Login must display the site render", loaded)
                         }
                         if (state.user != null && DesktopUiKit.sceneFits(width.dp, height.dp) && page in setOf(DesktopPage.HOME, DesktopPage.SERVERS, DesktopPage.MULTIHOP, DesktopPage.PROTOCOL)) awaitEarth(400_000_000L)
                         if (label == "home-example" && width in listOf(1000, 1920)) {

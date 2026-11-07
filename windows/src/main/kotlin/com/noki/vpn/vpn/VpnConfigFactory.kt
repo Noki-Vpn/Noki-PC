@@ -14,51 +14,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 sealed interface YoutubeConnectionConfig {
-    data class WireGuard(val wireguard: BackendRuWireGuardConfig, val privateKey: ByteArray) : YoutubeConnectionConfig
     data class SelectedTransport(val profile: VlessProfile) : YoutubeConnectionConfig
 
     companion object {
-        fun fromReady(access: BackendYoutubeAccess, primary: VlessProfile?, publicKeyId: String,
-                      privateKey: ByteArray, expectedDeviceId: String? = null): YoutubeConnectionConfig {
-            require(access.status == "ready") { "youtube_access_not_ready" }
-            return when (access.mode) {
-                "wireguard" -> {
-                    require(access.publicKeyId == publicKeyId) { "youtube_access_key_mismatch" }
-                    WireGuard(requireNotNull(access.wireguard), privateKey)
-                }
-                "selected_transport" -> {
-                    require(primary != null && primary.endpointCode.isNotBlank()) { "youtube_primary_transport_missing" }
-                    val endpoint = requireNotNull(access.endpoint)
-                    require(!endpoint.canaryOnly && EndpointSecurityPolicy.isAllowedCandidate(endpoint)) { "youtube_endpoint_unsupported" }
-                    if (endpoint.proxyType.equals("nokinv", true)) {
-                        require(access.nokinvDeviceId != null && runCatching { java.util.UUID.fromString(access.nokinvDeviceId).toString() }
-                            .getOrNull() == access.nokinvDeviceId && (expectedDeviceId == null || access.nokinvDeviceId == expectedDeviceId)) {
-                            "youtube_device_mismatch"
-                        }
-                    }
-                    val profile = EndpointSelector.profileFromCandidate(endpoint, requireNotNull(access.vpnSecret), access.vpnUsername.orEmpty()).let { profile ->
-                        if (endpoint.proxyType.equals("nokinv", true)) profile.copy(
-                            nokinvToken = requireNotNull(access.vpnSecret), nokinvCredentialGeneration = access.nokinvCredentialGeneration,
-                            nokinvMode = primary.nokinvMode,
-                            transportMode = if (endpoint.transportMode.isNullOrBlank()) primary.transportMode else profile.transportMode,
-                        ) else profile
-                    }
-                    require(transportFamily(profile) == transportFamily(primary)) { "youtube_transport_mismatch" }
-                    VpnConfigFactory.buildProbe(profile)
-                    SelectedTransport(profile)
-                }
-                else -> throw IllegalArgumentException("youtube_access_mode_invalid")
-            }
-        }
-
-        private fun transportFamily(profile: VlessProfile): List<String> {
-            fun normalized(value: String): String = when (val lower = value.lowercase(Locale.ROOT)) {
-                "raw" -> "tcp"
-                "hysteria2", "hy2" -> "hysteria"
-                else -> lower
-            }
-            return listOf(normalized(profile.proxyType), normalized(profile.transport), normalized(profile.security),
-                profile.transportMode.lowercase(Locale.ROOT))
+        fun fromReady(access: BackendYoutubeAccess): YoutubeConnectionConfig {
+            require(access.status == "ready" && access.mode == "selected_transport") { "youtube_access_not_ready" }
+            val endpoint = requireNotNull(access.endpoint)
+            require(EndpointSecurityPolicy.isFixedYoutubeCandidate(endpoint)) { "youtube_endpoint_unsupported" }
+            val profile = EndpointSelector.profileFromCandidate(endpoint, requireNotNull(access.vpnSecret))
+            require(VpnProfileValidator.isUsable(profile, AdvancedSettings())) { "youtube_access_credential_invalid" }
+            VpnConfigFactory.buildProbe(profile)
+            return SelectedTransport(profile)
         }
     }
 }
@@ -138,11 +104,6 @@ object VpnConfigFactory {
         dns.put("rules", JSONArray().put(JSONObject(youtube.toString()).put("server", DNS_TAG))
             .apply { for (index in 0 until dnsRules.length()) put(dnsRules.getJSONObject(index)) })
         when (connection) {
-            is YoutubeConnectionConfig.WireGuard -> {
-                val endpoints = config.optJSONArray("endpoints") ?: JSONArray().also { config.put("endpoints", it) }
-                endpoints.put(wireGuardEndpoint(connection.wireguard, connection.privateKey, YOUTUBE_TAG, keepalive = 0)
-                    .put("domain_resolver", resolver(BOOTSTRAP_TAG)))
-            }
             is YoutubeConnectionConfig.SelectedTransport -> config.getJSONArray("outbounds")
                 .put(proxyOutbound(connection.profile).put("tag", YOUTUBE_TAG))
             null -> Unit

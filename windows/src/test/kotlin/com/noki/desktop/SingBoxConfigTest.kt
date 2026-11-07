@@ -179,7 +179,7 @@ class SingBoxConfigTest {
     }
 
     @Test fun `DNS protection stays enabled across every main path and YouTube branch`() {
-        val youtube = YoutubeConnectionConfig.WireGuard(youtubeWireGuard(), ByteArray(32) { (it + 2).toByte() })
+        val youtube = youtubeConnection()
         val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings(youtubeAdBlockEnabled = true))
         for ((base, current) in fourMainPaths(settings)) {
             for (config in listOf(base, SingBoxConfig.withYoutube(base, current, null), SingBoxConfig.withYoutube(base, current, youtube))) {
@@ -367,9 +367,7 @@ class SingBoxConfigTest {
         val geosite = SingBoxConfig.bundledGeosite()
         val domains = VpnConfigFactory.domainMatch(listOf("geosite:youtube"),
             GeositeAsset.resolveDomains(geosite, setOf("geosite:youtube")))!!
-        val connections = listOf(YoutubeConnectionConfig.WireGuard(youtubeWireGuard(), ByteArray(32) { (it + 2).toByte() }),
-            YoutubeConnectionConfig.SelectedTransport(EndpointSelector.profileFromCandidate(
-                candidate().copy(code = "youtube", entryHost = "youtube.example.com"), UUID)))
+        val connections = listOf(youtubeConnection())
         for ((base, current) in fourMainPaths(settings)) {
             val before = base.toString()
             assertFalse(before.contains("youtube-ru"))
@@ -378,21 +376,10 @@ class SingBoxConfigTest {
                 val config = SingBoxConfig.withYoutube(base, current, connection, geosite)
                 assertEquals(before, base.toString())
                 assertMainPathUnchanged(base, config)
-                val branch = when (connection) {
-                    is YoutubeConnectionConfig.WireGuard -> {
-                        val endpoint = config.getJSONArray("endpoints").objects().single { it.optString("tag") == "youtube-ru" }
-                        assertEquals(0, endpoint.getJSONArray("peers").getJSONObject(0).getInt("persistent_keepalive_interval"))
-                        assertEquals(connection.wireguard.address, endpoint.getJSONArray("address").getString(0))
-                        assertEquals(connection.wireguard.mtu, endpoint.getInt("mtu"))
-                        assertFalse(endpoint.getBoolean("system"))
-                        endpoint
-                    }
-                    is YoutubeConnectionConfig.SelectedTransport -> config.getJSONArray("outbounds").objects()
-                        .single { it.optString("tag") == "youtube-ru" }.also {
-                            assertEquals("youtube.example.com", it.getString("server"))
-                            assertEquals("vless", it.getString("type"))
-                        }
-                }
+                val branch = config.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-ru" }
+                assertEquals("yt1.noki.ykino.tech", branch.getString("server"))
+                assertEquals("vless", branch.getString("type"))
+                assertEquals("xtls-rprx-vision", branch.getString("flow"))
                 assertFalse(branch.has("detour"))
                 assertEquals("bootstrap", branch.getJSONObject("domain_resolver").getString("server"))
                 val rows = config.getJSONObject("route").getJSONArray("rules").objects()
@@ -432,7 +419,7 @@ class SingBoxConfigTest {
     @Test fun `YouTube disabled is unchanged and missing admission blocks only its eligible traffic`() {
         val enabled = DesktopState().settings.copy(filterMode = AppFilterMode.ONLY_SELECTED,
             selectedPackages = setOf("C:\\Apps\\Browser.exe"), advancedSettings = AdvancedSettings(youtubeAdBlockEnabled = true))
-        val connection = YoutubeConnectionConfig.WireGuard(youtubeWireGuard(), ByteArray(32) { (it + 2).toByte() })
+        val connection = youtubeConnection()
         for ((base, settings) in fourMainPaths(enabled)) {
             val disabled = settings.copy(advancedSettings = settings.advancedSettings.copy(youtubeAdBlockEnabled = false))
             val off = SingBoxConfig.withYoutube(base, disabled, connection, ByteArray(0))
@@ -454,50 +441,27 @@ class SingBoxConfigTest {
         }
     }
 
-    @Test fun `YouTube ready material preserves actual transport and rejects incompatible or missing primaries`() {
-        val key = ByteArray(32) { (it + 2).toByte() }
-        val grant = BackendYoutubeAccess("wireguard", "ready", "grant", 1, Long.MAX_VALUE, "x".repeat(32),
-            publicKeyId = "key", wireguard = youtubeWireGuard())
-        assertTrue(YoutubeConnectionConfig.fromReady(grant, null, "key", key) is YoutubeConnectionConfig.WireGuard)
-        rejected { YoutubeConnectionConfig.fromReady(grant, null, "another-key", key) }
-        rejected { YoutubeConnectionConfig.fromReady(grant.copy(status = "pending"), null, "key", key) }
-        val candidates = listOf(candidate(), nokiNv(), hysteria())
-        val base = generate(session(candidate()), candidate())
-        val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings(youtubeAdBlockEnabled = true))
-        for (endpoint in candidates) {
-            val nokiNv = EndpointTransportPolicy.isNokiNv(endpoint)
-            val primary = EndpointSelector.profileFromCandidate(session(endpoint), endpoint).let {
-                if (nokiNv) it.copy(nokinvMode = "gaming") else it
-            }
-            val selected = grant.copy(mode = "selected_transport", publicKeyId = null, wireguard = null,
-                endpoint = endpoint.copy(code = "youtube", entryHost = "youtube.example.com"),
-                vpnSecret = if (nokiNv) java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 2 }) else UUID,
-                nokinvDeviceId = if (nokiNv) DEVICE else null, nokinvCredentialGeneration = if (nokiNv) 9 else 0)
-            val config = YoutubeConnectionConfig.fromReady(selected, primary, "key", key, expectedDeviceId = DEVICE) as YoutubeConnectionConfig.SelectedTransport
-            assertEquals(primary.transport, config.profile.transport)
-            assertNull(config.profile.multiHop)
-            if (nokiNv) {
-                assertEquals(selected.vpnSecret, config.profile.nokinvToken)
-                assertEquals(9, config.profile.nokinvCredentialGeneration)
-                assertEquals("gaming", config.profile.nokinvMode)
-                rejected { YoutubeConnectionConfig.fromReady(selected.copy(nokinvDeviceId = null), primary, "key", key, DEVICE) }
-                rejected { YoutubeConnectionConfig.fromReady(selected.copy(nokinvDeviceId = ENTRY), primary, "key", key, DEVICE) }
-                rejected { YoutubeConnectionConfig.fromReady(selected.copy(nokinvCredentialGeneration = 0), primary, "key", key, DEVICE) }
-                rejected { YoutubeConnectionConfig.fromReady(selected.copy(vpnSecret = UUID), primary, "key", key, DEVICE) }
-            }
-            val output = SingBoxConfig.withYoutube(base, settings, config)
+    @Test fun `fixed YouTube Reality preserves every primary protocol and has no main detour`() {
+        val fixed = youtubeConnection()
+        val naive = candidate().copy(proxyType = "naive", transport = "naive", security = "tls", transportMode = null,
+            publicKey = null, shortId = null, flow = null, requestHost = null, path = null, alpn = null)
+        for (endpoint in listOf(candidate(), nokiNv(), hysteria(), naive)) {
+            val base = generate(session(endpoint), endpoint)
+            val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings(youtubeAdBlockEnabled = true))
+            val output = SingBoxConfig.withYoutube(base, settings, fixed)
             assertMainPathUnchanged(base, output)
-            assertFalse(output.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-ru" }.has("detour"))
+            val branch = output.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-ru" }
+            assertEquals("vless", branch.getString("type"))
+            assertEquals(443, branch.getInt("server_port"))
+            assertEquals("xtls-rprx-vision", branch.getString("flow"))
+            assertEquals("yt1.noki.ykino.tech", branch.getString("server"))
+            assertEquals(branch.getString("server"), branch.getJSONObject("tls").getString("server_name"))
+            assertEquals("99999999-9999-4999-8999-999999999999", branch.getString("uuid"))
+            assertFalse(branch.has("transport"))
+            assertFalse(branch.has("detour"))
+            assertEquals(1, output.getJSONArray("inbounds").objects().count { it.optString("type") == "tun" })
             checkWithCore(output)
-            rejected { YoutubeConnectionConfig.fromReady(selected, null, "key", key, DEVICE) }
-            rejected { YoutubeConnectionConfig.fromReady(selected, primary.copy(endpointCode = ""), "key", key, DEVICE) }
-            rejected { YoutubeConnectionConfig.fromReady(selected, primary.copy(security = "none"), "key", key, DEVICE) }
-            rejected { YoutubeConnectionConfig.fromReady(selected.copy(endpoint = endpoint.copy(allowInsecure = true)), primary, "key", key, DEVICE) }
         }
-        val primary = EndpointSelector.profileFromCandidate(session(candidate()), candidate())
-        val mismatched = grant.copy(mode = "selected_transport", publicKeyId = null, wireguard = null, endpoint = hysteria(), vpnSecret = UUID)
-        rejected { YoutubeConnectionConfig.fromReady(mismatched, primary, "key", key) }
-        rejected { YoutubeConnectionConfig.fromReady(mismatched.copy(endpoint = candidate().copy(transportMode = "packet-up")), primary, "key", key) }
     }
 
     private fun fourMainPaths(settings: StoredSettings): List<Pair<JSONObject, StoredSettings>> {
@@ -518,6 +482,13 @@ class SingBoxConfigTest {
             ByteArray(32) { (it + 2).toByte() }, 20909, SECRET, 20808, "https://api.noki.example", current, routingRules = rules, dnsPolicy = { unitDnsPolicy })
         return listOf(direct to settings, multi to multiSettings, ru(ruSettings, null) to ruSettings, ru(ruMultiSettings, ENTRY) to ruMultiSettings)
     }
+
+    private fun youtubeConnection(): YoutubeConnectionConfig = YoutubeConnectionConfig.fromReady(
+        BackendYoutubeAccess("selected_transport", "ready", "grant", 1, Long.MAX_VALUE, "r".repeat(43),
+            endpoint = candidate().copy(code = "youtube", entryHost = "yt1.noki.ykino.tech", serverName = "yt1.noki.ykino.tech",
+                connectIp = null, entryPort = 443, transport = "tcp", transportMode = null, security = "reality",
+                flow = "xtls-rprx-vision", requestHost = null, path = null),
+            vpnSecret = "99999999-9999-4999-8999-999999999999"))
 
     private fun youtubeWireGuard() = BackendRuWireGuardConfig("youtube.example.com:51820",
         java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 1).toByte() }), "10.201.0.2/32", listOf("10.201.0.1"), 1280, listOf("0.0.0.0/0"))

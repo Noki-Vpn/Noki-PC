@@ -3,6 +3,15 @@ package com.noki.vpn.data
 import java.util.Locale
 
 object EndpointSecurityPolicy {
+    fun isFixedYoutubeCandidate(candidate: BackendEndpointCandidate): Boolean =
+        isAllowedCandidate(candidate) && !candidate.canaryOnly &&
+            candidate.proxyType.equals("vless", true) && candidate.security.equals("reality", true) &&
+            candidate.normalizedTransport() == "tcp" && candidate.entryPort == 443 &&
+            candidate.flow == "xtls-rprx-vision" && candidate.transportMode.isNullOrBlank() &&
+            candidate.connectIp == null && candidate.entryHost == candidate.serverName &&
+            DomainRulePolicy.normalize("full:${candidate.entryHost}") == "full:${candidate.entryHost}" &&
+            candidate.requestHost.isNullOrBlank() && candidate.path.orEmpty() in setOf("", "/")
+
     fun isValidNaiveCredential(value: String): Boolean =
         value.isNotBlank() && value.toByteArray(Charsets.UTF_8).size <= 4096 && value.none { it.code < 32 || it.code == 127 }
 

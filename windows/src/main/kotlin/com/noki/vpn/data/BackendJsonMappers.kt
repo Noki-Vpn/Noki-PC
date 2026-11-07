@@ -217,11 +217,9 @@ internal fun canonicalRuUuid(raw: String): String = runCatching { UUID.fromStrin
 internal fun YoutubeAccessRequest.toBackendJson(): JSONObject {
     require(deviceKey == null || deviceKey.length in 4..255) { "youtube_device_key_invalid" }
     require(deviceNonce.length in 16..128 && deviceSignature.length in 32..4096) { "youtube_device_proof_invalid" }
-    require(primaryEndpointCode == null || primaryEndpointCode.length in 1..64) { "youtube_primary_endpoint_invalid" }
     return JSONObject()
         .put("request_id", canonicalRuUuid(requestId)).put("device_id", canonicalRuUuid(deviceId))
         .put("device_key", deviceKey).put("device_nonce", deviceNonce).put("device_signature", deviceSignature)
-        .put("public_key_id", publicKeyId?.let(::canonicalRuUuid)).put("primary_endpoint_code", primaryEndpointCode)
 }
 
 internal object RuWireGuardSessionJsonParser {
@@ -566,7 +564,7 @@ internal object BackendYoutubeAccessJsonParser {
         require(json.opt("version") == 1) { "youtube_access_version_invalid" }
         val mode = json.getString("mode")
         val status = json.getString("status")
-        require(mode in setOf("wireguard", "selected_transport") && status in setOf("pending", "ready", "blocked")) {
+        require(mode == "selected_transport" && status in setOf("pending", "ready", "blocked")) {
             "youtube_access_state_invalid"
         }
         val grantId = canonicalRuUuid(json.getString("grant_id"))
@@ -579,47 +577,30 @@ internal object BackendYoutubeAccessJsonParser {
         require(revokeToken.length in 32..128 && revokeToken.all {
             (it.isLetterOrDigit() && it.code < 128) || it == '-' || it == '_'
         }) { "youtube_access_revoke_invalid" }
-        val readyWg = status == "ready" && mode == "wireguard"
-        val readySelected = status == "ready" && mode == "selected_transport"
-        require((!json.isNull("wireguard")) == readyWg && (!json.isNull("public_key_id")) == readyWg &&
+        val readySelected = status == "ready"
+        require(listOf("wireguard", "public_key_id", "vpn_username", "nokinv_device_id", "nokinv_credential_generation")
+            .all(json::isNull) &&
             (!json.isNull("endpoint")) == readySelected && (!json.isNull("vpn_secret")) == readySelected) {
             "youtube_access_payload_invalid"
         }
-        val wireguard = if (readyWg) json.getJSONObject("wireguard").let { config ->
-            require(config.keys().asSequence().all { it in setOf("endpoint", "server_public_key", "address", "dns", "mtu", "allowed_ips") } &&
-                config.opt("mtu") is Int) { "youtube_access_wireguard_invalid" }
-            RuWireGuardSessionJsonParser.parseConfig(config)
-        } else null
         val endpoint = if (readySelected) json.getJSONObject("endpoint").let { item ->
             require(item.opt("entry_port") is Int && item.getInt("entry_port") in 1..65535 &&
                 item.getString("code").isNotBlank() && item.getString("proxy_type").isNotBlank() &&
                 item.getString("transport").isNotBlank() && item.getString("security").isNotBlank() &&
                 (item.isNull("transport_mode") || item.opt("transport_mode") is String) &&
                 (item.isNull("allow_insecure") || item.opt("allow_insecure") is Boolean) &&
-                (item.isNull("canary_only") || item.opt("canary_only") is Boolean)) { "youtube_access_endpoint_invalid" }
+                (item.isNull("canary_only") || item.opt("canary_only") is Boolean) &&
+                item.isNull("connect_ip") && item.isNull("detour")) { "youtube_access_endpoint_invalid" }
             canonicalRuUuid(item.getString("node_id"))
             BackendVpnSessionJsonParser.parseEndpointCandidate(item).also {
-                require(EndpointSecurityPolicy.isAllowedCandidate(it) && !it.canaryOnly) { "youtube_access_endpoint_invalid" }
+                require(EndpointSecurityPolicy.isFixedYoutubeCandidate(it)) { "youtube_access_endpoint_invalid" }
             }
         } else null
         val secret = if (readySelected) json.getString("vpn_secret").also {
-            require(it.isNotBlank()) { "youtube_access_credential_invalid" }
+            canonicalRuUuid(it)
         } else null
-        val nokinv = endpoint?.let(EndpointTransportPolicy::isNokiNv) == true
-        val naive = endpoint?.let(EndpointTransportPolicy::isNaive) == true
-        val username = if (naive) json.getString("vpn_username").also {
-            require(EndpointSecurityPolicy.isValidNaiveCredential(it) &&
-                EndpointSecurityPolicy.isValidNaiveCredential(secret.orEmpty())) { "youtube_access_credential_invalid" }
-        } else null
-        require(naive || json.isNull("vpn_username")) { "youtube_access_credential_invalid" }
-        val nokinvGeneration = if (nokinv) (json.opt("nokinv_credential_generation") as? Int)
-            ?: throw IllegalArgumentException("youtube_access_credential_invalid") else 0
-        val nokinvDeviceId = if (nokinv) canonicalRuUuid(json.getString("nokinv_device_id")) else null
-        require(if (nokinv) EndpointSecurityPolicy.isValidNokiNvCredential(secret.orEmpty(), nokinvGeneration)
-            else json.isNull("nokinv_device_id") && json.isNull("nokinv_credential_generation")) { "youtube_access_credential_invalid" }
         return BackendYoutubeAccess(mode, status, grantId, generation, expiresAt.toEpochMilli(), revokeToken,
-            if (readyWg) canonicalRuUuid(json.getString("public_key_id")) else null, wireguard, endpoint, secret,
-            nokinvDeviceId, nokinvGeneration, username)
+            endpoint, secret)
     }
 }
 

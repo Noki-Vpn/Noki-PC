@@ -2,7 +2,6 @@ package com.noki.vpn.vpn
 
 import com.noki.vpn.data.AdvancedSettings
 import com.noki.vpn.data.BackendRuWireGuardConfig
-import com.noki.vpn.data.BackendYoutubeAccess
 import com.noki.vpn.data.DomainRulePolicy
 import com.noki.vpn.data.EndpointSelector
 import com.noki.vpn.data.EndpointSecurityPolicy
@@ -13,26 +12,14 @@ import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 
-sealed interface YoutubeConnectionConfig {
-    data class SelectedTransport(val profile: VlessProfile) : YoutubeConnectionConfig
-
-    companion object {
-        fun fromReady(access: BackendYoutubeAccess): YoutubeConnectionConfig {
-            require(access.status == "ready" && access.mode == "selected_transport") { "youtube_access_not_ready" }
-            val endpoint = requireNotNull(access.endpoint)
-            require(EndpointSecurityPolicy.isFixedYoutubeCandidate(endpoint)) { "youtube_endpoint_unsupported" }
-            val profile = EndpointSelector.profileFromCandidate(endpoint, requireNotNull(access.vpnSecret))
-            require(VpnProfileValidator.isUsable(profile, AdvancedSettings())) { "youtube_access_credential_invalid" }
-            VpnConfigFactory.buildProbe(profile)
-            return SelectedTransport(profile)
-        }
-    }
+data class YoutubeConnectionConfig(val port: Int) {
+    init { require(port in 1..65535) { "youtube_local_port_invalid" } }
 }
 
 object VpnConfigFactory {
     private const val DNS_TAG = "noki-node-dns"
     private const val BOOTSTRAP_TAG = "bootstrap"
-    private const val YOUTUBE_TAG = "youtube-ru"
+    private const val YOUTUBE_TAG = "youtube-local"
 
     // The same V2Fly private set used by the server compiler, including CGNAT/reserved ranges.
     private val privateCidrs = listOf(
@@ -72,7 +59,7 @@ object VpnConfigFactory {
                 .put("allowed_ips", JSONArray(config.allowedIps)).put("persistent_keepalive_interval", keepalive)))
     }
 
-    /** Compose only from the unchanged main config, so expired admissions cannot leave an old route behind. */
+    /** Compose from the main config; a missing local process blocks only the YouTube branch. */
     fun withYoutube(baseConfig: JSONObject, connection: YoutubeConnectionConfig?, geositeBytes: ByteArray): JSONObject {
         val config = JSONObject(baseConfig.toString())
         val youtube = domainMatch(listOf("geosite:youtube"), GeositeAsset.resolveDomains(geositeBytes, setOf("geosite:youtube")))
@@ -94,6 +81,8 @@ object VpnConfigFactory {
                         .put(JSONObject(youtube.toString())).put(extra))
                 rules.put(match(JSONObject().put("ip_version", 6)).put("action", "reject"))
                 rules.put(match(JSONObject().put("network", "udp")).put("action", "reject"))
+                if (connection != null) rules.put(match(JSONObject().put("network", "tcp"))
+                    .put("action", "resolve").put("server", DNS_TAG).put("strategy", "ipv4_only"))
                 rules.put(match(JSONObject().put("network", "tcp")).put("action", if (connection == null) "reject" else "route")
                     .apply { if (connection != null) put("outbound", YOUTUBE_TAG) })
             }
@@ -103,11 +92,9 @@ object VpnConfigFactory {
         val dnsRules = dns.getJSONArray("rules")
         dns.put("rules", JSONArray().put(JSONObject(youtube.toString()).put("server", DNS_TAG))
             .apply { for (index in 0 until dnsRules.length()) put(dnsRules.getJSONObject(index)) })
-        when (connection) {
-            is YoutubeConnectionConfig.SelectedTransport -> config.getJSONArray("outbounds")
-                .put(proxyOutbound(connection.profile).put("tag", YOUTUBE_TAG))
-            null -> Unit
-        }
+        if (connection != null) config.getJSONArray("outbounds").put(JSONObject()
+            .put("type", "socks").put("tag", YOUTUBE_TAG).put("server", "127.0.0.1")
+            .put("server_port", connection.port).put("version", "5").put("network", "tcp"))
         return config
     }
 

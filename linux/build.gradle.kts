@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "com.noki"
-version = "1.9.1"
+version = "1.9.2"
 
 val desktopTarget = providers.gradleProperty("desktopTarget").orElse("linux").get()
 require(desktopTarget in setOf("linux", "windows")) { "desktopTarget must be linux or windows" }
@@ -145,6 +145,7 @@ tasks.named<ProcessResources>("processResources") {
     inputs.property("appVersion", project.version.toString())
     doFirst { appVersionFile.get().asFile.apply { parentFile.mkdirs(); writeText(project.version.toString()) } }
     from(appVersionFile) { into("noki/desktop") }
+    from("vendor/byedpi") { include("byedpi-windows.properties", "byedpi-linux.properties"); into("noki/desktop") }
     if (linuxHost) { dependsOn("prepareVpnRuntime"); from(layout.buildDirectory.file("runtime/linux-x64/linux-core.properties")) { into("noki/desktop") } }
     // Authoring sources stay available to parity tests, not in Native Image's permanent image heap.
     exclude("noki/desktop/earth/relief.png", "noki/desktop/earth/countries.json")

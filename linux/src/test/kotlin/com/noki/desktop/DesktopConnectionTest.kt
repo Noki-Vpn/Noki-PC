@@ -678,155 +678,163 @@ class DesktopConnectionTest {
         }
     }
 
-    @Test fun `YouTube opt out makes no admission calls or additional core direction`() = runBlocking {
+    @Test fun `YouTube opt out starts only the main core`() = runBlocking {
         Fixture().use { f ->
             f.ready(); f.app.connect()
             withTimeout(15_000) { f.app.state.first { it.running && !it.loading && it.verified } }
-            assertFalse(f.app.state.value.settings.advancedSettings.youtubeAdBlockEnabled)
-            assertEquals(0, f.youtubeCreateCalls.get())
-            assertEquals(0, f.youtubePollCalls.get())
-            assertEquals(0, f.youtubeRenewCalls.get())
-            assertFalse(f.runtime.starts.single().toString().contains("youtube-ru"))
+            assertEquals(0, f.runtime.youtubeStarts.get())
+            assertTrue(f.youtubeRequests.isEmpty())
+            assertFalse(f.runtime.starts.single().toString().contains("youtube-local"))
         }
     }
 
-    @Test fun `YouTube pending becomes ready and identical renewed material keeps the same core`() = runBlocking {
+    @Test fun `local YouTube readiness preserves the main route and never requests server admission`() = runBlocking {
         Fixture().use { f ->
-            f.ready()
-            f.youtubeCreatePending = true
-            f.youtubeLeaseSeconds = 30
-            f.enableYoutube()
-            f.app.connect()
-            f.awaitYoutubeReady()
-            assertEquals("reject", youtubeTcpAction(f.runtime.starts.first()))
-            assertEquals(2, f.runtime.starts.size)
-            val starts = f.runtime.starts.size
-            withTimeout(25_000) {
-                while (f.youtubeRenewCalls.get() == 0 || f.youtubeReadyReplies.get() < 2) delay(10)
-            }
-            delay(100)
-            withTimeout(5_000) { f.app.state.first { it.running && !it.loading } }
-            val events = f.runtime.starts.mapIndexed { index, config -> "${f.runtime.startTimes.getOrNull(index)}:${youtubeTcpAction(config)}" }
-            assertEquals("firstLeaseExpiry=${f.youtubeFirstReadyExpiresAt}, latestExpiry=${f.youtubeExpiresAt}, now=${System.currentTimeMillis()}, starts=$events", starts, f.runtime.starts.size)
-            assertNotNull(youtubeEndpoint(f.runtime.starts.last()))
-            assertEquals("route", youtubeTcpAction(f.runtime.starts.last()))
+            f.ready(); f.enableYoutube(); f.app.connect(); f.awaitYoutubeReady()
+            assertEquals("route", youtubeTcpAction(f.runtime.starts.first()))
+            assertEquals(1, f.runtime.starts.size)
+            val branch = checkNotNull(youtubeEndpoint(f.runtime.starts.last()))
+            assertEquals("socks", branch.getString("type"))
+            assertEquals("127.0.0.1", branch.getString("server"))
+            assertEquals(1080, branch.getInt("server_port"))
+            assertEquals(1, f.runtime.youtubeStarts.get())
             assertEquals(1, f.sessionNodes.size)
-            assertEquals(0, f.proofFailures.get())
-            assertEquals(0, f.wireGuardRegistrationCalls.get())
-            for (request in f.youtubeRequests.filter { it.method != "DELETE" })
-                assertEquals("fixed_reality_tcp_v1", request.header("X-Youtube-Transport"))
-            val create = f.youtubeRequests.first { it.method == "POST" && it.url.encodedPath.endsWith("youtube-access") }
-            val body = JSONObject(Buffer().also { create.body!!.writeTo(it) }.readUtf8())
-            assertFalse(body.has("public_key_id"))
-            assertFalse(body.has("primary_endpoint_code"))
-            assertFalse("The canonical main config must not retain an expired extra direction",
-                f.mainConfig().toString().contains("youtube-ru"))
+            assertTrue(f.youtubeRequests.isEmpty())
+            assertFalse(f.mainConfig().toString().contains("youtube-local"))
+            delay(2_300)
+            assertEquals(1, f.runtime.starts.size)
+            assertEquals(1, f.runtime.youtubeStarts.get())
         }
     }
 
-    @Test fun `YouTube toggle applies immediately without changing the active main route`() = runBlocking {
+    @Test fun `YouTube toggle stops the sidecar and preserves the active main route`() = runBlocking {
         Fixture().use { f ->
             f.ready(); f.app.connect()
             withTimeout(15_000) { f.app.state.first { it.running && !it.loading && it.verified } }
             val main = JSONObject(f.mainConfig().toString())
             val connectedAt = f.app.state.value.connectedAtMillis
             val label = f.app.state.value.connectionLabel
-            f.runtime.startDelayMillis = 2_300
-            f.enableYoutube()
-            f.awaitYoutubeReady()
+            f.enableYoutube(); f.awaitYoutubeReady()
             assertTrue(f.mainConfig().similar(main))
             assertEquals(connectedAt, f.app.state.value.connectedAtMillis)
             assertEquals(label, f.app.state.value.connectionLabel)
-            f.runtime.startDelayMillis = 0
             f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = false)) }.join()
             assertTrue(f.app.state.value.running)
-            assertFalse(f.app.state.value.displayedSettings.advancedSettings.youtubeAdBlockEnabled)
+            assertFalse(f.runtime.youtubeRunning)
             assertTrue(f.runtime.starts.last().similar(main))
             assertEquals(1, f.sessionNodes.size)
-            withTimeout(5_000) {
-                while (f.youtubeRevokeCalls.get() == 0 || f.vault.readEncrypted("youtube-revoke.dpapi") != null) delay(10)
-            }
-            assertEquals(0, f.proofFailures.get())
+            assertTrue(f.youtubeRequests.isEmpty())
         }
     }
 
-    @Test fun `rejected YouTube runtime profile restores the same main with only YouTube blocked`() = runBlocking {
+    @Test fun `failed local YouTube startup and cleanup keep the same main core and its closed SOCKS route`() = runBlocking {
         Fixture().use { f ->
             f.ready(); f.enableYoutube()
-            f.runtime.failYoutubeStarts.set(1)
+            f.runtime.failLocalYoutube = true
+            f.runtime.failYoutubeStops = true
             f.app.connect()
             withTimeout(15_000) {
-                while (!f.app.state.value.running || f.app.state.value.loading || f.youtubeRevokeCalls.get() == 0) delay(10)
+                while (f.app.state.value.loading || f.app.state.value.youtubeMessage == null) delay(10)
             }
-            assertEquals(3, f.runtime.starts.size)
-            assertNull(youtubeEndpoint(f.runtime.starts.last()))
-            assertEquals("reject", youtubeTcpAction(f.runtime.starts.last()))
+            assertTrue(f.app.state.value.running)
+            assertNotNull(youtubeEndpoint(f.runtime.starts.last()))
+            assertEquals("route", youtubeTcpAction(f.runtime.starts.last()))
+            assertEquals(1, f.runtime.starts.size)
+            assertFalse(f.runtime.youtubeRunning)
+            assertEquals(1, f.sessionNodes.size)
+        }
+    }
+
+    @Test fun `YouTube endpoint allocation failure preserves the main core and never starts an unused child`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.enableYoutube()
+            f.runtime.failYoutubePort = true
+            f.app.connect()
+            withTimeout(15_000) { f.app.state.first { it.running && it.verified && !it.loading && it.youtubeMessage != null } }
+            val main = checkNotNull(f.runtime.active)
+            val config = JSONObject(f.runtime.starts.single().toString())
+            assertEquals("reject", youtubeTcpAction(config))
+            assertNull(youtubeEndpoint(config))
+            val primary = f.mainConfig().getJSONArray("outbounds").getJSONObject(0)
+            assertTrue(primary.similar(config.getJSONArray("outbounds").getJSONObject(0)))
+            assertEquals(0, f.runtime.youtubeStarts.get())
+            f.runtime.failYoutubePort = false
+            delay(2_300)
+            assertEquals(main, f.runtime.active)
+            assertEquals(1, f.runtime.starts.size)
+            assertTrue(config.similar(f.runtime.starts.single()))
+            assertEquals(0, f.runtime.youtubeStarts.get())
+            assertFalse(f.runtime.youtubeRunning)
             assertNotNull(f.app.state.value.youtubeMessage)
             assertEquals(1, f.sessionNodes.size)
-            assertFalse(f.mainConfig().toString().contains("youtube-ru"))
-            assertEquals(0, f.proofFailures.get())
         }
     }
 
-    @Test fun `pending YouTube renewal cannot extend the old ready deadline or stop the main VPN`() = runBlocking {
+    @Test fun `local YouTube process failure blocks only YouTube and keeps the main VPN`() = runBlocking {
         Fixture().use { f ->
-            f.ready()
-            f.youtubeLeaseSeconds = 6
-            f.youtubePendingAfterRenew = true
-            f.enableYoutube()
-            f.app.connect()
-            f.awaitYoutubeReady()
-            val confirmedDeadline = f.youtubeFirstReadyExpiresAt
-            withTimeout(12_000) {
-                while (System.currentTimeMillis() <= confirmedDeadline || f.youtubeRenewCalls.get() == 0 ||
-                    youtubeTcpAction(f.runtime.starts.last()) != "reject" || !f.app.state.value.running) delay(10)
-            }
-            assertTrue("The pending response offers a later deadline, which is not a ready lease",
-                f.youtubeExpiresAt > confirmedDeadline)
-            assertNull(youtubeEndpoint(f.runtime.starts.last()))
-            assertTrue(f.app.state.value.running)
+            f.ready(); f.enableYoutube(); f.app.connect(); f.awaitYoutubeReady()
+            f.runtime.failLocalYoutube = true
+            f.runtime.youtubeRunning = false
+            withTimeout(5_000) { f.app.state.first { it.running && !it.loading && it.youtubeMessage != null } }
             assertNotNull(f.runtime.active)
+            assertEquals("route", youtubeTcpAction(f.runtime.starts.last()))
+            assertEquals(1, f.runtime.starts.size)
             assertEquals(1, f.sessionNodes.size)
-            assertEquals(0, f.proofFailures.get())
+            assertTrue(f.youtubeRequests.isEmpty())
         }
     }
 
-    @Test fun `disconnect during a delayed YouTube reply revokes its capability and cannot restore the core`() = runBlocking {
+    @Test fun `a physical network change replaces the local process without obtaining a new main session`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.enableYoutube(); f.app.connect(); f.awaitYoutubeReady()
+            f.networkSignature = "another-physical-network"
+            withTimeout(10_000) { while (f.runtime.youtubeStarts.get() < 2) delay(10) }
+            f.awaitYoutubeReady()
+            assertEquals(f.networkSignature, f.runtime.youtubeNetworks.last().signature)
+            assertEquals(1, f.sessionNodes.size)
+            assertTrue(f.youtubeRequests.isEmpty())
+        }
+    }
+
+    @Test fun `Free cannot start a saved paid YouTube option`() = runBlocking {
+        Fixture().use { f ->
+            f.bootstrap.getJSONObject("subscription").put("plan_code", "free").put("plan_name", "Free")
+            f.ready(); f.app.refresh().join()
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = true)) }.join()
+            f.app.connect()
+            withTimeout(15_000) { f.app.state.first { it.running && !it.loading && it.youtubeMessage != null } }
+            assertEquals(0, f.runtime.youtubeStarts.get())
+            assertEquals("reject", youtubeTcpAction(f.runtime.starts.last()))
+            assertNotNull(f.runtime.active)
+        }
+    }
+
+    @Test fun `disconnect cancels delayed local YouTube startup without restoring the core`() = runBlocking {
         Fixture().use { f ->
             f.ready()
-            val responseGate = java.util.concurrent.CountDownLatch(1)
-            f.youtubeCreateGate = responseGate
-            f.enableYoutube()
-            try {
-                f.app.connect()
-                withTimeout(15_000) { while (f.youtubeCreateCalls.get() == 0) delay(10) }
-                withContext(Dispatchers.Main) { f.app.disconnect() }
-                withTimeout(1_500) { f.app.state.first { !it.running && !it.loading } }
-                assertNull("Stopping the tunnel must not wait for the late YouTube reply", f.runtime.active)
-                responseGate.countDown()
-                withTimeout(10_000) {
-                    f.app.state.first { !it.running && !it.loading }
-                    while (f.youtubeRevokeCalls.get() == 0) delay(10)
-                }
-                assertNull(f.runtime.active)
-                assertEquals(1, f.runtime.starts.size)
-                assertNull(f.vault.readEncrypted("connection.dpapi"))
-                val revoke = f.youtubeRequests.first { it.method == "DELETE" }
-                assertEquals("r".repeat(43), revoke.header("X-Youtube-Revoke-Token"))
-                assertNull(revoke.header("Authorization"))
-                assertEquals(0, f.proofFailures.get())
-            } finally { responseGate.countDown() }
+            val gate = CompletableDeferred<Unit>()
+            f.runtime.youtubeGate = gate
+            f.enableYoutube(); f.app.connect()
+            withTimeout(15_000) { while (f.runtime.youtubeStarts.get() == 0) delay(10) }
+            f.app.disconnect()
+            withTimeout(1_500) { f.app.state.first { !it.running && !it.loading } }
+            gate.complete(Unit)
+            delay(50)
+            assertNull(f.runtime.active)
+            assertFalse(f.runtime.youtubeRunning)
+            assertEquals(1, f.runtime.starts.size)
+            assertNull(f.vault.readEncrypted("connection.dpapi"))
         }
     }
 
     private companion object {
         fun youtubeEndpoint(config: JSONObject): JSONObject? = config.optJSONArray("outbounds")?.let { endpoints ->
-            (0 until endpoints.length()).map { endpoints.getJSONObject(it) }.firstOrNull { it.optString("tag") == "youtube-ru" }
+            (0 until endpoints.length()).map { endpoints.getJSONObject(it) }.firstOrNull { it.optString("tag") == "youtube-local" }
         }
 
         fun youtubeTcpAction(config: JSONObject): String? = config.getJSONObject("route").getJSONArray("rules").let { rules ->
             (0 until rules.length()).map { rules.getJSONObject(it) }.firstOrNull { rule ->
-                rule.optString("type") == "logical" && rule.toString().contains("youtube") &&
+                rule.optString("type") == "logical" && rule.optString("action") in setOf("route", "reject") && rule.toString().contains("youtube") &&
                     rule.getJSONArray("rules").let { parts -> (0 until parts.length()).any {
                         parts.getJSONObject(it).optString("network") == "tcp"
                     } }
@@ -909,24 +917,19 @@ class DesktopConnectionTest {
         }
     }
 
-    @Test fun `disconnect cancels a YouTube core replacement without waiting for startup`() = runBlocking {
+    @Test fun `disconnect cancels an explicit YouTube toggle replacing the core`() = runBlocking {
         Fixture().use { f ->
-            f.ready()
-            val gate = java.util.concurrent.CountDownLatch(1)
-            f.youtubeCreateGate = gate
-            f.enableYoutube()
-            try {
-                f.app.connect()
-                withTimeout(15_000) { f.app.state.first { !it.loading && it.verified } }
-                f.runtime.startDelayMillis = 8_000
-                gate.countDown()
-                withTimeout(5_000) { while (f.runtime.starts.size < 2) delay(10) }
-                f.app.disconnect()
-                withTimeout(1_500) { f.app.state.first { !it.loading && !it.running } }
-                assertNull(f.runtime.active)
-                delay(50)
-                assertEquals(2, f.runtime.starts.size)
-            } finally { gate.countDown() }
+            f.ready(); f.app.connect()
+            withTimeout(15_000) { f.app.state.first { !it.loading && it.verified } }
+            f.runtime.startDelayMillis = 8_000
+            val changing = launch { f.enableYoutube() }
+            withTimeout(5_000) { while (f.runtime.starts.size < 2) delay(10) }
+            f.app.disconnect()
+            withTimeout(1_500) { f.app.state.first { !it.loading && !it.running } }
+            changing.join()
+            assertNull(f.runtime.active)
+            assertFalse(f.runtime.youtubeRunning)
+            assertEquals(2, f.runtime.starts.size)
         }
     }
 
@@ -1826,7 +1829,30 @@ class DesktopConnectionTest {
         val failRebinds = AtomicInteger()
         val stops = CopyOnWriteArrayList<Boolean>()
         val failStops = AtomicInteger()
-        val failYoutubeStarts = AtomicInteger()
+        val youtubeStarts = AtomicInteger()
+        val youtubeNetworks = CopyOnWriteArrayList<WindowsNetworkSnapshot>()
+        @Volatile var youtubeRunning = false
+        @Volatile var failLocalYoutube = false
+        @Volatile var failYoutubePort = false
+        @Volatile var failYoutubeStops = false
+        @Volatile var youtubeGate: CompletableDeferred<Unit>? = null
+        internal override fun youtubePort(): Int {
+            if (failYoutubePort) throw java.io.IOException("Simulated local port allocation failure")
+            return 1080
+        }
+        internal override suspend fun startYoutube(network: WindowsNetworkSnapshot): Int {
+            youtubeStarts.incrementAndGet()
+            youtubeNetworks += network
+            youtubeGate?.await()
+            check(!failLocalYoutube) { "Simulated local process failure" }
+            youtubeRunning = true
+            return 1080
+        }
+        internal override suspend fun stopYoutube() {
+            check(!failYoutubeStops) { "Simulated child identity failure" }
+            youtubeRunning = false
+        }
+        internal override suspend fun youtubeAlive(): Boolean = youtubeRunning
         @Volatile var armed = false
         @Volatile var failProtection = false
         @Volatile var failGuardRead = false
@@ -1850,8 +1876,6 @@ class DesktopConnectionTest {
             if (killSwitch) armed = true
             starts += JSONObject(config.toString())
             startTimes += System.currentTimeMillis()
-            if (youtubeEndpoint(config) != null && failYoutubeStarts.getAndUpdate { (it - 1).coerceAtLeast(0) } > 0)
-                throw IllegalStateException("Simulated supplementary profile rejection")
             delay(startDelayMillis)
             return Running(10_000 + starts.size, System.currentTimeMillis(), 10000, "fixture", 10001, label, serverId).also { active = it }
         }
@@ -1927,31 +1951,31 @@ class DesktopConnectionTest {
         val uploadedLogs = CopyOnWriteArrayList<String>()
         @Volatile var bootstrapGate: java.util.concurrent.CountDownLatch? = null
         @Volatile var sessionGate: java.util.concurrent.CountDownLatch? = null
-        val youtubeCreateCalls = AtomicInteger()
+
         val wireGuardRegistrationCalls = AtomicInteger()
-        val youtubePollCalls = AtomicInteger()
-        val youtubeRenewCalls = AtomicInteger()
-        val youtubeRevokeCalls = AtomicInteger()
+
+
+
         val ruRevokeCalls = AtomicInteger()
         @Volatile var ruRevokeGate: java.util.concurrent.CountDownLatch? = null
-        val youtubeReadyReplies = AtomicInteger()
+
         val youtubeRequests = CopyOnWriteArrayList<okhttp3.Request>()
         val proofFailures = AtomicInteger()
         private val challengeCounter = AtomicInteger()
         private val proofLock = Any()
         private var challengeNonce: String? = null
         private val deviceId = "22222222-2222-4222-8222-222222222222"
-        private val youtubeKeyId = "11111111-1111-4111-8111-111111111111"
-        private val youtubeGrantId = "44444444-4444-4444-8444-444444444444"
-        @Volatile var youtubeCreatePending = false
-        @Volatile var youtubePendingAfterRenew = false
-        @Volatile var youtubeLeaseSeconds = 9L
-        @Volatile var youtubeExpiresAt = 0L
-        @Volatile var youtubeFirstReadyExpiresAt = 0L
-        @Volatile var youtubeCreateGate: java.util.concurrent.CountDownLatch? = null
-        private var youtubeRequestId: String? = null
-        private var youtubeGeneration = 1
-        private var youtubeStatus = "pending"
+        private val wireGuardKeyId = "11111111-1111-4111-8111-111111111111"
+
+
+
+
+
+
+
+
+
+
         @Volatile var networkSignature = "fixture"
         @Volatile var dnsSnapshot: () -> WindowsDnsPolicy = { WindowsDnsPolicy(emptyList(), emptyList()) }
         @Volatile var networkAvailable = true
@@ -1974,6 +1998,7 @@ class DesktopConnectionTest {
                 })) }))
         private val http = OkHttpClient.Builder().addInterceptor { chain ->
             val request = chain.request()
+            if (request.url.encodedPath.contains("youtube-access")) youtubeRequests += request
             val payload = chain.request().body?.let { body -> Buffer().also(body::writeTo).readUtf8().takeIf { it.isNotBlank() }?.let(::JSONObject) } ?: JSONObject()
             var status = 200
             val body = when (chain.request().url.encodedPath) {
@@ -2029,64 +2054,9 @@ class DesktopConnectionTest {
                 "/v1/vpn/wireguard-keys" -> {
                     wireGuardRegistrationCalls.incrementAndGet()
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
-                    JSONObject().put("id", youtubeKeyId).put("public_key", payload.getString("public_key"))
+                    JSONObject().put("id", wireGuardKeyId).put("public_key", payload.getString("public_key"))
                 }
-                "/v1/vpn/youtube-access" -> {
-                    youtubeRequests += request
-                    val create = youtubeCreateCalls.incrementAndGet()
-                    if (request.header("X-Youtube-Transport") != "fixed_reality_tcp_v1" ||
-                        payload.has("public_key_id") || payload.has("primary_endpoint_code")) status = 400
-                    if (!consumeProof(payload.getString("device_nonce"))) status = 403
-                    synchronized(proofLock) {
-                        val requestId = payload.getString("request_id")
-                        if (youtubeRequestId != requestId) {
-                            youtubeRequestId = requestId
-                            youtubeGeneration = 1
-                            youtubeExpiresAt = System.currentTimeMillis() + youtubeLeaseSeconds * 1_000
-                            youtubeStatus = if (youtubeCreatePending || (create > 1 && youtubePendingAfterRenew)) "pending" else "ready"
-                        }
-                    }
-                    if (create == 1) youtubeCreateGate?.await(10, java.util.concurrent.TimeUnit.SECONDS)
-                    youtubeResponse()
-                }
-                "/v1/vpn/youtube-access/$youtubeGrantId" -> {
-                    youtubeRequests += request
-                    if (request.method == "DELETE") {
-                        youtubeRevokeCalls.incrementAndGet()
-                        if (request.header("X-Youtube-Revoke-Token") != "r".repeat(43)) status = 403
-                        synchronized(proofLock) {
-                            if (youtubeStatus != "blocked") youtubeGeneration++
-                            youtubeStatus = "blocked"
-                        }
-                        JSONObject().put("ok", true)
-                    } else {
-                        if (request.header("X-Youtube-Transport") != "fixed_reality_tcp_v1") status = 400
-                        youtubePollCalls.incrementAndGet()
-                        if (!consumeProof(request.header("X-Device-Nonce"))) status = 403
-                        synchronized(proofLock) {
-                            if (youtubeStatus != "blocked" && (!youtubePendingAfterRenew || youtubeGeneration == 1)) youtubeStatus = "ready"
-                        }
-                        youtubeResponse()
-                    }
-                }
-                "/v1/vpn/youtube-access/$youtubeGrantId/renew" -> {
-                    if (request.header("X-Youtube-Transport") != "fixed_reality_tcp_v1") status = 400
-                    youtubeRequests += request
-                    youtubeRenewCalls.incrementAndGet()
-                    if (!consumeProof(request.header("X-Device-Nonce"))) status = 403
-                    synchronized(proofLock) {
-                        if (youtubeStatus == "blocked") status = 409 else when (payload.getInt("generation")) {
-                            youtubeGeneration -> {
-                                youtubeGeneration++
-                                youtubeExpiresAt = System.currentTimeMillis() + youtubeLeaseSeconds * 1_000
-                                youtubeStatus = "pending"
-                            }
-                            youtubeGeneration - 1 -> Unit
-                            else -> status = 409
-                        }
-                    }
-                    youtubeResponse()
-                }
+
                 "/v1/vpn/session" -> {
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
                     sessionRequests += JSONObject(payload.toString())
@@ -2150,12 +2120,14 @@ class DesktopConnectionTest {
             }
             app.setWindowVisible(false)
         }
-        suspend fun enableYoutube() = app.updateSettings {
-            it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = true))
-        }.join()
+        suspend fun enableYoutube() {
+            bootstrap.getJSONObject("subscription").put("plan_code", "pro").put("plan_name", "Pro")
+            app.refresh().join()
+            app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = true)) }.join()
+        }
         suspend fun awaitYoutubeReady() {
             withTimeout(12_000) {
-                while (!app.state.value.running || app.state.value.loading ||
+                while (!app.state.value.running || app.state.value.loading || !runtime.youtubeRunning ||
                     runtime.starts.lastOrNull()?.let(::youtubeEndpoint) == null) delay(10)
             }
         }
@@ -2170,21 +2142,7 @@ class DesktopConnectionTest {
                 true
             }
         }
-        private fun youtubeResponse(): JSONObject = synchronized(proofLock) {
-            val response = JSONObject().put("version", 1).put("mode", "selected_transport").put("status", youtubeStatus)
-                .put("grant_id", youtubeGrantId).put("generation", youtubeGeneration)
-                .put("expires_at", java.time.Instant.ofEpochMilli(youtubeExpiresAt).toString()).put("revoke_token", "r".repeat(43))
-            if (youtubeStatus == "ready") {
-                if (youtubeFirstReadyExpiresAt == 0L) youtubeFirstReadyExpiresAt = youtubeExpiresAt
-                youtubeReadyReplies.incrementAndGet()
-                response.put("vpn_secret", "99999999-9999-4999-8999-999999999999").put("endpoint", JSONObject()
-                    .put("code", "youtube-reality").put("node_id", deviceId)
-                    .put("entry_host", "yt1.noki.ykino.tech").put("server_name", "yt1.noki.ykino.tech").put("entry_port", 443)
-                    .put("proxy_type", "vless").put("security", "reality").put("transport", "tcp")
-                    .put("flow", "xtls-rprx-vision").put("public_key", "p".repeat(43)).put("short_id", "0123456789abcdef"))
-            }
-            response
-        }
+
         @Suppress("UNCHECKED_CAST")
         fun markActiveRu() {
             val mutable = DesktopController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(app) as MutableStateFlow<DesktopState>
@@ -2196,7 +2154,7 @@ class DesktopConnectionTest {
         override fun close() {
             poolCommitGate?.countDown()
             bootstrapGate?.countDown()
-            youtubeCreateGate?.countDown()
+
             runBlocking { withTimeout(5_000) { app.closeAndJoin() } }
             app.close(); listener.close(); acceptor.join(1_000)
             http.connectionPool.evictAll(); http.dispatcher.executorService.shutdownNow()

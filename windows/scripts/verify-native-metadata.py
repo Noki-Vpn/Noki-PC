@@ -1,5 +1,6 @@
 """Check effective Win32 metadata and external native libraries against the application JAR."""
 import json
+import hashlib
 import mmap
 from pathlib import Path
 import re
@@ -54,11 +55,14 @@ def verify(arguments_file):
                         read_config(str(file), file.read_text(encoding='utf-8'))
     archive = Path(arguments[arguments.index('-jar') + 1])
     with zipfile.ZipFile(archive) as jar:
+        manifest = dict(line.split('=', 1) for line in jar.read('noki/desktop/byedpi-windows.properties').decode().splitlines() if '=' in line)
+        assert manifest.get('version') == '0.17.3' and manifest.get('profile') == 'windows-disorder-fake', 'Wrong ByeDPI profile'
         assert 'noki/desktop/earth/countries.bin' in jar.namelist(), 'Packed country geometry is missing'
         assert 'noki/desktop/earth/relief-4k.png' in jar.namelist(), 'Window Earth atlas is missing'
         for authoring in ('relief.png', 'countries.json'):
             assert 'noki/desktop/earth/' + authoring not in jar.namelist(), f'Authoring resource in Native Image: {authoring}'
         package_root = Path(__file__).resolve().parents[1] / 'build/compose/binaries/main/graalvm-app/Noki'
+        assert hashlib.sha256((package_root / 'ciadpi.exe').read_bytes()).hexdigest() == manifest.get('ciadpi'), 'Packaged ByeDPI differs from its embedded pin'
         verify_native_libraries(arguments, jar, package_root)
         for name in jar.namelist():
             if name.startswith('META-INF/native-image/') and name.endswith(('reachability-metadata.json', 'reflect-config.json', 'proxy-config.json')):
@@ -86,6 +90,7 @@ def verify(arguments_file):
                               'dwXSize', 'dwYSize', 'dwXCountChars', 'dwYCountChars', 'dwFillAttribute',
                               'dwFlags', 'wShowWindow', 'cbReserved2', 'lpReserved2', 'hStdInput', 'hStdOutput', 'hStdError'},
         'WinBase$PROCESS_INFORMATION': {'hProcess', 'hThread', 'dwProcessId', 'dwThreadId'},
+        'WinBase$SECURITY_ATTRIBUTES': {'dwLength', 'lpSecurityDescriptor', 'bInheritHandle'},
         'Tlhelp32$PROCESSENTRY32': {'dwSize', 'cntUsage', 'th32ProcessID', 'th32DefaultHeapID', 'th32ModuleID',
                                   'cntThreads', 'th32ParentProcessID', 'pcPriClassBase', 'dwFlags', 'szExeFile'},
         'IPHlpAPI$MIB_IFROW': {'wszName', 'dwIndex', 'dwType', 'dwMtu', 'dwSpeed', 'dwPhysAddrLen', 'bPhysAddr',

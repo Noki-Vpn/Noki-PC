@@ -2,6 +2,9 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import hashlib
+import zipfile
 
 
 def load(name):
@@ -16,6 +19,34 @@ runtime = load('prepare-runtime-linux')
 
 
 class LinuxPackagingTest(unittest.TestCase):
+    def test_byedpi_delivery_rejects_modified_source_and_requires_the_pinned_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            delivery = root / 'vendor/byedpi'
+            delivery.mkdir(parents=True)
+            target = root / 'build/runtime/linux-x64'
+            target.mkdir(parents=True)
+            archive = delivery / 'byedpi.SOURCE.zip'
+            with zipfile.ZipFile(archive, 'w') as packed:
+                packed.writestr('LICENSE', 'fixture license')
+            source = hashlib.sha256(archive.read_bytes()).hexdigest()
+            binary = b'fixture-pinned-runtime'
+            (delivery / 'byedpi.source.properties').write_text(f'version=0.17.3\nsource={source}\n')
+            manifest = f'version=0.17.3\nsource={source}\nprofile=linux-md5sig\nciadpi={hashlib.sha256(binary).hexdigest()}\n'
+            (delivery / 'byedpi-linux.properties').write_text(manifest)
+            (target / 'ciadpi').write_bytes(binary)
+            with patch.object(runtime, 'ROOT', root):
+                runtime.prepare_byedpi(target, target.parent)
+                self.assertEqual('fixture license', (target / 'LICENSE-ByeDPI').read_text())
+                self.assertEqual(manifest, (target / 'byedpi-linux.properties').read_text())
+                (target / 'ciadpi').write_bytes(b'modified')
+                with patch.object(runtime.shutil, 'which', return_value=None), patch.dict(runtime.os.environ, {}, clear=True):
+                    with self.assertRaisesRegex(ValueError, 'toolchain'):
+                        runtime.prepare_byedpi(target, target.parent)
+                archive.write_bytes(b'modified source')
+                with self.assertRaisesRegex(ValueError, 'source/profile mismatch'):
+                    runtime.prepare_byedpi(target, target.parent)
+
     def test_rpm_removes_its_own_directories_but_does_not_own_shared_system_dirs(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = Path(directory)

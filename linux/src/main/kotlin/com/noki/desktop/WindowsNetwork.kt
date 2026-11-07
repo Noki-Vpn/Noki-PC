@@ -38,6 +38,14 @@ import kotlinx.coroutines.isActive
 internal data class WindowsNetworkSnapshot(val signature: String, val kind: EndpointRankingPolicy.NetworkKind, val available: Boolean,
     val interfaceIndex: Int? = null)
 
+/** A foreign VPN's default route must never become ByeDPI's underlay. */
+internal fun youtubePhysicalInterface(index: Int): Boolean {
+    val adapter = NetworkInterface.getByIndex(index) ?: return false
+    if (!adapter.isUp || adapter.isLoopback || adapter.isVirtual || adapter.name.equals("Noki", true)) return false
+    return if (DesktopBuild.IS_LINUX) java.nio.file.Files.isDirectory(java.nio.file.Path.of("/sys/class/net", adapter.name, "device"))
+    else WindowsDnsWmi().use { it.physicalInterface(index) }
+}
+
 /** Keep topology sampling independent of account and core-control request latency. */
 internal fun windowsNetworkSnapshots(snapshot: () -> WindowsNetworkSnapshot = ::windowsNetworkSnapshot): Flow<WindowsNetworkSnapshot> = flow {
     while (currentCoroutineContext().isActive) {
@@ -395,10 +403,11 @@ private class WindowsDnsWmi : AutoCloseable {
         @Suppress("UNCHECKED_CAST")
         return policies as List<Map<String, Any?>>
     }
-    private fun rows(service: Pointer, className: String, properties: List<String>): List<Map<String, Any?>> {
+    private fun rows(service: Pointer, className: String, properties: List<String>,
+                     predicate: String = "Store = 1 AND CompartmentId = 1"): List<Map<String, Any?>> {
         val output = PointerByReference()
         // Match Get-NetRoute/Get-NetIPInterface without IncludeAllCompartments: the primary compartment is 1.
-        bstr("WQL") { language -> bstr("SELECT ${properties.joinToString(",")} FROM $className WHERE Store = 1 AND CompartmentId = 1") { query ->
+        bstr("WQL") { language -> bstr("SELECT ${properties.joinToString(",")} FROM $className WHERE $predicate") { query ->
             checkHr(callWindowsCom(service, 20, language, query, 0x30, null, output), "WMI query $className")
         } }
         val enumeration = own(output.value)
@@ -418,6 +427,13 @@ private class WindowsDnsWmi : AutoCloseable {
             if (status == 1) return rows // WBEM_S_FALSE is end of enumeration, including an empty table.
         }
     }
+    fun physicalInterface(index: Int): Boolean {
+        require(index > 0)
+        val rows = rows(connect("ROOT\\StandardCimv2"), "MSFT_NetAdapter", listOf("InterfaceIndex", "HardwareInterface", "Virtual"),
+            "InterfaceIndex = $index")
+        return rows.singleOrNull()?.let { it["HardwareInterface"] == true && it["Virtual"] == false } == true
+    }
+
     fun routes(): JSONArray {
         val service = connect("ROOT\\StandardCimv2")
         val definition = objectAt(service, "MSFT_NetRoute")

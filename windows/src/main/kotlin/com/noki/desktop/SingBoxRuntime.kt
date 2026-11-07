@@ -45,10 +45,16 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 open class SingBoxRuntime(private val vault: WindowsVault,
     private val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(3, TimeUnit.SECONDS).callTimeout(4, TimeUnit.SECONDS).build(),
-    private val canRecoverRuntime: () -> Boolean = { !DesktopBuild.IS_LINUX && windowsCoreProcessesStopped() }) {
+    private val canRecoverRuntime: () -> Boolean = { !DesktopBuild.IS_LINUX && windowsCoreProcessesStopped() },
+    private val canRecoverYoutube: () -> Boolean = {
+        if (DesktopBuild.IS_LINUX) { LinuxPlatform.helper("byedpi-stop"); true }
+        else windowsCoreProcessesStopped(executable = "ciadpi.exe")
+    }) {
     data class Running(val pid: Int, val startedAt: Long, val controlPort: Int, val controlSecret: String, val probePort: Int, val label: String, val serverId: String? = null)
     internal class StartupFailure(message: String, cause: Throwable) : IOException(message, cause)
     internal class ProbeFailure(message: String, cause: Throwable) : IOException(message, cause)
@@ -101,6 +107,126 @@ open class SingBoxRuntime(private val vault: WindowsVault,
     private val coreLogHttp = http.newBuilder().proxy(Proxy.NO_PROXY).followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).build()
     private val binary: Path = findBinary()
+    private data class YoutubeRunning(val pid: Int, val startedAt: Long, val port: Int, val parent: Int, val network: String)
+    private val youtubeLock = Mutex()
+    @Volatile private var youtube: YoutubeRunning? = null
+    private var localYoutubePort: Int? = null
+    private val youtubeBinary: Path get() = binary.resolveSibling(if (DesktopBuild.IS_LINUX) "ciadpi" else "ciadpi.exe")
+
+    internal open fun youtubePort(): Int = synchronized(this) {
+        localYoutubePort ?: freePort().also { localYoutubePort = it }
+    }
+
+    private fun loadYoutube(): YoutubeRunning? = youtube ?: vault.loadRuntimeRecord(canRecoverYoutube, "byedpi.dpapi") { raw ->
+        raw?.let {
+            val value = JSONObject(it)
+            YoutubeRunning(value.getInt("pid"), value.getLong("started_at"), value.getInt("port"),
+                value.getInt("parent"), value.getString("network")).also { current ->
+                if (current.pid <= 1 || current.startedAt <= 0 || current.port !in 1..65535 || current.parent <= 1)
+                    throw org.json.JSONException("Invalid ByeDPI identity")
+                youtube = current
+            }
+        }
+    }
+
+    internal open suspend fun youtubeAlive(): Boolean = withContext(Dispatchers.IO) {
+        val current = loadYoutube() ?: return@withContext false
+        current.parent == restored()?.pid && youtubeMatches(current)
+    }
+
+    private fun youtubeMatches(current: YoutubeRunning): Boolean {
+        if (DesktopBuild.IS_LINUX) return LinuxPlatform.serviceMatches(current.pid, current.startedAt, "noki-byedpi")
+        return windowsProcessMatches(current.pid, current.startedAt, youtubeBinary)
+    }
+
+    internal open suspend fun startYoutube(network: WindowsNetworkSnapshot): Int = withContext(Dispatchers.IO) {
+        youtubeLock.withLock {
+            val parent = checkNotNull(restored()) { "youtube_main_connection_missing" }
+            val previous = loadYoutube()
+            if (previous != null && previous.port == youtubePort() && previous.parent == parent.pid && previous.network == network.signature && youtubeMatches(previous))
+                return@withLock previous.port
+            stopYoutubeLocked()
+            verifyYoutubeBinary(youtubeBinary)
+            val port = youtubePort()
+            val adapter = java.net.NetworkInterface.getByIndex(requireNotNull(network.interfaceIndex))
+            require(network.available && adapter != null && youtubePhysicalInterface(network.interfaceIndex)) {
+                "youtube_physical_network_unavailable"
+            }
+            val source = adapter.inetAddresses.toList().filterIsInstance<java.net.Inet4Address>()
+                .firstOrNull { !it.isLoopbackAddress && !it.isLinkLocalAddress }?.hostAddress
+                ?: error("youtube_physical_ipv4_unavailable")
+            try {
+                val current = if (DesktopBuild.IS_LINUX) {
+                    val config = JSONObject().put("port", port).put("interface", adapter.name).put("source", source).put("parent", parent.pid)
+                    val file = LinuxPlatform.runtimeDirectory.resolve("byedpi.json")
+                    Files.writeString(file, config.toString()); LinuxPlatform.privatePath(file)
+                    try {
+                        val reply = runInterruptible { LinuxPlatform.helper("byedpi-start") }
+                        require(reply.getInt("port") == port)
+                        val pid = reply.getInt("pid")
+                        YoutubeRunning(pid, ProcessHandle.of(pid.toLong()).orElseThrow().info().startInstant().orElseThrow().toEpochMilli(), port, parent.pid, network.signature)
+                    } finally { Files.deleteIfExists(file) }
+                } else {
+                    if (guardArmed()) guardHelper("youtube-on", binary.toString(), ProcessHandle.current().info().command().orElseThrow())
+                    val report = vault.writePrivate("byedpi-startup.log", "")
+                    val process = WindowsShell.launchProcess(youtubeBinary,
+                        youtubeArguments(port, network.interfaceIndex.toString(), source, parent.pid, linux = false), output = report)
+                    try { YoutubeRunning(Kernel32.INSTANCE.GetProcessId(process), creationTime(process), port, parent.pid, network.signature) }
+                    finally { Kernel32.INSTANCE.CloseHandle(process) }
+                }
+                youtube = current
+                vault.writeEncrypted("byedpi.dpapi", JSONObject().put("pid", current.pid).put("started_at", current.startedAt)
+                    .put("port", current.port).put("parent", current.parent).put("network", current.network).toString())
+                if (!DesktopBuild.IS_LINUX) {
+                    val report = vault.directory.resolve("byedpi-startup.log")
+                    val ready = withTimeoutOrNull(5_000) {
+                        while (true) {
+                            check(youtubeMatches(current)) { "ByeDPI завершился при запуске" }
+                            require(Files.size(report) <= 65536) { "Некорректный ответ ByeDPI" }
+                            if (youtubeReady(Files.readString(report), port, linux = false)) return@withTimeoutOrNull true
+                            delay(25)
+                        }
+                    }
+                    check(ready == true) { "ByeDPI не подтвердил готовность" }
+                }
+                check(restored() == parent && youtubeMatches(current)) { "youtube_main_connection_changed" }
+                port
+            } catch (error: Throwable) {
+                withContext(NonCancellable) {
+                    stopYoutubeLocked()
+                    if (!DesktopBuild.IS_LINUX && guardArmed())
+                        guardHelper("on", binary.toString(), ProcessHandle.current().info().command().orElseThrow())
+                }
+                throw error
+            }
+        }
+    }
+
+    internal open suspend fun stopYoutube(): Unit = withContext(Dispatchers.IO + NonCancellable) {
+        youtubeLock.withLock {
+            val existed = !DesktopBuild.IS_LINUX && loadYoutube() != null
+            stopYoutubeLocked()
+            if (existed && !DesktopBuild.IS_LINUX && guardArmed())
+                guardHelper("on", binary.toString(), ProcessHandle.current().info().command().orElseThrow())
+        }
+    }
+
+    private fun stopYoutubeLocked() {
+        if (DesktopBuild.IS_LINUX) LinuxPlatform.helper("byedpi-stop")
+        else loadYoutube()?.let { current ->
+            if (youtubeMatches(current)) {
+                val process = Kernel32.INSTANCE.OpenProcess(0x1000 or 0x100000 or 1, false, current.pid)
+                    ?: error("Windows не разрешила завершить ByeDPI")
+                try {
+                    check(creationTime(process) == current.startedAt && windowsProcessMatches(current.pid, current.startedAt, youtubeBinary))
+                    check(Kernel32.INSTANCE.TerminateProcess(process, 0) || Kernel32.INSTANCE.WaitForSingleObject(process, 0) == 0)
+                    check(Kernel32.INSTANCE.WaitForSingleObject(process, 2_000) == 0) { "ByeDPI не остановлен" }
+                } finally { Kernel32.INSTANCE.CloseHandle(process) }
+            }
+        }
+        youtube = null
+        Files.deleteIfExists(vault.directory.resolve("byedpi.dpapi"))
+    }
     internal suspend fun ruleSetCommand(command: String, source: Path, output: Path) = withContext(Dispatchers.IO) {
         require(command in setOf("compile", "decompile"))
         verifyRuntimeBinary(binary)
@@ -433,7 +559,55 @@ open class SingBoxRuntime(private val vault: WindowsVault,
     private fun clearRecord() { running = null; Files.deleteIfExists(vault.directory.resolve("runtime.dpapi")) }
 
     companion object {
-        internal fun windowsCoreProcessesStopped(kernel: Kernel32 = Kernel32.INSTANCE): Boolean {
+        internal fun youtubeArguments(port: Int, network: String, source: String, parent: Int, linux: Boolean): List<String> {
+            require(port in 0..65535 && parent > 1 && network.isNotBlank())
+            require(java.net.InetAddress.getByName(source) is java.net.Inet4Address && source != "0.0.0.0")
+            return listOf("--ip", "127.0.0.1", "--port", port.toString(), "--max-conn", "4096", "--conn-ip", "0.0.0.0",
+                "--no-udp", "--no-domain", "--proto", "tls,http") +
+                (if (linux) listOf("--fake", "-1", "--md5sig") else listOf("--disorder", "1", "--fake", "-1")) +
+                listOf("--noki-interface", network, "--noki-source", source, "--noki-parent", parent.toString()) +
+                (if (linux) listOf("--noki-mark", "20047") else emptyList())
+        }
+
+        internal fun youtubeReady(output: String, port: Int, linux: Boolean): Boolean = output.lineSequence().any {
+            it == "NOKI_READY port=$port profile=${if (linux) "linux-md5sig" else "windows-disorder-fake"}"
+        }
+
+        internal fun verifyYoutubeBinary(binary: Path) {
+            val os = if (DesktopBuild.IS_LINUX) "linux" else "windows"
+            val manifest = java.util.Properties().apply {
+                checkNotNull(SingBoxRuntime::class.java.getResourceAsStream("/noki/desktop/byedpi-$os.properties")) {
+                    "Отсутствует закреплённая поставка ByeDPI"
+                }.use { load(it) }
+            }
+            require(manifest.getProperty("version") == "0.17.3" && manifest.getProperty("profile") ==
+                if (DesktopBuild.IS_LINUX) "linux-md5sig" else "windows-disorder-fake")
+            check(Files.isRegularFile(binary)) { "ByeDPI не найден" }
+            val actual = Files.newInputStream(binary).use { input ->
+                val digest = MessageDigest.getInstance("SHA-256")
+                val bytes = ByteArray(65536)
+                while (true) { val count = input.read(bytes); if (count < 0) break; digest.update(bytes, 0, count) }
+                digest.digest().joinToString("") { "%02x".format(it) }
+            }
+            check(actual == manifest.getProperty("ciadpi")) { "Контрольная сумма ByeDPI не совпадает" }
+        }
+
+        internal fun verifyBundledYoutube() = verifyYoutubeBinary(findBinary().resolveSibling(if (DesktopBuild.IS_LINUX) "ciadpi" else "ciadpi.exe"))
+
+        private fun windowsProcessMatches(pid: Int, startedAt: Long, executable: Path): Boolean {
+            val process = Kernel32.INSTANCE.OpenProcess(0x1000 or 0x100000, false, pid) ?: run {
+                check(Kernel32.INSTANCE.GetLastError() == 87) { "Windows не разрешила проверить ByeDPI" }
+                return false
+            }
+            return try {
+                val path = CharArray(32768); val length = IntByReference(path.size)
+                Kernel32.INSTANCE.WaitForSingleObject(process, 0) == 258 && creationTime(process) == startedAt &&
+                    Kernel32.INSTANCE.QueryFullProcessImageName(process, 0, path, length) &&
+                    Path.of(String(path, 0, length.value)).toAbsolutePath().normalize() == executable.toAbsolutePath().normalize()
+            } finally { Kernel32.INSTANCE.CloseHandle(process) }
+        }
+
+        internal fun windowsCoreProcessesStopped(kernel: Kernel32 = Kernel32.INSTANCE, executable: String = "sing-box.exe"): Boolean {
             val snapshot = kernel.CreateToolhelp32Snapshot(com.sun.jna.platform.win32.Tlhelp32.TH32CS_SNAPPROCESS,
                 com.sun.jna.platform.win32.WinDef.DWORD(0))
             if (snapshot == WinBase.INVALID_HANDLE_VALUE || snapshot == null)
@@ -442,8 +616,8 @@ open class SingBoxRuntime(private val vault: WindowsVault,
                 val process = com.sun.jna.platform.win32.Tlhelp32.PROCESSENTRY32()
                 var found = kernel.Process32First(snapshot, process)
                 while (found) {
-                    // An inaccessible or unrelated sing-box is also a reason to leave the record intact.
-                    if (com.sun.jna.Native.toString(process.szExeFile).equals("sing-box.exe", ignoreCase = true)) return false
+                    // An inaccessible or unrelated matching process also prevents identity recovery.
+                    if (com.sun.jna.Native.toString(process.szExeFile).equals(executable, ignoreCase = true)) return false
                     found = kernel.Process32Next(snapshot, process)
                 }
                 val error = kernel.GetLastError()

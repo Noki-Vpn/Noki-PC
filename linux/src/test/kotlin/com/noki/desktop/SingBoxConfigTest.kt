@@ -19,6 +19,99 @@ import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
 class SingBoxConfigTest {
+    @Test fun `pinned core resolves YouTube through protected DNS and sends an IPv4 SOCKS destination`() {
+        val binary = Path.of("build/runtime/windows-x64/sing-box.exe").toAbsolutePath()
+        SingBoxRuntime.verifyRuntimeBinary(binary)
+        val loopback = java.net.InetAddress.getByName("127.0.0.1")
+        java.net.DatagramSocket(0, loopback).use { dns -> java.net.ServerSocket(0, 8, loopback).use { sidecar ->
+            dns.soTimeout = 10_000; sidecar.soTimeout = 10_000
+            val destination = java.util.concurrent.CompletableFuture<Pair<Int, List<Int>>>()
+            val dnsQueries = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val dnsThread = Thread {
+                try {
+                    while (!dns.isClosed) {
+                        val packet = java.net.DatagramPacket(ByteArray(4096), 4096)
+                        dns.receive(packet)
+                        val query = packet.data
+                        var offset = 12
+                        val labels = mutableListOf<String>()
+                        while (query[offset].toInt() != 0) {
+                            val length = query[offset++].toInt() and 255
+                            labels += String(query, offset, length, Charsets.US_ASCII); offset += length
+                        }
+                        offset++
+                        val type = (query[offset].toInt() and 255) * 256 + (query[offset + 1].toInt() and 255)
+                        offset += 4
+                        dnsQueries += labels.joinToString(".")
+                        val answer = type == 1
+                        val response = query.copyOfRange(0, offset).apply {
+                            this[2] = 0x81.toByte(); this[3] = 0x80.toByte(); this[6] = 0; this[7] = if (answer) 1 else 0
+                            this[8] = 0; this[9] = 0; this[10] = 0; this[11] = 0
+                        } + if (answer) byteArrayOf(0xc0.toByte(), 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4,
+                            198.toByte(), 51, 100, 17) else byteArrayOf()
+                        dns.send(java.net.DatagramPacket(response, response.size, packet.socketAddress))
+                    }
+                } catch (_: java.io.IOException) { }
+            }.apply { isDaemon = true; start() }
+            val socksThread = Thread {
+                try {
+                    sidecar.accept().use { socket ->
+                        socket.soTimeout = 5_000
+                        val input = socket.getInputStream(); val output = socket.getOutputStream()
+                        check(input.read() == 5)
+                        input.readNBytes(input.read())
+                        output.write(byteArrayOf(5, 0)); output.flush()
+                        val header = input.readNBytes(4)
+                        val type = header[3].toInt() and 255
+                        val length = when (type) { 1 -> 4; 4 -> 16; 3 -> input.read(); else -> error("Invalid SOCKS address type") }
+                        val address = input.readNBytes(length).map { it.toInt() and 255 }
+                        input.readNBytes(2)
+                        destination.complete(type to address)
+                        output.write(byteArrayOf(5, 0, 0, 1, 127, 0, 0, 1, 0, 1)); output.flush()
+                    }
+                } catch (error: Throwable) { destination.completeExceptionally(error) }
+            }.apply { isDaemon = true; start() }
+            val inbound = SingBoxRuntime.freePort()
+            val config = SingBoxConfig.withYoutube(generate(session(candidate()), candidate()),
+                DesktopState().settings.copy(advancedSettings = AdvancedSettings(youtubeAdBlockEnabled = true)), YoutubeConnectionConfig(sidecar.localPort))
+            config.put("inbounds", JSONArray().put(JSONObject().put("type", "socks").put("tag", "tun")
+                .put("listen", "127.0.0.1").put("listen_port", inbound)))
+            config.getJSONObject("experimental").getJSONObject("clash_api")
+                .put("external_controller", "127.0.0.1:${SingBoxRuntime.freePort()}")
+            val servers = config.getJSONObject("dns").getJSONArray("servers")
+            val resolver = servers.objects().indexOfFirst { it.optString("tag") == "noki-node-dns" }
+            servers.put(resolver, JSONObject().put("type", "udp").put("tag", "noki-node-dns")
+                .put("server", "127.0.0.1").put("server_port", dns.localPort))
+            val file = Files.createTempFile("noki-youtube-wire-", ".json")
+            val log = Files.createTempFile("noki-youtube-wire-", ".log")
+            var process: com.sun.jna.platform.win32.WinNT.HANDLE? = null
+            try {
+                Files.writeString(file, config.toString())
+                process = WindowsShell.launchProcess(binary, listOf("run", "-c", file.toString()), output = log)
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (true) {
+                    try { java.net.Socket().use { it.connect(java.net.InetSocketAddress(loopback, inbound), 100) }; break }
+                    catch (error: java.io.IOException) { if (System.nanoTime() >= deadline) throw error; Thread.sleep(25) }
+                }
+                java.net.Socket(java.net.Proxy(java.net.Proxy.Type.SOCKS, java.net.InetSocketAddress(loopback, inbound))).use {
+                    it.connect(java.net.InetSocketAddress.createUnresolved("www.youtube.com", 443), 5_000)
+                }
+                val observed = destination.get(5, TimeUnit.SECONDS)
+                assertEquals(Files.readString(log), 1, observed.first)
+                assertEquals(listOf(198, 51, 100, 17), observed.second)
+                assertTrue(dnsQueries.contains("www.youtube.com"))
+            } finally {
+                process?.let { handle ->
+                    com.sun.jna.platform.win32.Kernel32.INSTANCE.TerminateProcess(handle, 0)
+                    com.sun.jna.platform.win32.Kernel32.INSTANCE.WaitForSingleObject(handle, 2_000)
+                    com.sun.jna.platform.win32.Kernel32.INSTANCE.CloseHandle(handle)
+                }
+                dns.close(); sidecar.close(); dnsThread.join(1_000); socksThread.join(1_000)
+                Files.deleteIfExists(file); Files.deleteIfExists(log)
+            }
+        } }
+    }
+
     @Test fun `NaiveProxy uses session credentials in the native outbound and remains a separate manual family`() {
         val naive = hysteria().copy(code = "ro-naive", locationCode = "ro", locationName = "Romania",
             proxyType = "naive", transport = "naive", alpn = null, connectIp = "203.0.113.10")
@@ -370,23 +463,24 @@ class SingBoxConfigTest {
         val connections = listOf(youtubeConnection())
         for ((base, current) in fourMainPaths(settings)) {
             val before = base.toString()
-            assertFalse(before.contains("youtube-ru"))
+            assertFalse(before.contains("youtube-local"))
             val apps = base.getJSONObject("route").getJSONArray("rules").objects().first { it.toString().contains("process_path_regex") }
             for (connection in connections) {
                 val config = SingBoxConfig.withYoutube(base, current, connection, geosite)
                 assertEquals(before, base.toString())
                 assertMainPathUnchanged(base, config)
-                val branch = config.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-ru" }
-                assertEquals("yt1.noki.ykino.tech", branch.getString("server"))
-                assertEquals("vless", branch.getString("type"))
-                assertEquals("xtls-rprx-vision", branch.getString("flow"))
+                val branch = config.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-local" }
+                assertEquals("127.0.0.1", branch.getString("server"))
+                assertEquals("socks", branch.getString("type"))
+                assertEquals(1080, branch.getInt("server_port"))
+                assertEquals("5", branch.getString("version"))
+                assertEquals("tcp", branch.getString("network"))
                 assertFalse(branch.has("detour"))
-                assertEquals("bootstrap", branch.getJSONObject("domain_resolver").getString("server"))
                 val rows = config.getJSONObject("route").getJSONArray("rules").objects()
                 val youtube = rows.filter { it.optJSONArray("rules")?.let { match ->
                     match.length() == 4 && match.getJSONObject(1).similar(domains)
                 } == true }
-                assertEquals(3, youtube.size)
+                assertEquals(4, youtube.size)
                 youtube.forEach { assertEquals("tun", it.getJSONArray("rules").getJSONObject(0).getString("inbound")) }
                 assertEquals("reject", youtube[0].getString("action"))
                 assertEquals(6, youtube[0].getJSONArray("rules").getJSONObject(2).getInt("ip_version"))
@@ -394,7 +488,10 @@ class SingBoxConfigTest {
                 assertEquals("udp", youtube[1].getJSONArray("rules").getJSONObject(2).getString("network"))
                 assertFalse(youtube[1].getJSONArray("rules").getJSONObject(2).has("port"))
                 assertEquals("tcp", youtube[2].getJSONArray("rules").getJSONObject(2).getString("network"))
-                assertEquals("youtube-ru", youtube[2].getString("outbound"))
+                assertEquals("resolve", youtube[2].getString("action"))
+                assertEquals("noki-node-dns", youtube[2].getString("server"))
+                assertEquals("ipv4_only", youtube[2].getString("strategy"))
+                assertEquals("youtube-local", youtube[3].getString("outbound"))
                 val appIndex = rows.indexOfFirst { it.similar(apps) }
                 val youtubeIndex = rows.indexOf(youtube.first())
                 val directIndex = rows.indexOfFirst { it.optString("outbound") == "direct" &&
@@ -427,7 +524,7 @@ class SingBoxConfigTest {
             assertNotSame(base, off)
             val blocked = SingBoxConfig.withYoutube(base, settings, null)
             assertMainPathUnchanged(base, blocked)
-            assertFalse(blocked.toString().contains("youtube-ru"))
+            assertFalse(blocked.toString().contains("youtube-local"))
             val rows = blocked.getJSONObject("route").getJSONArray("rules").objects()
             val youtube = rows.filter { it.optJSONArray("rules")?.let { match ->
                 match.length() == 4 && match.getJSONObject(0).optString("inbound") == "tun"
@@ -441,27 +538,23 @@ class SingBoxConfigTest {
         }
     }
 
-    @Test fun `fixed YouTube Reality preserves every primary protocol and has no main detour`() {
-        val fixed = youtubeConnection()
+    @Test fun `local YouTube SOCKS preserves every primary protocol and has no main detour`() {
         val naive = candidate().copy(proxyType = "naive", transport = "naive", security = "tls", transportMode = null,
             publicKey = null, shortId = null, flow = null, requestHost = null, path = null, alpn = null)
         for (endpoint in listOf(candidate(), nokiNv(), hysteria(), naive)) {
             val base = generate(session(endpoint), endpoint)
             val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings(youtubeAdBlockEnabled = true))
-            val output = SingBoxConfig.withYoutube(base, settings, fixed)
+            val output = SingBoxConfig.withYoutube(base, settings, youtubeConnection())
             assertMainPathUnchanged(base, output)
-            val branch = output.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-ru" }
-            assertEquals("vless", branch.getString("type"))
-            assertEquals(443, branch.getInt("server_port"))
-            assertEquals("xtls-rprx-vision", branch.getString("flow"))
-            assertEquals("yt1.noki.ykino.tech", branch.getString("server"))
-            assertEquals(branch.getString("server"), branch.getJSONObject("tls").getString("server_name"))
-            assertEquals("99999999-9999-4999-8999-999999999999", branch.getString("uuid"))
-            assertFalse(branch.has("transport"))
+            val branch = output.getJSONArray("outbounds").objects().single { it.optString("tag") == "youtube-local" }
+            assertEquals("socks", branch.getString("type"))
+            assertEquals(1080, branch.getInt("server_port"))
+            assertEquals("127.0.0.1", branch.getString("server"))
             assertFalse(branch.has("detour"))
             assertEquals(1, output.getJSONArray("inbounds").objects().count { it.optString("type") == "tun" })
             checkWithCore(output)
         }
+        for (port in listOf(0, -1, 65536)) rejected { YoutubeConnectionConfig(port) }
     }
 
     private fun fourMainPaths(settings: StoredSettings): List<Pair<JSONObject, StoredSettings>> {
@@ -483,12 +576,7 @@ class SingBoxConfigTest {
         return listOf(direct to settings, multi to multiSettings, ru(ruSettings, null) to ruSettings, ru(ruMultiSettings, ENTRY) to ruMultiSettings)
     }
 
-    private fun youtubeConnection(): YoutubeConnectionConfig = YoutubeConnectionConfig.fromReady(
-        BackendYoutubeAccess("selected_transport", "ready", "grant", 1, Long.MAX_VALUE, "r".repeat(43),
-            endpoint = candidate().copy(code = "youtube", entryHost = "yt1.noki.ykino.tech", serverName = "yt1.noki.ykino.tech",
-                connectIp = null, entryPort = 443, transport = "tcp", transportMode = null, security = "reality",
-                flow = "xtls-rprx-vision", requestHost = null, path = null),
-            vpnSecret = "99999999-9999-4999-8999-999999999999"))
+    private fun youtubeConnection() = YoutubeConnectionConfig(1080)
 
     private fun youtubeWireGuard() = BackendRuWireGuardConfig("youtube.example.com:51820",
         java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 1).toByte() }), "10.201.0.2/32", listOf("10.201.0.1"), 1280, listOf("0.0.0.0/0"))

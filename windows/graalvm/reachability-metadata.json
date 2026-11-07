@@ -1,6 +1,11 @@
 {
   "reflection": [
     {
+      "type": "com.sun.jna.platform.win32.WinBase$SECURITY_ATTRIBUTES",
+      "allDeclaredFields": true,
+      "allDeclaredConstructors": true
+    },
+    {
       "type": "com.sun.jna.platform.win32.WinDef$LONG",
       "allDeclaredConstructors": true
     },

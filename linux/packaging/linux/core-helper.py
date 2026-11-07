@@ -1,6 +1,8 @@
 #!/usr/bin/python3 -I
 """Fixed polkit entry point. The core runs as the caller, never as root."""
 import json
+import hashlib
+import ipaddress
 import fcntl
 import os
 from pathlib import Path, PurePosixPath
@@ -9,8 +11,10 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 CORE = PurePosixPath('/usr/lib/noki/sing-box')
+BYEDPI = PurePosixPath('/usr/lib/noki/ciadpi')
 STATE = Path('/var/lib/noki/guard')
 MARK = 0x4E4F
 INTERFACE = 'Noki'
@@ -55,7 +59,7 @@ def checked_scope(uid, path):
     return path.strip('/')
 
 
-def nft_rules(uid, scope=None):
+def nft_rules(uid, scope=None, youtube_interface=None):
     if uid <= 0 or uid > 2**32 - 2:
         raise ValueError('Invalid UID')
     table = f'noki_{uid}'
@@ -63,9 +67,16 @@ def nft_rules(uid, scope=None):
     if scope:
         scope = checked_scope(uid, '/' + scope.lstrip('/'))
         gui = f'    socket cgroupv2 level {len(scope.split("/"))} "{scope}" accept\n'
+    youtube = ''
+    if youtube_interface:
+        if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,15}', youtube_interface) or youtube_interface in ('lo', INTERFACE):
+            raise ValueError('Invalid physical interface')
+        group = f'socket cgroupv2 level 2 "system.slice/noki-byedpi-{uid}.service"'
+        youtube = (f'    {group} oifname "{youtube_interface}" meta l4proto tcp meta mark {MARK} accept\n'
+                   f'    {group} reject\n')
     return (f'table inet {table} {{\n  chain output {{\n    type filter hook output priority -10; policy accept;\n'
             f'    oifname "lo" accept\n'
-            f'    meta mark {MARK} accept\n    oifname "{INTERFACE}" accept\n'
+            + youtube + f'    meta mark {MARK} accept\n    oifname "{INTERFACE}" accept\n'
             + gui + f'    udp dport 53 reject\n    tcp dport 53 reject\n'
             f'    meta skuid != {uid} accept\n    reject\n  }}\n}}\n')
 
@@ -74,26 +85,32 @@ def guard_enabled(uid):
     return invoke([executable('nft'), 'list', 'table', 'inet', f'noki_{uid}'], check=False).returncode == 0
 
 
-def save_state(uid, enabled):
+def save_state(uid, enabled, youtube_interface=None):
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = STATE / f'{uid}.tmp'
-    temporary.write_text(json.dumps({'guard': bool(enabled)}))
+    temporary.write_text(json.dumps({'guard': bool(enabled), 'youtube_interface': youtube_interface}))
     temporary.chmod(0o600)
     temporary.replace(STATE / str(uid))
 
 
-def set_guard(uid, enabled, scope=None):
+def set_guard(uid, enabled, scope=None, youtube_interface=None):
+    if youtube_interface is None:
+        record = STATE / str(uid)
+        if record.is_file() and Path(f'/sys/fs/cgroup/system.slice/noki-byedpi-{uid}.service').is_dir():
+            youtube_interface = json.loads(record.read_text()).get('youtube_interface')
     table = f'noki_{uid}'
     prefix = f'delete table inet {table}\n' if guard_enabled(uid) else ''
-    script = prefix + (nft_rules(uid, scope) if enabled else '')
+    script = prefix + (nft_rules(uid, scope, youtube_interface) if enabled else '')
     if script:
         invoke([executable('nft'), '-f', '-'], input=script)
-    save_state(uid, enabled)
+    save_state(uid, enabled, youtube_interface)
 
 
-def checked_config(uid):
+def checked_config(uid, name='vpn.json'):
+    if name not in ('vpn.json', 'byedpi.json'):
+        raise ValueError('Unsupported configuration')
     directory = Path(f'/run/user/{uid}/noki')
-    config = directory / 'vpn.json'
+    config = directory / name
     for path, directory_expected in ((directory, True), (config, False)):
         info = path.lstat()
         if (path.resolve() != path or info.st_uid != uid or info.st_mode & 0o077 or
@@ -131,10 +148,84 @@ def unit_command(uid, gid, home, config):
             '--working-directory=/usr/lib/noki', '--setenv=LD_LIBRARY_PATH=/usr/lib/noki',
             str(CORE), 'run', '-c', str(config)]
 
-def stop_unit(uid):
-    result = invoke([executable('systemctl'), 'stop', f'noki-vpn-{uid}.service'], check=False)
+def stop_unit(uid, service='noki-vpn'):
+    if service not in ('noki-vpn', 'noki-byedpi'):
+        raise ValueError('Unsupported service')
+    result = invoke([executable('systemctl'), 'stop', f'{service}-{uid}.service'], check=False)
     if result.returncode and 'not loaded' not in result.stderr and 'not found' not in result.stderr:
         raise ValueError('Failed to stop the VPN service')
+
+
+def byedpi_arguments(config, parent):
+    if set(config) != {'port', 'interface', 'source', 'parent'}:
+        raise ValueError('Unexpected ByeDPI configuration')
+    port, interface, source = config['port'], config['interface'], config['source']
+    if (type(port) is not int or not 1 <= port <= 65535 or config['parent'] != parent or
+            not isinstance(interface, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,15}', interface) or
+            interface in ('lo', INTERFACE)):
+        raise ValueError('Invalid ByeDPI physical binding')
+    address = ipaddress.IPv4Address(source)
+    if address.is_unspecified or address.is_loopback or address.is_link_local:
+        raise ValueError('Invalid ByeDPI source')
+    return ['--ip', '127.0.0.1', '--port', str(port), '--max-conn', '4096', '--conn-ip', '0.0.0.0',
+            '--no-udp', '--no-domain', '--proto', 'tls,http', '--fake', '-1', '--md5sig',
+            '--noki-interface', interface, '--noki-source', str(address), '--noki-mark', str(MARK),
+            '--noki-parent', str(parent)]
+
+
+def byedpi_start(uid, account, scope):
+    for name in (str(BYEDPI), '/usr/lib/noki/byedpi-linux.properties'):
+        path = Path(name)
+        info = path.lstat()
+        if path.resolve() != path or info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
+            raise ValueError('ByeDPI runtime must be root-owned and immutable to users')
+    manifest = dict(line.split('=', 1) for line in Path('/usr/lib/noki/byedpi-linux.properties').read_text().splitlines() if '=' in line)
+    if (manifest.get('version') != '0.17.3' or manifest.get('profile') != 'linux-md5sig' or
+            hashlib.sha256(Path(BYEDPI).read_bytes()).hexdigest() != manifest.get('ciadpi')):
+        raise ValueError('ByeDPI runtime checksum mismatch')
+    parent = int(invoke([executable('systemctl'), 'show', f'noki-vpn-{uid}.service', '-p', 'MainPID', '--value']).stdout.strip())
+    core_identity(uid, parent)
+    config = json.loads(checked_config(uid, 'byedpi.json').read_text())
+    arguments = byedpi_arguments(config, parent)
+    if not Path('/sys/class/net', config['interface'], 'device').is_dir():
+        raise ValueError('ByeDPI requires a physical network interface')
+    addresses = json.loads(invoke([executable('ip'), '-j', '-4', 'addr', 'show', 'dev', config['interface']]).stdout)
+    if not any(row.get('local') == config['source'] for adapter in addresses for row in adapter.get('addr_info', [])):
+        raise ValueError('ByeDPI source does not belong to the physical interface')
+    stop_unit(uid, 'noki-byedpi')
+    command = [executable('systemd-run'), '--quiet', '--collect', f'--unit=noki-byedpi-{uid}',
+               f'--uid={uid}', f'--gid={account.pw_gid}', '--property=Type=exec', '--property=Restart=no',
+               '--property=NoNewPrivileges=yes', '--property=AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW',
+               '--property=CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW', '--property=ProtectSystem=strict',
+               '--property=ProtectHome=yes', '--property=ProtectControlGroups=yes', '--property=PrivateTmp=yes',
+               '--property=UMask=0077', '--property=KillMode=control-group', '--property=TimeoutStopSec=2s',
+               f'--property=BindsTo=noki-vpn-{uid}.service', f'--property=After=noki-vpn-{uid}.service',
+               '--property=RestrictAddressFamilies=AF_INET AF_UNIX', str(BYEDPI)] + arguments
+    try:
+        invoke(command)
+        unit = f'noki-byedpi-{uid}.service'
+        invocation = invoke([executable('systemctl'), 'show', unit, '-p', 'InvocationID', '--value']).stdout.strip()
+        if not re.fullmatch('[a-f0-9]{32}', invocation):
+            raise ValueError('Invalid ByeDPI invocation')
+        expected = f"NOKI_READY port={config['port']} profile=linux-md5sig"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            value = invoke([executable('systemctl'), 'show', unit, '-p', 'MainPID', '--value']).stdout.strip()
+            if not value.isdecimal() or int(value) <= 1:
+                raise ValueError('ByeDPI exited before readiness')
+            process = Path(f'/proc/{value}')
+            if (process / 'exe').readlink().as_posix() != str(BYEDPI) or f'0::/system.slice/{unit}' not in (process / 'cgroup').read_text().splitlines():
+                raise ValueError('ByeDPI process identity mismatch')
+            logs = invoke([executable('journalctl'), '--no-pager', '-o', 'cat', '-n', '20', f'_SYSTEMD_INVOCATION_ID={invocation}']).stdout
+            if expected in logs.splitlines():
+                if guard_enabled(uid):
+                    set_guard(uid, True, scope, config['interface'])
+                return {'pid': int(value), 'port': config['port']}
+            time.sleep(0.05)
+        raise ValueError('ByeDPI did not confirm the Linux MD5 profile')
+    except BaseException:
+        stop_unit(uid, 'noki-byedpi')
+        raise
 
 def check_guard_owner(uid):
     for path in STATE.glob('*'):
@@ -158,20 +249,29 @@ def main(arguments):
                     set_guard(uid, True)
             elif arguments[0] == 'upgrade':
                 stop_unit(uid)
+                stop_unit(uid, 'noki-byedpi')
                 if json.loads(path.read_text()).get('guard') is True:
                     set_guard(uid, True)
             else:
                 stop_unit(uid)
+                stop_unit(uid, 'noki-byedpi')
                 set_guard(uid, False)
                 path.unlink(missing_ok=True)
         return {}
-    if len(arguments) != 2 or arguments[0] not in ('identity', 'start', 'stop', 'dns-on', 'on', 'off', 'status', 'refresh'):
+    if len(arguments) != 2 or arguments[0] not in ('identity', 'start', 'stop', 'dns-on', 'on', 'off', 'status', 'refresh', 'byedpi-start', 'byedpi-stop'):
         raise ValueError('Unsupported operation')
     uid = caller_uid(os.environ)
     account = pwd.getpwuid(uid)
     pid = int(arguments[1])
     action = arguments[0]
     scope = gui_scope(uid, pid)
+    if action == 'byedpi-start':
+        return byedpi_start(uid, account, scope)
+    if action == 'byedpi-stop':
+        stop_unit(uid, 'noki-byedpi')
+        if guard_enabled(uid):
+            set_guard(uid, True, scope, '')
+        return {}
     if action in ('start', 'on'):
         check_guard_owner(uid)
     if action == 'identity':
@@ -198,6 +298,7 @@ def main(arguments):
     if action == 'stop':
         # A collected transient unit may already be absent after an early startup failure.
         stop_unit(uid)
+        stop_unit(uid, 'noki-byedpi')
         return {}
     if action == 'dns-on':
         # Removing the TUN also removes its resolved link settings; physical adapters remain untouched.

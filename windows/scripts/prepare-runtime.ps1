@@ -165,3 +165,41 @@ $nativeVersion = (& $binary version) -join "`n"
 if ($LASTEXITCODE -ne 0 -or ($nativeVersion -split "`n")[0] -ne "sing-box version $version") { throw 'Native runtime version mismatch' }
 Write-Output "sing-box $version binary SHA256 $binaryHash"
 Write-Output $nativeVersion
+
+$byeDelivery = Join-Path $root 'vendor\byedpi'
+$byeSource = ConvertFrom-StringData ([IO.File]::ReadAllText((Join-Path $byeDelivery 'byedpi.source.properties')))
+$byeManifest = ConvertFrom-StringData ([IO.File]::ReadAllText((Join-Path $byeDelivery 'byedpi-windows.properties')))
+$byeArchive = Join-Path $byeDelivery 'byedpi.SOURCE.zip'
+if ($byeSource.version -ne '0.17.3' -or $byeManifest.version -ne '0.17.3' -or
+    $byeManifest.profile -ne 'windows-disorder-fake' -or $byeManifest.source -ne $byeSource.source -or
+    (Get-Sha256 $byeArchive) -ne $byeSource.source) { throw 'Pinned ByeDPI source/profile mismatch' }
+$byeBinary = Join-Path $target 'ciadpi.exe'
+if (!(Test-Path -LiteralPath $byeBinary) -or (Get-Sha256 $byeBinary) -ne $byeManifest.ciadpi) {
+    $compiler = if ($env:BYEDPI_CC) { $env:BYEDPI_CC } else { 'x86_64-w64-mingw32-gcc' }
+    if (!(Get-Command $compiler -ErrorAction SilentlyContinue) -or !(Get-Command make -ErrorAction SilentlyContinue)) {
+        throw 'ByeDPI requires the pinned MinGW-w64/make toolchain or its verified prebuilt runtime.'
+    }
+    $byeBuild = Join-Path $runtime ('byedpi-build-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Compression.ZipFile]::ExtractToDirectory($byeArchive, $byeBuild)
+    try {
+        Push-Location $byeBuild
+        try { Invoke-Checked 'make' @('windows', "CC=$compiler", 'LDFLAGS=-static -Wl,--no-insert-timestamp') }
+        finally { Pop-Location }
+        $built = Join-Path $byeBuild 'ciadpi.exe'
+        if ((Get-Sha256 $built) -ne $byeManifest.ciadpi) { throw 'Reproduced Windows ByeDPI checksum mismatch; use its pinned toolchain.' }
+        Copy-Item -LiteralPath $built -Destination $byeBinary -Force
+    } finally {
+        if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($byeBuild)) -ne $runtime -or
+            [IO.Path]::GetFileName($byeBuild) -notmatch '^byedpi-build-[0-9a-f]{32}$') { throw 'Invalid ByeDPI build cleanup path' }
+        Remove-Item -LiteralPath $byeBuild -Recurse -Force
+    }
+}
+if ((Get-Sha256 $byeBinary) -ne $byeManifest.ciadpi) { throw 'Windows ByeDPI checksum mismatch' }
+$byeZip = [IO.Compression.ZipFile]::OpenRead($byeArchive)
+try {
+    $notice = $byeZip.GetEntry('LICENSE')
+    if ($null -eq $notice) { throw 'ByeDPI license is missing' }
+    [IO.Compression.ZipFileExtensions]::ExtractToFile($notice, (Join-Path $target 'LICENSE-ByeDPI'), $true)
+} finally { $byeZip.Dispose() }
+Copy-Item -LiteralPath (Join-Path $byeDelivery 'byedpi-windows.properties') -Destination $target -Force
+Write-Output "ByeDPI 0.17.3 Windows runtime SHA256 $($byeManifest.ciadpi)"

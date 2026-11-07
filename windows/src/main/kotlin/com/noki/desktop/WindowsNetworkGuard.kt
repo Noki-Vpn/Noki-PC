@@ -37,7 +37,10 @@ internal class WindowsNetworkGuard : AutoCloseable {
         fun ConvertStringSecurityDescriptorToSecurityDescriptorW(value: WString, revision: Int, result: PointerByReference, size: IntByReference): Boolean
         fun SetFileSecurityW(path: WString, information: Int, descriptor: Pointer): Boolean
     }
-    interface IpHelper : StdCallLibrary { fun ConvertInterfaceAliasToLuid(alias: WString, luid: LongByReference): Int }
+    interface IpHelper : StdCallLibrary {
+        fun ConvertInterfaceAliasToLuid(alias: WString, luid: LongByReference): Int
+        fun ConvertInterfaceIndexToLuid(index: Int, luid: LongByReference): Int
+    }
 
     @Structure.FieldOrder("name", "description")
     class Display : Structure() { @JvmField var name: WString? = null; @JvmField var description: WString? = null }
@@ -70,7 +73,7 @@ internal class WindowsNetworkGuard : AutoCloseable {
     private fun key(name: String) = GUID(UUID.nameUUIDFromBytes("Noki PC WFP:$sid:$name".toByteArray(Charsets.UTF_8)).toString())
     private val layers = listOf("c38d57d1-05a7-4c33-904f-7fbceee60e82", "4a72393b-319f-44bc-84c3-ba54dcb3b6b4")
     // Include obsolete DNS permits so upgrading also removes the former global bypass.
-    private val ruleNames = listOf("block", "core", "client", "loopback", "tun", "dns-tcp", "dns-udp")
+    private val ruleNames = listOf("block", "core", "client", "loopback", "tun", "dns-tcp", "dns-udp", "byedpi")
     init {
         val output = PointerByReference(); checked(api.FwpmEngineOpen0(null, 10, null, null, output)); engine = checkNotNull(output.value)
     }
@@ -81,7 +84,7 @@ internal class WindowsNetworkGuard : AutoCloseable {
         if (status == 0x80320003.toInt()) return false
         checked(status); return false
     }
-    fun enable(core: Path, client: Path, tunLuid: Long?) {
+    fun enable(core: Path, client: Path, tunLuid: Long?, youtube: Boolean = false) {
         val descriptors = mutableListOf<PointerByReference>()
         val security = Native.load("advapi32", Security::class.java)
         val user = PointerByReference()
@@ -100,11 +103,24 @@ internal class WindowsNetworkGuard : AutoCloseable {
             return condition("d78e1e87-8644-4ea5-9437-d809ecefc971", pointerValue(12, checkNotNull(pointer.value)))
         }
         val luid = tunLuid?.let { Memory(8).apply { setLong(0, it) } }
+        val physical = if (youtube) {
+            val index = requireNotNull(windowsNetworkSnapshot().takeIf { it.available }?.interfaceIndex)
+            require(youtubePhysicalInterface(index)) { "youtube_physical_network_unavailable" }
+            val value = LongByReference()
+            checked(Native.load("iphlpapi", IpHelper::class.java).ConvertInterfaceIndexToLuid(index, value))
+            Memory(8).apply { setLong(0, value.value) }
+        } else null
         try {
             val coreCondition = appCondition(core)
             val clientCondition = appCondition(client)
             val loopback = condition("632ce23b-5167-435c-86d7-e903684aa80c", numericValue(3, 1), 6)
             val tun = luid?.let { condition("4cd62a49-59c3-4969-b7f3-bda5d32890a4", pointerValue(4, it)) }
+            val sidecar = physical?.let {
+                val path = core.resolveSibling("ciadpi.exe")
+                SingBoxRuntime.verifyYoutubeBinary(path)
+                listOf(appCondition(path), condition("4cd62a49-59c3-4969-b7f3-bda5d32890a4", pointerValue(4, it)),
+                    condition("3971ef2b-623e-4f9a-8cb1-6e79b806b9a7", numericValue(1, 6)))
+            }
             transaction {
                 removeFilters()
                 val layer = SubLayer().apply { key = key("sublayer"); display.name = WString("Noki PC kill switch") }
@@ -128,6 +144,7 @@ internal class WindowsNetworkGuard : AutoCloseable {
                     }
                     add("block"); add("core", coreCondition); add("client", clientCondition); add("loopback", loopback)
                     if (tun != null) add("tun", tun)
+                    if (index == 0 && sidecar != null) add("byedpi", *sidecar.toTypedArray())
                 }
             }
         } finally {
@@ -135,6 +152,7 @@ internal class WindowsNetworkGuard : AutoCloseable {
             user.value?.let { Kernel32.INSTANCE.LocalFree(it) }
             Reference.reachabilityFence(userDescriptor)
             Reference.reachabilityFence(luid)
+            Reference.reachabilityFence(physical)
         }
     }
     fun disable() = transaction {
@@ -195,11 +213,11 @@ internal fun runNetworkGuard(args: Array<String>) {
             if (command == "off") {
                 require(args.size == 4)
                 guard.disable(); Files.deleteIfExists(directory.resolve("guard.dpapi"))
-            } else if (command == "on") {
+            } else if (command == "on" || command == "youtube-on") {
                 require(args.size == 6)
                 val binary = Path.of(args[4]).toAbsolutePath().normalize()
                 SingBoxRuntime.verifyRuntimeBinary(binary)
-                guard.enable(binary, Path.of(args[5]).toAbsolutePath().normalize(), WindowsNetworkGuard.tunLuid())
+                guard.enable(binary, Path.of(args[5]).toAbsolutePath().normalize(), WindowsNetworkGuard.tunLuid(), youtube = command == "youtube-on")
                 vault.writeEncrypted("guard.dpapi", "enabled")
             } else {
                 require(command == "launch" && args.size == 8)

@@ -45,6 +45,44 @@ def checked_member(name):
         raise ValueError(f'Unsafe archive member: {name}')
 
 
+def prepare_byedpi(target, runtime):
+    delivery = ROOT / 'vendor/byedpi'
+    source = dict(line.split('=', 1) for line in (delivery / 'byedpi.source.properties').read_text().splitlines() if '=' in line)
+    manifest = dict(line.split('=', 1) for line in (delivery / 'byedpi-linux.properties').read_text().splitlines() if '=' in line)
+    archive = delivery / 'byedpi.SOURCE.zip'
+    if (source.get('version') != '0.17.3' or manifest.get('version') != '0.17.3' or
+            manifest.get('profile') != 'linux-md5sig' or manifest.get('source') != source.get('source') or
+            digest(archive) != source.get('source')):
+        raise ValueError('Pinned ByeDPI source/profile mismatch')
+    binary = target / 'ciadpi'
+    if not binary.is_file() or digest(binary) != manifest.get('ciadpi'):
+        compiler = os.environ.get('BYEDPI_CC') or shutil.which('musl-gcc')
+        if not compiler or not shutil.which('make'):
+            raise ValueError('ByeDPI requires the pinned musl-gcc/make toolchain or its verified prebuilt runtime')
+        with tempfile.TemporaryDirectory(prefix='byedpi-linux-', dir=runtime) as scratch:
+            build = Path(scratch)
+            with zipfile.ZipFile(archive) as packed:
+                for entry in packed.infolist():
+                    checked_member(entry.filename)
+                    if (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                        raise ValueError('Unexpected symlink in ByeDPI source')
+                packed.extractall(build)
+            cppflags = '-D_DEFAULT_SOURCE -D_GNU_SOURCE'
+            for headers in ('/usr/include', '/usr/include/x86_64-linux-gnu'):
+                if Path(headers).is_dir():
+                    cppflags += f' -idirafter {headers}'
+            subprocess.run(['make', f'CC={compiler}', f'CPPFLAGS={cppflags}', 'LDFLAGS=-static'], cwd=build, check=True)
+            if digest(build / 'ciadpi') != manifest.get('ciadpi'):
+                raise ValueError('Reproduced Linux ByeDPI checksum mismatch; use its pinned toolchain')
+            shutil.copy2(build / 'ciadpi', binary)
+    if digest(binary) != manifest.get('ciadpi'):
+        raise ValueError('Linux ByeDPI checksum mismatch')
+    binary.chmod(0o755)
+    with zipfile.ZipFile(archive) as packed:
+        (target / 'LICENSE-ByeDPI').write_bytes(packed.read('LICENSE'))
+    shutil.copy2(delivery / 'byedpi-linux.properties', target / 'byedpi-linux.properties')
+
+
 def main():
     if sys.platform != 'linux' or platform.machine() not in ('x86_64', 'AMD64'):
         raise SystemExit('Build this runtime on Linux x86_64')
@@ -54,6 +92,7 @@ def main():
     runtime = ROOT / 'build/runtime'
     target = runtime / 'linux-x64'
     target.mkdir(parents=True, exist_ok=True)
+    prepare_byedpi(target, runtime)
     binary = target / 'sing-box'
     cronet = target / 'libcronet.so'
     download(f'https://raw.githubusercontent.com/SagerNet/cronet-go/{CRONET_REVISION}/lib/linux_amd64/libcronet.so',

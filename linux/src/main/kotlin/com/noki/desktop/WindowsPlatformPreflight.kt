@@ -98,13 +98,15 @@ internal fun runWindowsPlatformPreflight() {
     println("platform-preflight: process-snapshot=ok")
 
     val startupJob = WindowsShell.createStartupJob()
+    val childOutput = java.nio.file.Files.createTempFile("noki-child-preflight-", ".log")
     var child: com.sun.jna.platform.win32.WinNT.HANDLE? = null
     try {
         child = WindowsShell.launchProcess(java.nio.file.Path.of(System.getenv("SystemRoot"), "System32", "whoami.exe"),
-            emptyList(), job = startupJob)
+            emptyList(), job = startupJob, output = childOutput)
         check(kernel.WaitForSingleObject(child, 5_000) == 0) { "Startup job child did not exit" }
         val exit = IntByReference()
         check(kernel.GetExitCodeProcess(child, exit) && exit.value == 0) { "Startup job child failed" }
+        check(java.nio.file.Files.size(childOutput) > 0) { "Native child output is missing" }
         kernel.CloseHandle(child)
         child = null
         val deadline = System.nanoTime() + 2_000_000_000L
@@ -118,12 +120,15 @@ internal fun runWindowsPlatformPreflight() {
         } finally {
             child?.let { kernel.CloseHandle(it) }
             kernel.CloseHandle(startupJob)
+            java.nio.file.Files.deleteIfExists(childOutput)
         }
     }
     println("platform-preflight: startup-job=ok")
+    SingBoxRuntime.verifyBundledYoutube()
+    println("platform-preflight: byedpi=ok")
 
     IPHlpAPI.INSTANCE.GetIfEntry(IPHlpAPI.MIB_IFROW())
-    windowsNetworkSnapshot()
+    windowsNetworkSnapshot().interfaceIndex?.let(::youtubePhysicalInterface)
     check(windowsSystemDnsServers().all { it.interfaceName.isNotBlank() && it.interfaceIndex > 0 })
     val dnsStarted = System.nanoTime()
     val dnsPolicy = windowsDnsPolicy()

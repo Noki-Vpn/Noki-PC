@@ -214,13 +214,6 @@ internal fun canonicalRuUuid(raw: String): String = runCatching { UUID.fromStrin
     .getOrElse { throw IllegalArgumentException("ru_wireguard_uuid_invalid", it) }
     .also { require(it == raw.lowercase(Locale.ROOT)) { "ru_wireguard_uuid_invalid" } }
 
-internal fun YoutubeAccessRequest.toBackendJson(): JSONObject {
-    require(deviceKey == null || deviceKey.length in 4..255) { "youtube_device_key_invalid" }
-    require(deviceNonce.length in 16..128 && deviceSignature.length in 32..4096) { "youtube_device_proof_invalid" }
-    return JSONObject()
-        .put("request_id", canonicalRuUuid(requestId)).put("device_id", canonicalRuUuid(deviceId))
-        .put("device_key", deviceKey).put("device_nonce", deviceNonce).put("device_signature", deviceSignature)
-}
 
 internal object RuWireGuardSessionJsonParser {
     fun parse(
@@ -556,53 +549,6 @@ internal object BackendTemporaryVpnResponseParser {
     }
 }
 
-internal object BackendYoutubeAccessJsonParser {
-    fun parse(json: JSONObject, now: Instant = Instant.now()): BackendYoutubeAccess {
-        val fields = setOf("version", "mode", "status", "grant_id", "generation", "expires_at", "revoke_token",
-            "public_key_id", "wireguard", "endpoint", "vpn_secret", "vpn_username", "nokinv_device_id", "nokinv_credential_generation")
-        require(json.keys().asSequence().all { it in fields }) { "youtube_access_fields_invalid" }
-        require(json.opt("version") == 1) { "youtube_access_version_invalid" }
-        val mode = json.getString("mode")
-        val status = json.getString("status")
-        require(mode == "selected_transport" && status in setOf("pending", "ready", "blocked")) {
-            "youtube_access_state_invalid"
-        }
-        val grantId = canonicalRuUuid(json.getString("grant_id"))
-        val generation = json.opt("generation") as? Int
-        require(generation != null && generation >= 1) { "youtube_access_generation_invalid" }
-        val expiresAt = runCatching { Instant.parse(json.getString("expires_at")) }
-            .getOrElse { throw IllegalArgumentException("youtube_access_expiry_invalid", it) }
-        require(status == "blocked" || expiresAt.isAfter(now)) { "youtube_access_expired" }
-        val revokeToken = json.getString("revoke_token")
-        require(revokeToken.length in 32..128 && revokeToken.all {
-            (it.isLetterOrDigit() && it.code < 128) || it == '-' || it == '_'
-        }) { "youtube_access_revoke_invalid" }
-        val readySelected = status == "ready"
-        require(listOf("wireguard", "public_key_id", "vpn_username", "nokinv_device_id", "nokinv_credential_generation")
-            .all(json::isNull) &&
-            (!json.isNull("endpoint")) == readySelected && (!json.isNull("vpn_secret")) == readySelected) {
-            "youtube_access_payload_invalid"
-        }
-        val endpoint = if (readySelected) json.getJSONObject("endpoint").let { item ->
-            require(item.opt("entry_port") is Int && item.getInt("entry_port") in 1..65535 &&
-                item.getString("code").isNotBlank() && item.getString("proxy_type").isNotBlank() &&
-                item.getString("transport").isNotBlank() && item.getString("security").isNotBlank() &&
-                (item.isNull("transport_mode") || item.opt("transport_mode") is String) &&
-                (item.isNull("allow_insecure") || item.opt("allow_insecure") is Boolean) &&
-                (item.isNull("canary_only") || item.opt("canary_only") is Boolean) &&
-                item.isNull("connect_ip") && item.isNull("detour")) { "youtube_access_endpoint_invalid" }
-            canonicalRuUuid(item.getString("node_id"))
-            BackendVpnSessionJsonParser.parseEndpointCandidate(item).also {
-                require(EndpointSecurityPolicy.isFixedYoutubeCandidate(it)) { "youtube_access_endpoint_invalid" }
-            }
-        } else null
-        val secret = if (readySelected) json.getString("vpn_secret").also {
-            canonicalRuUuid(it)
-        } else null
-        return BackendYoutubeAccess(mode, status, grantId, generation, expiresAt.toEpochMilli(), revokeToken,
-            endpoint, secret)
-    }
-}
 
 internal object BackendVpnSessionJsonParser {
     fun parse(json: JSONObject): BackendVpnSession {

@@ -44,10 +44,12 @@ internal object LinuxPlatform {
         return checkNotNull(reply)
     }
 
-    fun coreMatches(pid: Int, startedAt: Long): Boolean = runCatching {
+    fun coreMatches(pid: Int, startedAt: Long): Boolean = serviceMatches(pid, startedAt, "noki-vpn")
+
+    fun serviceMatches(pid: Int, startedAt: Long, service: String): Boolean = runCatching {
         val process = ProcessHandle.of(pid.toLong()).orElse(null) ?: return false
         process.isAlive && process.info().startInstant().map { it.toEpochMilli() }.orElse(-1L) == startedAt &&
-            Files.readAllLines(Path.of("/proc/$pid/cgroup")).contains("0::/system.slice/noki-vpn-$uid.service")
+            Files.readAllLines(Path.of("/proc/$pid/cgroup")).contains("0::/system.slice/$service-$uid.service")
     }.getOrDefault(false)
 
     fun privatePath(path: Path, directory: Boolean = false) {

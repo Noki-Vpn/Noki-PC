@@ -19,6 +19,37 @@ import java.util.zip.ZipOutputStream
 class WindowsUpdatesTest {
     private fun native() = VelopackNative(Path.of("build/tools/velopack_libc_win_x64_msvc.dll"))
 
+    @Test fun `uninstall stops its packaged ByeDPI while the main owner is still alive`() {
+        org.junit.Assume.assumeTrue(!DesktopBuild.IS_LINUX)
+        val network = windowsNetworkSnapshot()
+        org.junit.Assume.assumeTrue(network.interfaceIndex?.let(::youtubePhysicalInterface) == true)
+        val adapter = java.net.NetworkInterface.getByIndex(checkNotNull(network.interfaceIndex))
+        val source = adapter.inetAddresses.toList().filterIsInstance<java.net.Inet4Address>()
+            .first { !it.isLoopbackAddress && !it.isLinkLocalAddress }.hostAddress
+        val original = Path.of("build/runtime/windows-x64/ciadpi.exe").toAbsolutePath().normalize()
+        SingBoxRuntime.verifyYoutubeBinary(original)
+        val directory = Files.createTempDirectory("noki-uninstall-byedpi").toAbsolutePath().normalize()
+        val executable = Files.copy(original, directory.resolve("ciadpi.exe"))
+        val kernel = com.sun.jna.platform.win32.Kernel32.INSTANCE
+        val parent = ProcessHandle.current().pid()
+        val process = WindowsShell.launchProcess(executable, SingBoxRuntime.youtubeArguments(SingBoxRuntime.freePort(),
+            network.interfaceIndex.toString(), source, parent.toInt(), linux = false))
+        try {
+            val pid = kernel.GetProcessId(process).toLong()
+            assertFalse(stopWindowsUninstallProcess(pid, setOf(original)))
+            assertEquals(258, kernel.WaitForSingleObject(process, 0))
+            assertTrue(stopWindowsUninstallProcess(pid, setOf(directory.resolve("sing-box.exe"), executable)))
+            assertEquals(0, kernel.WaitForSingleObject(process, 0))
+            assertTrue(ProcessHandle.of(parent).orElseThrow().isAlive)
+        } finally {
+            if (kernel.WaitForSingleObject(process, 0) == 258) {
+                kernel.TerminateProcess(process, 1); kernel.WaitForSingleObject(process, 5_000)
+            }
+            kernel.CloseHandle(process)
+            Files.deleteIfExists(executable); Files.deleteIfExists(directory)
+        }
+    }
+
     @Test fun `uninstall skips the system idle process while enumerating Windows processes`() {
         assertFalse(stopWindowsUninstallProcess(0, emptySet()))
         ProcessHandle.allProcesses().use { processes ->

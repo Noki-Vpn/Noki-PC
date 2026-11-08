@@ -38,6 +38,7 @@ internal class VpnWatchdogController(
     private var failureCount = 0
     private var lastHealthyMillis: Long? = null
     private var lastXrayEvidenceMillis: Long? = null
+    private var lastTrafficEvidenceMillis: Long? = null
 
     @Synchronized
     fun start(
@@ -65,6 +66,7 @@ internal class VpnWatchdogController(
         failureCount = 0
         lastHealthyMillis = null
         lastXrayEvidenceMillis = null
+        lastTrafficEvidenceMillis = null
     }
 
     @Synchronized
@@ -93,6 +95,7 @@ internal class VpnWatchdogController(
         failureCount = 0
         lastHealthyMillis = null
         lastXrayEvidenceMillis = null
+        lastTrafficEvidenceMillis = null
         scheduleNext(updated)
     }
 
@@ -100,6 +103,7 @@ internal class VpnWatchdogController(
     fun completeProbe(
         owner: ConnectedWatchdogPolicy.Owner,
         latencyMs: Long?,
+        runtimeAlive: Boolean = true,
     ): WatchdogProbeOutcome {
         if (activeOwner != owner || activeProbe == null) {
             return WatchdogProbeOutcome.Ignored
@@ -109,6 +113,12 @@ internal class VpnWatchdogController(
         if (healthy) {
             failureCount = 0
             recordEvidence(WatchdogEvidence.XRAY_PROBE)
+            return WatchdogProbeOutcome.Healthy
+        }
+        if (runtimeAlive && lastTrafficEvidenceMillis?.let {
+                nowMillis() - it in 0 until ConnectedWatchdogPolicy.PROBE_AFTER_IDLE_MS
+            } == true) {
+            failureCount = 0
             return WatchdogProbeOutcome.Healthy
         }
         if (!ConnectedWatchdogPolicy.automaticRecoveryAllowed(checkNotNull(settings).userProfile.serverSelectionMode))
@@ -148,11 +158,12 @@ internal class VpnWatchdogController(
     }
 
     @Synchronized
-    fun recordEvidence(evidence: WatchdogEvidence) {
-        if (evidence != WatchdogEvidence.XRAY_PROBE || activeOwner == null) return
+    fun recordEvidence(evidence: WatchdogEvidence, owner: ConnectedWatchdogPolicy.Owner? = activeOwner) {
+        if (owner == null || activeOwner != owner) return
         val now = nowMillis()
         lastHealthyMillis = now
-        lastXrayEvidenceMillis = now
+        if (evidence == WatchdogEvidence.XRAY_PROBE) lastXrayEvidenceMillis = now
+        else lastTrafficEvidenceMillis = now
         failureCount = 0
     }
 

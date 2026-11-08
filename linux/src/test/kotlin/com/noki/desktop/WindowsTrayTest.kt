@@ -120,6 +120,60 @@ class WindowsTrayTest {
         failure?.let { throw it }
     }
 
+    @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+    @Test fun `taskbar and thumbnail use the same supplied artwork on both themes`() {
+        var failure: Throwable? = null
+        dev.nucleusframework.window.tao.TaoApplication.run { app ->
+            val window = app.openWindow(title = "Noki shell icon probe", visible = false)
+            val light = androidx.compose.runtime.mutableStateOf(false)
+            var scene: androidx.compose.ui.ImageComposeScene? = null
+            CoroutineScope(Dispatchers.Main).launch {
+                try {
+                    withTimeout(5_000) { while (window.nativeHandle == 0L) delay(10) }
+                    window.setIcon(32, 32, ByteArray(32 * 32 * 4) { -1 })
+                    delay(100)
+                    val iconScene = androidx.compose.ui.ImageComposeScene(1, 1) { WindowsTaskbarIcon(window, light.value) }
+                    scene = iconScene
+                    val hwnd = HWND(com.sun.jna.Pointer(window.nativeHandle))
+                    for (theme in listOf(false, true)) {
+                        light.value = theme
+                        repeat(4) { iconScene.render().close() }
+                        delay(100)
+                        val small = User32.INSTANCE.SendMessage(hwnd, 0x7F, WPARAM(0), LPARAM(0)).toLong()
+                        val big = User32.INSTANCE.SendMessage(hwnd, 0x7F, WPARAM(1), LPARAM(0)).toLong()
+                        assertNotEquals(0L, small); assertNotEquals(0L, big)
+                        for (point in listOf(.125 to .5, .5 to .5, .5 to .125)) {
+                            assertEquals("The preview and taskbar must show the same artwork", iconColor(big, point), iconColor(small, point))
+                        }
+                    }
+                } catch (error: Throwable) { failure = error }
+                finally { scene?.close(); window.requestClose(); app.exit() }
+            }
+        }
+        failure?.let { throw it }
+    }
+
+    private fun iconColor(handle: Long, point: Pair<Double, Double>): Int {
+        val gdi = com.sun.jna.platform.win32.GDI32.INSTANCE
+        val info = com.sun.jna.platform.win32.WinGDI.ICONINFO()
+        assertTrue(User32.INSTANCE.GetIconInfo(com.sun.jna.platform.win32.WinDef.HICON(com.sun.jna.Pointer(handle)), info))
+        val dc = gdi.CreateCompatibleDC(null)
+        assertNotNull(dc)
+        val previous = gdi.SelectObject(dc, info.hbmColor)
+        try {
+            val bitmap = com.sun.jna.platform.win32.WinGDI.BITMAP()
+            assertNotEquals(0, gdi.GetObject(info.hbmColor, bitmap.size(), bitmap.pointer))
+            bitmap.read()
+            val color = com.sun.jna.Function.getFunction("gdi32", "GetPixel", com.sun.jna.Function.ALT_CONVENTION)
+                .invokeInt(arrayOf(dc, (bitmap.bmWidth.toInt() * point.first).toInt(), (bitmap.bmHeight.toInt() * point.second).toInt()))
+            assertNotEquals(-1, color)
+            return color
+        } finally {
+            gdi.SelectObject(dc, previous); gdi.DeleteDC(dc)
+            gdi.DeleteObject(info.hbmColor); gdi.DeleteObject(info.hbmMask)
+        }
+    }
+
     @Test fun `explicit taskbar variants retain their silhouette and contrast`() {
         val dark = checkNotNull(javaClass.getResourceAsStream("/noki/desktop/taskbar.png")).use(javax.imageio.ImageIO::read)
         val light = checkNotNull(javaClass.getResourceAsStream("/noki/desktop/taskbar-light.png")).use(javax.imageio.ImageIO::read)

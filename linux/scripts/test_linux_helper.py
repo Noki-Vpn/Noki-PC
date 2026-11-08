@@ -14,30 +14,12 @@ spec.loader.exec_module(helper)
 
 
 class LinuxHelperTest(unittest.TestCase):
-    def test_byedpi_has_one_tcp_ipv4_profile_and_mandatory_underlay_binding(self):
-        config = dict(port=1080, interface='eth0', source='192.0.2.2', parent=42)
-        arguments = helper.byedpi_arguments(config, 42)
-        for name, expected in [('--ip', '127.0.0.1'), ('--port', '1080'), ('--max-conn', '4096'),
-                               ('--conn-ip', '0.0.0.0'), ('--fake', '-1'), ('--proto', 'tls,http'),
-                               ('--noki-interface', 'eth0'), ('--noki-source', '192.0.2.2'),
-                               ('--noki-parent', '42'), ('--noki-mark', '20047')]:
-            self.assertEqual(expected, arguments[arguments.index(name) + 1])
-        self.assertTrue({'--no-domain', '--no-udp', '--md5sig'}.issubset(arguments))
-        self.assertNotIn('--disorder', arguments)
-        for changes in (dict(port=0), dict(port=True), dict(interface='Noki'), dict(interface='lo'),
-                        dict(interface='eth0;echo x'), dict(source='0.0.0.0'), dict(source='::1'),
-                        dict(source='127.0.0.1'), dict(parent=43), dict(extra='unsupported')):
-            with self.assertRaises(ValueError):
-                helper.byedpi_arguments(dict(config, **changes), 42)
-
-    def test_byedpi_guard_permits_only_its_cgroup_tcp_mark_and_selected_physical_interface(self):
-        rules = helper.nft_rules(1000, youtube_interface='eth0')
-        group = 'socket cgroupv2 level 2 "system.slice/noki-byedpi-1000.service"'
-        self.assertIn(group + ' oifname "eth0" meta l4proto tcp meta mark 20047 accept', rules)
-        self.assertLess(rules.index(group + ' reject'), rules.index('\n    meta mark 20047 accept\n'))
-        for interface in ('lo', 'Noki', 'eth0" accept', '../eth0'):
-            with self.assertRaises(ValueError):
-                helper.nft_rules(1000, youtube_interface=interface)
+    def test_youtube_uses_the_existing_core_without_a_local_helper(self):
+        self.assertFalse(hasattr(helper, "byedpi_start"))
+        self.assertFalse(hasattr(helper, "byedpi_arguments"))
+        rules = helper.nft_rules(1000)
+        self.assertNotIn("noki-byedpi", rules)
+        self.assertIn(f"meta mark {helper.MARK} accept", rules)
 
     def test_core_identity_is_verified_by_the_privileged_helper(self):
         import tempfile

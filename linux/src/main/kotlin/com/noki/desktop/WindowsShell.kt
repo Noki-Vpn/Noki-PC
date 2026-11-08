@@ -92,31 +92,18 @@ internal object WindowsShell {
         return launchProcess(executable, prefix + arguments, administrator, job)
     }
 
-    fun launchProcess(executable: Path, arguments: List<String>, administrator: Boolean = false, job: WinNT.HANDLE? = null,
-                      output: Path? = null): WinNT.HANDLE {
+    fun launchProcess(executable: Path, arguments: List<String>, administrator: Boolean = false, job: WinNT.HANDLE? = null): WinNT.HANDLE {
         require(!administrator || job == null) { "UAC-запуск не поддерживает startup job" }
-        require(!administrator || output == null)
         if (!administrator) {
             // CreateProcess keeps the helper's child in the same job; a shell broker need not.
             val kernel = Kernel32.INSTANCE
             val started = WinBase.PROCESS_INFORMATION()
             val startup = WinBase.STARTUPINFO().apply { dwFlags = 1; wShowWindow = com.sun.jna.platform.win32.WinDef.WORD(0) }
-            val inherited = output?.let { path ->
-                val attributes = WinBase.SECURITY_ATTRIBUTES().apply { bInheritHandle = true }
-                kernel.CreateFile(path.toString(), 0x40000000, 1, attributes, 2, 0x80, null).also { handle ->
-                    check(handle != WinBase.INVALID_HANDLE_VALUE) { "Windows не открыла журнал процесса" }
-                    startup.dwFlags = startup.dwFlags or 0x100
-                    startup.hStdOutput = handle; startup.hStdError = handle
-                    startup.hStdInput = kernel.GetStdHandle(-10)
-                }
-            }
             val command = (listOf(executable.toString()) + arguments).joinToString(" ", transform = ::quoteArgument) + '\u0000'
             val flags = 0x08000000 or if (job == null) 0 else 0x00000004 // CREATE_NO_WINDOW | CREATE_SUSPENDED.
-            try {
-                if (!kernel.CreateProcessW(executable.toString(), command.toCharArray(), null, null, output != null,
-                        DWORD(flags.toLong()), null, executable.parent.toString(), startup, started))
-                    throw Win32Exception(kernel.GetLastError())
-            } finally { inherited?.let(kernel::CloseHandle) }
+            if (!kernel.CreateProcessW(executable.toString(), command.toCharArray(), null, null, false,
+                    DWORD(flags.toLong()), null, executable.parent.toString(), startup, started))
+                throw Win32Exception(kernel.GetLastError())
             try {
                 if (job != null) {
                     if (Function.getFunction("kernel32", "AssignProcessToJobObject", Function.ALT_CONVENTION)

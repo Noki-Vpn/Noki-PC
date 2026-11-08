@@ -181,10 +181,10 @@ internal fun prepareWindowsUninstall() {
     acquireDesktopOwnership().use {
         // Stop watchdogs and acquire the client lock before stopping their core.
         ProcessHandle.allProcesses().use { processes -> processes.forEach {
-            stopWindowsUninstallProcess(it.pid(), setOf(executable.resolveSibling("sing-box.exe"), executable.resolveSibling("ciadpi.exe")))
+            stopWindowsUninstallProcess(it.pid(), setOf(executable.resolveSibling("sing-box.exe")))
         } }
         WindowsNetworkGuard().use { it.disable() }
-        for (name in listOf("runtime.dpapi", "byedpi.dpapi", "guard.dpapi", "vpn.json"))
+        for (name in listOf("runtime.dpapi", "guard.dpapi", "vpn.json"))
             Files.deleteIfExists(WindowsVault.defaultDirectory().resolve(name))
         WindowsShell.removeLaunchAtStartup()
     }

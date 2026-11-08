@@ -7,15 +7,5 @@
     "upstream_repository": "https://github.com/shtorm-7/sing-box-extended",
     "upstream_commit": "55faa763f986f4ca8a492d9b2719bc6330d2bef5",
     "license": "GPL-3.0-or-later with the additional name/association condition in vendor/sing-box/LICENSE; Xray-derived portions are MPL-2.0. Other dependency notices are retained in vendor/sing-box/NOTICE."
-  },
-  "youtube_runtime": {
-    "version": "0.17.3",
-    "upstream_repository": "https://github.com/hufrea/byedpi",
-    "upstream_tag": "v0.17.3",
-    "archive": "vendor/byedpi/byedpi.SOURCE.zip",
-    "pins": "vendor/byedpi/byedpi.source.properties and byedpi-windows.properties/byedpi-linux.properties",
-    "profiles": "Windows: --disorder 1 --fake -1. Linux: --fake -1 --md5sig, verified at process startup. Unsupported socket options fail closed.",
-    "build": "scripts/prepare-runtime.ps1 uses MinGW-w64/make; scripts/prepare-runtime-linux.py uses musl-gcc/make and a static link. Each checks the delivered source and exact platform binary hashes.",
-    "license": "MIT; LICENSE in the source archive, LICENSE-ByeDPI in the runtime and licenses/ByeDPI/LICENSE in the Windows package."
   }
 }

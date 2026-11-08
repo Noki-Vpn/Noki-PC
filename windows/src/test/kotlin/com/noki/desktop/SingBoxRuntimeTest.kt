@@ -26,117 +26,6 @@ import java.util.concurrent.TimeUnit
 import java.io.IOException
 
 class SingBoxRuntimeTest {
-    @Test fun `restored child is replaced at the configured port without restarting its main owner`() = kotlinx.coroutines.runBlocking {
-        assumeWindows()
-        val network = windowsNetworkSnapshot()
-        assumeTrue(network.available && network.interfaceIndex?.let(::youtubePhysicalInterface) == true)
-        val sandbox = Files.createTempDirectory("noki-byedpi-restore").toAbsolutePath().normalize()
-        val vault = WindowsVault(sandbox)
-        val parent = SingBoxRuntime.Running(ProcessHandle.current().pid().toInt(),
-            ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli(), 1, "fixture", 2, "unchanged-main")
-        fun runtime() = object : SingBoxRuntime(vault) {
-            override fun restored(): Running = parent
-            override fun guardArmed() = false
-        }
-        val first = runtime()
-        val restored = runtime()
-        try {
-            val originalPort = first.startYoutube(network)
-            assertTrue(first.youtubeAlive())
-            val configuredPort = restored.youtubePort()
-            assertNotEquals(originalPort, configuredPort)
-            assertEquals(configuredPort, restored.startYoutube(network))
-            assertTrue(restored.youtubeAlive())
-            assertFalse(first.youtubeAlive())
-            assertEquals(parent, restored.restored())
-            assertEquals(configuredPort, restored.startYoutube(network))
-            assertEquals(configuredPort, restored.youtubePort())
-        } finally {
-            try { restored.stopYoutube() } finally { first.stopYoutube() }
-            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
-                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
-            } }
-        }
-    }
-
-    @Test fun `unreadable child identity cannot break the main runtime and recovers only after child absence`() = kotlinx.coroutines.runBlocking {
-        assumeWindows()
-        val sandbox = Files.createTempDirectory("noki-byedpi-record").toAbsolutePath().normalize()
-        try {
-            val vault = WindowsVault(sandbox)
-            vault.saveTokens(com.noki.vpn.data.BackendAuthTokens("fixture-access", "fixture-refresh"))
-            vault.saveSettings(vault.loadSettings())
-            SingBoxRuntime.persistIdentity(vault, SingBoxRuntime.Running(12, 34, 12345, "fixture", 12346, "main"))
-            val preserved = listOf("session.dpapi", "settings.dpapi", "runtime.dpapi").associateWith { Files.readAllBytes(sandbox.resolve(it)) }
-            for (kind in listOf("ciphertext", "json", "empty")) {
-                val path = sandbox.resolve("byedpi.dpapi")
-                when (kind) {
-                    "ciphertext" -> Files.write(path, ByteArray(64) { 42 })
-                    "empty" -> Files.write(path, byteArrayOf())
-                    else -> vault.writeEncrypted("byedpi.dpapi", "{")
-                }
-                val original = Files.readAllBytes(path)
-                var checks = 0
-                val runtime = SingBoxRuntime(vault, canRecoverRuntime = { error("Main identity is valid") },
-                    canRecoverYoutube = { checks++; false })
-                assertTrue(runtime.youtubePort() in 1..65535)
-                assertEquals(0, checks)
-                assertTrue(runCatching { runtime.youtubeAlive() }.isFailure)
-                assertEquals(1, checks)
-                assertArrayEquals(original, Files.readAllBytes(path))
-                val recovered = SingBoxRuntime(vault, canRecoverYoutube = { true })
-                assertFalse(recovered.youtubeAlive())
-                assertFalse(Files.exists(path))
-                assertEquals(setOf("byedpi.dpapi"), vault.takeRecoveredFiles().keys)
-                val backups = Files.newDirectoryStream(sandbox, "byedpi.dpapi.unreadable-*.bak").use { it.toList() }
-                assertTrue(backups.any { Files.readAllBytes(it).contentEquals(original) })
-                for ((name, bytes) in preserved) assertArrayEquals(name, bytes, Files.readAllBytes(sandbox.resolve(name)))
-            }
-        } finally {
-            Files.walk(sandbox).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach {
-                check(it.toAbsolutePath().normalize().startsWith(sandbox)); Files.delete(it)
-            } }
-        }
-    }
-
-    @Test fun `local ByeDPI uses explicit platform profiles and physical socket constraints`() {
-        for (linux in listOf(false, true)) {
-            val arguments = SingBoxRuntime.youtubeArguments(1080, if (linux) "eth0" else "12", "192.0.2.2", 1234, linux)
-            fun value(name: String) = arguments[arguments.indexOf(name) + 1]
-            assertEquals("127.0.0.1", value("--ip"))
-            assertEquals("4096", value("--max-conn"))
-            assertEquals("0.0.0.0", value("--conn-ip"))
-            assertEquals("192.0.2.2", value("--noki-source"))
-            assertEquals("1234", value("--noki-parent"))
-            assertEquals("tls,http", value("--proto"))
-            assertEquals("-1", value("--fake"))
-            assertTrue(arguments.containsAll(listOf("--no-domain", "--no-udp")))
-            assertEquals(linux, "--md5sig" in arguments)
-            assertEquals(!linux, "--disorder" in arguments)
-            assertEquals(linux, "--noki-mark" in arguments)
-            if (linux) assertEquals("20047", value("--noki-mark")) else assertEquals("1", value("--disorder"))
-            val profile = if (linux) "linux-md5sig" else "windows-disorder-fake"
-            assertTrue(SingBoxRuntime.youtubeReady("NOKI_READY port=1080 profile=$profile\n", 1080, linux))
-            assertFalse(SingBoxRuntime.youtubeReady("NOKI_READY port=1081 profile=$profile", 1080, linux))
-            assertFalse(SingBoxRuntime.youtubeReady("NOKI_READY port=1080 profile=unsupported", 1080, linux))
-        }
-        for (source in listOf("0.0.0.0", "::1")) assertThrows(IllegalArgumentException::class.java) {
-            SingBoxRuntime.youtubeArguments(1080, "12", source, 1234, false)
-        }
-    }
-
-    @Test fun `hidden Windows child redirects its native readiness output`() {
-        assumeWindows()
-        val output = Files.createTempFile("noki-child-output", ".log")
-        try {
-            val process = WindowsShell.launchProcess(Path.of(System.getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-                listOf("-NoProfile", "-Command", "[Console]::Write('NOKI_READY')"), output = output)
-            try { assertEquals(0, Kernel32.INSTANCE.WaitForSingleObject(process, 10_000)) }
-            finally { Kernel32.INSTANCE.CloseHandle(process) }
-            assertEquals("NOKI_READY", Files.readString(output).trim())
-        } finally { Files.deleteIfExists(output) }
-    }
-
     @Test fun `unreadable runtime record recovers only after confirmed core absence`() {
         assumeWindows()
         val sandbox = Files.createTempDirectory("noki-runtime-record").toAbsolutePath().normalize()
@@ -912,9 +801,39 @@ class SingBoxRuntimeTest {
 
     @org.junit.Test fun `metrics parser ignores nested connection counters without building their objects`() {
         val raw = """{"connections":[{"uploadTotal":999999,"metadata":{"escaped":"a\\\"b,}[]"}}],"uploadTotal":123,"downloadTotal":456,"memory":10}"""
-        org.junit.Assert.assertEquals(123L to 456L, SingBoxRuntime.readTotals(raw.reader()))
+        org.junit.Assert.assertEquals(123L to 456L, SingBoxRuntime.readTotals(raw.reader()).let { it.uploadTotal to it.downloadTotal })
         org.junit.Assert.assertTrue(runCatching { SingBoxRuntime.readTotals("{\"uploadTotal\":-1,\"downloadTotal\":0}".reader()) }.isFailure)
         org.junit.Assert.assertTrue(runCatching { SingBoxRuntime.readTotals("{\"connections\":[{".reader()) }.isFailure)
+    }
+
+    @Test fun `primary receive evidence excludes direct supplementary DNS and probe traffic`() {
+        fun connection(id: String, inbound: String, chains: List<String>, rx: Long) = JSONObject()
+            .put("id", id).put("download", rx).put("upload", 99999)
+            .put("chains", JSONArray(chains)).put("metadata", JSONObject().put("type", inbound)
+                .put("host", "fixture.invalid").put("unknown", JSONObject().put("downloadTotal", 99999)))
+        val connections = JSONArray().put(connection("primary", "tun/tun", listOf("proxy"), 12))
+            .put(connection("selected", "tun/tun", listOf("proxy", "selector"), 21))
+            .put(connection("direct", "tun/tun", listOf("direct"), 300))
+            .put(connection("youtube", "tun/tun", listOf("youtube-ru"), 400))
+            .put(connection("probe", "mixed/probe", listOf("proxy"), 500))
+            .put(connection("dns", "", listOf("proxy"), 600))
+            .put(connection("outgoing", "tun/tun", listOf("proxy"), 0))
+        val parsed = SingBoxRuntime.readTotals(JSONObject().put("uploadTotal", 99999).put("downloadTotal", 99999)
+            .put("connections", connections).toString().reader())
+        assertEquals(mapOf("primary" to 12L, "selected" to 21L, "outgoing" to 0L), parsed.primaryDownloads)
+        assertFalse("A first sample is only a baseline", parsed.primaryReceivedProgress)
+        val previous = parsed.copy(primaryDownloads = mapOf("primary" to 12L, "selected" to 21L))
+        assertFalse(parsed.receivedPrimarySince(previous))
+        assertTrue(parsed.copy(primaryDownloads = mapOf("primary" to 13L)).receivedPrimarySince(previous))
+        assertTrue(parsed.copy(primaryDownloads = mapOf("new" to 1L)).receivedPrimarySince(previous))
+        assertFalse(parsed.copy(primaryDownloads = mapOf("primary" to 11L)).receivedPrimarySince(previous))
+        assertFalse(parsed.copy(primaryDownloads = emptyMap(), uploadTotal = 999999).receivedPrimarySince(previous))
+        val oversized = "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[" + List(4097) { "{}" }.joinToString(",") + "]}"
+        val overflow = SingBoxRuntime.readTotals(oversized.reader())
+        assertEquals(0L, overflow.downloadTotal)
+        assertNull(overflow.primaryDownloads)
+        assertFalse(overflow.receivedPrimarySince(parsed))
+        assertFalse("A sample after overflow needs a new baseline", parsed.receivedPrimarySince(overflow))
     }
 
     @org.junit.Test fun `probe uses the next independent target when the first fails`() = kotlinx.coroutines.runBlocking {

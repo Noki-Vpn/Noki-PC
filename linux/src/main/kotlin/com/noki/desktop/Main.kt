@@ -163,8 +163,7 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
     LaunchedEffect(tray) { if (DesktopBuild.IS_LINUX && tray is LinuxDesktopTray && !tray.available) visible = true }
     val lightTaskbar = tray?.lightTheme?.collectAsState()?.value ?: false
     if (tray != null) {
-        DisposableEffect(tray) { onDispose { tray.close() } }
-        SideEffect { tray.update(state.running && state.verified, state.language) }
+        DesktopTrayEffect(tray, state)
     }
     LaunchedEffect(app) {
         app?.let { controller ->
@@ -344,10 +343,15 @@ private fun runDesktop(initiallyVisible: Boolean) = nucleusApplication(backend =
     }
 }
 
-@Composable private fun WindowsTaskbarIcon(window: dev.nucleusframework.window.tao.TaoWindow, light: Boolean) {
+@Composable internal fun DesktopTrayEffect(tray: DesktopTrayHandle, state: DesktopState) {
+    DisposableEffect(tray) { onDispose { tray.close() } }
+    SideEffect { tray.update(state.hasEstablishedTunnel, state.language) }
+}
+
+@Composable internal fun WindowsTaskbarIcon(window: dev.nucleusframework.window.tao.TaoWindow, light: Boolean) {
     if (DesktopBuild.IS_LINUX) return
     LaunchedEffect(window, light) {
-        windowsTaskbarIcon({ window.nativeHandle }, light)
+        windowsTaskbarIcon(window, light)
     }
 }
 

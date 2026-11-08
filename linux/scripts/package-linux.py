@@ -60,10 +60,9 @@ def stage_payload(destination, image, runtime):
             raise ValueError('App image contains an external symlink')
     # jpackage runtime may contain internal relative links; preserve them without dereferencing.
     shutil.copytree(image, destination / 'usr/lib/noki/app', symlinks=True)
-    for name in ('sing-box', 'libcronet.so', 'ciadpi'):
+    for name in ('sing-box', 'libcronet.so'):
         copy_file(runtime / name, destination / 'usr/lib/noki' / name, 0o755)
-    copy_file(runtime / 'byedpi-linux.properties', destination / 'usr/lib/noki/byedpi-linux.properties')
-    for name in ('LICENSE-sing-box', 'COPYING-GPLv3', 'NOTICE-native', 'LICENSE-ByeDPI'):
+    for name in ('LICENSE-sing-box', 'COPYING-GPLv3', 'NOTICE-native'):
         copy_file(runtime / name, destination / 'usr/share/licenses/noki' / name)
     for name in ('LICENSE', 'COPYING'):
         copy_file(ROOT / name, destination / 'usr/share/licenses/noki' / name)

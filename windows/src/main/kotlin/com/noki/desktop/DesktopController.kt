@@ -319,8 +319,11 @@ class DesktopController internal constructor(
     private var connectionJob: Job? = null
     private var youtubeJob: Job? = null
     private val youtubeEpoch = AtomicLong()
+    private val youtubeRevokes = Mutex()
     private val ruRevokes = Mutex()
-    @Volatile private var appliedYoutubeConfig: JSONObject? = null
+    @Volatile private var youtubeGrantId: String? = null
+    @Volatile private var youtubeConfirmed: BackendYoutubeAccess? = null
+    private var appliedYoutubeConfig: String? = null
     private var transientRecoveryAttempt = 0
     @Volatile private var lastNetwork = runCatching { networkSnapshot() }.getOrNull()
     private val networkChangeLock = Any()
@@ -410,7 +413,7 @@ class DesktopController internal constructor(
             if (tokens != null) syncAccount()
             if (runtime.restored() != null && tokens != null) checkRuAuthorization()
             if (runtime.restored() != null && activeSettings().advancedSettings.youtubeAdBlockEnabled) {
-                replaceYoutubeConnection()
+                replaceYoutubeConnection(null)
                 startYoutubeAccess()
             }
             val settings = state.value.settings
@@ -453,7 +456,8 @@ class DesktopController internal constructor(
                             reportMessage("VPN-ядро завершилось. Проверяем и восстанавливаем соединение")
                             watchdog.forceProbe()
                         }
-                        if (!state.value.loading) active?.let { runCatching { recordMetrics(it, runtime.metrics(it)) } }
+                        val metricsOwner = watchdog.currentOwner()
+                        if (!state.value.loading) active?.let { runCatching { recordMetrics(it, runtime.metrics(it), metricsOwner) } }
                     }
                     if (System.currentTimeMillis() - dnsCheckedAt >= 30_000) {
                         dnsCheckedAt = System.currentTimeMillis()
@@ -465,6 +469,7 @@ class DesktopController internal constructor(
                             if (dnsChanged && operation.tryLock()) try {
                                 if (activeConnection === connection && !state.value.loading && !state.value.networkRebinding) {
                                     watchdog.currentOwner()?.let(watchdog::discardProbe)
+                                    recordLog("recovery_queued_system_dns_changed")
                                     recoveryJob?.cancel(); queueRecovery(0)
                                 }
                             } finally { operation.unlock() }
@@ -485,6 +490,7 @@ class DesktopController internal constructor(
                             lastRuStatusCheck = System.currentTimeMillis()
                             if (runtime.restored() == null) revokeRu()
                             else if (tokens != null) checkRuAuthorization()
+                            revokeYoutubePending()
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (error: Exception) {
                             reportMessage("Не удалось проверить или отозвать RU-сессию")
@@ -663,7 +669,7 @@ class DesktopController internal constructor(
             activeConnection?.put("settings", vault.encodeSettings(active))
             mutable.update { it.copy(connectionSettings = active) }
             persistConnection()
-            replaceYoutubeConnection()
+            replaceYoutubeConnection(null)
             if (active.advancedSettings.youtubeAdBlockEnabled) startYoutubeAccess()
         }
         if (normalized.advancedSettings.ruRelayEnabled != previousRuRelay) refresh()
@@ -1520,33 +1526,25 @@ class DesktopController internal constructor(
         startYoutubeAccess()
     }
 
+    private fun configHash(config: JSONObject): String = Base64.getEncoder().encodeToString(
+        java.security.MessageDigest.getInstance("SHA-256").digest(config.toString().toByteArray(Charsets.UTF_8)))
+
     private suspend fun startRuntime(base: JSONObject, settings: StoredSettings, label: String, serverId: String?, protectUntilVerified: Boolean = false): SingBoxRuntime.Running {
-        val config = SingBoxConfig.withYoutube(base, settings, youtubeConnection(settings))
+        // Keep the YouTube classifier identical across initial start, lease renewal and blocking.
+        val config = SingBoxConfig.withYoutube(base, settings, null)
         return runtime.start(config, label, settings.advancedSettings.killSwitchEnabled || protectUntilVerified, serverId).also {
-            appliedYoutubeConfig = config
+            appliedYoutubeConfig = configHash(config)
         }
     }
 
-    private fun youtubeConnection(settings: StoredSettings): YoutubeConnectionConfig? {
-        if (!settings.advancedSettings.youtubeAdBlockEnabled || SettingsPreparedStatePolicy.isFreePlan(state.value.androidState())) return null
-        return try { YoutubeConnectionConfig(runtime.youtubePort()) }
-        catch (cancelled: CancellationException) { throw cancelled }
-        catch (error: Exception) {
-            recordDiagnosticFailure("youtube_local_endpoint_failed", error, "vpn")
-            mutable.update { it.copy(youtubeMessage = tr(it,
-                "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
-            null
-        }
-    }
-
-    // Only an explicit toggle replaces the core. Local process retries keep this endpoint and the main VPN.
-    private suspend fun replaceYoutubeConnection() {
+    // The connection journal owns the main route; supplementary access never replaces its credentials.
+    private suspend fun replaceYoutubeConnection(connection: YoutubeConnectionConfig?) {
         val journal = checkNotNull(activeConnection) { "youtube_main_connection_missing" }
         val old = runtime.restored() ?: return
         val settings = activeSettings()
         val base = journal.getJSONObject("config")
-        val config = SingBoxConfig.withYoutube(base, settings, youtubeConnection(settings))
-        if (appliedYoutubeConfig?.similar(config) == true) return
+        val config = SingBoxConfig.withYoutube(base, settings, connection)
+        if (configHash(config) == appliedYoutubeConfig) return
         stopWatchdog()
         val verified = state.value.verified
         val wasLoading = state.value.loading
@@ -1559,7 +1557,7 @@ class DesktopController internal constructor(
             var supplementaryFailure: Exception? = null
             val active = try {
                 runtime.start(config, old.label, settings.advancedSettings.killSwitchEnabled, old.serverId).also {
-                    appliedYoutubeConfig = config
+                    appliedYoutubeConfig = configHash(config)
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
@@ -1568,7 +1566,7 @@ class DesktopController internal constructor(
                 runCatching { runtime.stop(restoreInternet = false) }
                 val blocked = SingBoxConfig.withYoutube(base, settings, null)
                 runtime.start(blocked, old.label, settings.advancedSettings.killSwitchEnabled, old.serverId).also {
-                    appliedYoutubeConfig = blocked
+                    appliedYoutubeConfig = configHash(blocked)
                     mutable.update { state -> state.copy(youtubeMessage = tr(state,
                         "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
                 }
@@ -1593,8 +1591,9 @@ class DesktopController internal constructor(
         val job = youtubeJob
         job?.cancel()
         if (waitForCleanup) job?.join()
+        // Keep a retiring worker as the predecessor of the next admission.
         if (youtubeJob === job && (waitForCleanup || job?.isCompleted != false)) youtubeJob = null
-        runCatching { runtime.stopYoutube() }.onFailure { recordDiagnosticFailure("youtube_local_stop_failed", it, "vpn") }
+        youtubeConfirmed = null
         mutable.update { it.copy(youtubeMessage = null) }
     }
 
@@ -1602,54 +1601,164 @@ class DesktopController internal constructor(
         val previous = youtubeJob
         previous?.cancel()
         val epoch = youtubeEpoch.incrementAndGet()
+        youtubeConfirmed = null
         if (!activeSettings().advancedSettings.youtubeAdBlockEnabled || !state.value.running) { youtubeJob = null; return }
         val owner = attempt() ?: return
+        val device = registered ?: return
         youtubeJob = scope.launch {
             previous?.join()
             if (!youtubeCurrent(epoch, owner)) return@launch
-            runYoutubeAccess(epoch, owner)
+            runYoutubeAccess(epoch, owner, device)
         }
     }
 
-    private suspend fun runYoutubeAccess(epoch: Long, owner: AuthSessionAttempt) {
-        fun unavailable() {
-            if (youtubeCurrent(epoch, owner)) mutable.update { it.copy(youtubeMessage = tr(it,
-                "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
+    private suspend fun runYoutubeAccess(epoch: Long, owner: AuthSessionAttempt, device: BackendDevice) = coroutineScope {
+        var keyBytes: ByteArray? = null
+        var keyId: String? = null
+        var grant: BackendYoutubeAccess? = null
+        var leaseTimer: Job? = null
+        var createAttempted = false
+        val requestId = java.util.UUID.randomUUID().toString()
+        var retryMillis = 2_000L
+        suspend fun receive(previous: BackendYoutubeAccess?, renewal: Boolean = false,
+                            call: suspend () -> BackendYoutubeAccess): BackendYoutubeAccess = withContext(NonCancellable) {
+            val response = call()
+            try { stageYoutubeRevoke(response) } catch (error: Exception) {
+                runCatching { api.revokeYoutubeAccess(response.grantId, response.revokeToken) }
+                throw error
+            }
+            grant = response
+            require(response.status != "ready" || response.publicKeyId == keyId) { "youtube_access_key_mismatch" }
+            if (previous != null) {
+                require(response.grantId == previous.grantId && response.mode == previous.mode && response.revokeToken == previous.revokeToken) {
+                    "youtube_access_identity_mismatch"
+                }
+                require(if (renewal) response.generation == previous.generation + 1 else
+                    response.generation == previous.generation || response.status == "blocked" && response.generation > previous.generation) {
+                    "youtube_access_generation_mismatch"
+                }
+            }
+            response
+        }
+        suspend fun create(): BackendYoutubeAccess = receive(null) {
+            withDeviceProof(device.id) { token, nonce, signature ->
+                createAttempted = true
+                api.createYoutubeAccess(token, YoutubeAccessRequest(device.id, device.deviceKey, nonce, signature,
+                    requestId, checkNotNull(keyId)))
+            }
+        }
+        suspend fun apply(connection: YoutubeConnectionConfig?, message: String?, confirmed: BackendYoutubeAccess? = null) = operation.withLock {
+            if (!youtubeCurrent(epoch, owner)) return@withLock
+            val valid = confirmed == null || confirmed.expiresAtEpochMillis > System.currentTimeMillis()
+            replaceYoutubeConnection(connection.takeIf { valid })
+            val expired = confirmed != null && confirmed.expiresAtEpochMillis <= System.currentTimeMillis()
+            if (expired) replaceYoutubeConnection(null)
+            youtubeConfirmed = confirmed.takeUnless { expired }
+            mutable.update { it.copy(youtubeMessage = if (expired)
+                tr(it, "Доступ к YouTube истёк. YouTube заблокирован", "YouTube access expired. YouTube is blocked") else message) }
         }
         try {
+            revokeYoutubePending()
+            check(!SettingsPreparedStatePolicy.isFreePlan(state.value.androidState())) { "youtube_plan_unavailable" }
+            val keys = vault.wireGuardKeyPair()
+            keyBytes = keys.first
             while (youtubeCurrent(epoch, owner)) {
                 try {
                     check(!SettingsPreparedStatePolicy.isFreePlan(state.value.androidState())) { "youtube_plan_unavailable" }
-                    val outbounds = appliedYoutubeConfig?.optJSONArray("outbounds")
-                    val endpoint = outbounds?.let { rows -> (0 until rows.length()).map(rows::getJSONObject)
-                        .firstOrNull { it.optString("tag") == "youtube-local" } }
-                    check(endpoint != null) { "youtube_local_endpoint_unavailable" }
-                    val network = runInterruptible(Dispatchers.IO) { networkSnapshot() }
-                    check(network.available && network.interfaceIndex != null) { "youtube_physical_network_unavailable" }
-                    check(runtime.startYoutube(network) == endpoint.getInt("server_port")) { "youtube_local_port_changed" }
+                    if (keyId == null) keyId = withContext(NonCancellable) { withDeviceProof(device.id) { token, nonce, signature ->
+                        api.registerRuWireGuardKey(token, device.id, device.deviceKey, nonce, signature, keys.second).id
+                    } }
+                    val currentGrant = grant ?: create()
                     currentCoroutineContext().ensureActive()
                     if (!youtubeCurrent(epoch, owner)) break
-                    mutable.update { it.copy(youtubeMessage = null) }
-                    while (youtubeCurrent(epoch, owner) && runtime.youtubeAlive()) {
-                        delay(2_000)
-                        val latest = runInterruptible(Dispatchers.IO) { networkSnapshot() }
-                        if (latest.signature != network.signature || !latest.available ||
-                            SettingsPreparedStatePolicy.isFreePlan(state.value.androidState())) break
+                    when (currentGrant.status) {
+                        "ready" -> {
+                            check(currentGrant.expiresAtEpochMillis > System.currentTimeMillis()) { "youtube_access_expired" }
+                            val connection = YoutubeConnectionConfig.fromReady(currentGrant, checkNotNull(keyId), keys.first)
+                            apply(connection, null, currentGrant)
+                            leaseTimer?.cancel()
+                            leaseTimer = launch {
+                                delay((currentGrant.expiresAtEpochMillis - System.currentTimeMillis()).coerceAtLeast(0))
+                                operation.withLock {
+                                    if (youtubeCurrent(epoch, owner) && youtubeConfirmed === currentGrant) {
+                                        replaceYoutubeConnection(null)
+                                        youtubeConfirmed = null
+                                        mutable.update { it.copy(youtubeMessage = tr(it,
+                                            "Доступ к YouTube истёк. YouTube заблокирован", "YouTube access expired. YouTube is blocked")) }
+                                    }
+                                }
+                            }
+                            delay(((currentGrant.expiresAtEpochMillis - System.currentTimeMillis()) * 2 / 3).coerceAtLeast(1))
+                            // Retries use the last confirmed generation; the backend renew is idempotent.
+                            while (youtubeCurrent(epoch, owner)) {
+                                try {
+                                    receive(currentGrant, renewal = true) {
+                                        withDeviceProof(device.id) { token, nonce, signature ->
+                                            api.renewYoutubeAccess(token, device.id, device.deviceKey, nonce, signature, currentGrant)
+                                        }
+                                    }
+                                    break
+                                } catch (cancelled: CancellationException) { throw cancelled }
+                                catch (error: Exception) {
+                                    if (!BackendRetryPolicy.isTransient(error)) throw error
+                                    delay(retryMillis); retryMillis = (retryMillis * 2).coerceAtMost(30_000)
+                                }
+                            }
+                        }
+                        "pending" -> {
+                            if (youtubeConfirmed == null) apply(null, tr(state.value,
+                                "Подготавливаем канал YouTube. YouTube пока заблокирован", "Preparing the YouTube channel. YouTube is blocked for now"))
+                            check(currentGrant.expiresAtEpochMillis > System.currentTimeMillis()) { "youtube_access_expired" }
+                            delay(2_000)
+                            receive(currentGrant) { withDeviceProof(device.id) { token, nonce, signature ->
+                                api.pollYoutubeAccess(token, device.id, device.deviceKey, nonce, signature, currentGrant.grantId)
+                            } }
+                        }
+                        else -> { apply(null, tr(state.value,
+                            "Доступ к YouTube отозван. YouTube заблокирован", "YouTube access revoked. YouTube is blocked")); break }
                     }
-                    runtime.stopYoutube()
-                    unavailable()
+                    retryMillis = 2_000
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) {
-                    unavailable()
-                    runCatching { runtime.stopYoutube() }.onFailure { recordDiagnosticFailure("youtube_local_stop_failed", it, "vpn") }
-                    recordDiagnosticFailure("youtube_local_failed", error, "vpn")
+                    if (!BackendRetryPolicy.isTransient(error)) throw error
+                    if (youtubeConfirmed == null) apply(null, tr(state.value,
+                        "Канал YouTube недоступен. Повторим запрос", "YouTube channel unavailable. Retrying"))
+                    delay(retryMillis); retryMillis = (retryMillis * 2).coerceAtMost(30_000)
                 }
-                delay(2_000)
             }
-        } finally {
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { apply(null, tr(state.value,
+            "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
+        finally {
+            leaseTimer?.cancel()
+            keyBytes?.fill(0)
             withContext(NonCancellable) {
-                runCatching { runtime.stopYoutube() }.onFailure { recordDiagnosticFailure("youtube_local_stop_failed", it, "vpn") }
+                // Recover a lost create reply by its stable request ID before capability-only cleanup.
+                if (createAttempted && grant == null && keyId != null && current(owner)) runCatching { create() }
+                if (youtubeEpoch.get() == epoch || youtubeGrantId == grant?.grantId) youtubeGrantId = null
+                runCatching { revokeYoutubePending() }
             }
+        }
+    }
+
+    private suspend fun stageYoutubeRevoke(grant: BackendYoutubeAccess) = youtubeRevokes.withLock {
+        val pending = vault.readEncrypted("youtube-revoke.dpapi")?.let(::JSONObject) ?: JSONObject()
+        pending.put(grant.grantId, grant.revokeToken)
+        vault.writeEncrypted("youtube-revoke.dpapi", pending.toString())
+        youtubeGrantId = grant.grantId
+    }
+
+    private suspend fun revokeYoutubePending() = youtubeRevokes.withLock {
+        val pending = vault.readEncrypted("youtube-revoke.dpapi")?.let(::JSONObject) ?: return@withLock
+        for (id in pending.keySet().toList()) {
+            if (id == youtubeGrantId) continue
+            try {
+                api.revokeYoutubeAccess(id, pending.getString(id))
+                pending.remove(id)
+                if (pending.isEmpty) Files.deleteIfExists(vault.directory.resolve("youtube-revoke.dpapi"))
+                else vault.writeEncrypted("youtube-revoke.dpapi", pending.toString())
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { /* Keep the capability encrypted for the next cleanup attempt. */ }
         }
     }
 
@@ -1700,16 +1809,19 @@ class DesktopController internal constructor(
                         watchdog.discardProbe(owner)
                         return@withLock
                     }
-                    val outcome = watchdog.completeProbe(owner, latency)
-                    if (outcome == WatchdogProbeOutcome.Ignored) return@withLock
                     val live = runtime.restored()
+                    val runtimeAlive = live == active && live != null
+                    val outcome = watchdog.completeProbe(owner, latency.takeIf { runtimeAlive }, runtimeAlive)
+                    if (outcome == WatchdogProbeOutcome.Ignored) return@withLock
                     val completingRebind = state.value.networkRebinding
                     mutable.update { it.copy(verified = outcome == WatchdogProbeOutcome.Healthy && live == active && live != null,
                         running = live != null, networkRebinding = completingRebind && live != null && outcome != WatchdogProbeOutcome.Healthy) }
                     if (outcome == WatchdogProbeOutcome.Healthy) {
                         activeConnection?.put("network", network.kind.name)
-                        if (live == active && live != null && latency != null) recordLatencySample(latency)
-                        recordEndpointResult(settings.profile.endpointCode, true, network.kind, settings.profile.multiHop, latency)
+                        if (latency != null && runtimeAlive) {
+                            recordLatencySample(latency)
+                            recordEndpointResult(settings.profile.endpointCode, true, network.kind, settings.profile.multiHop, latency)
+                        }
                     }
                     if (outcome is WatchdogProbeOutcome.Unhealthy && outcome.action == WatchdogAction.Refresh)
                         recordEndpointResult(settings.profile.endpointCode, false, network.kind, settings.profile.multiHop)
@@ -1807,6 +1919,7 @@ class DesktopController internal constructor(
                             operation.withLock {
                                 if (watchdog.accepts(owner) && runtime.restored() == active) {
                                     mutable.update { it.copy(networkRebinding = false) }
+                                    recordLog("recovery_queued_network_dns_changed")
                                     recoveryJob?.cancel(); queueRecovery(0)
                                 }
                             }
@@ -1828,6 +1941,7 @@ class DesktopController internal constructor(
                 if (watchdog.accepts(owner) && runtime.restored() == active && lastNetwork?.signature == signature &&
                     lastNetwork?.available == true) {
                     mutable.update { it.copy(networkRebinding = false) }
+                    recordLog("recovery_queued_network_rebind_exhausted")
                     recoveryJob?.cancel(); queueRecovery(0)
                 }
             }
@@ -2132,8 +2246,12 @@ class DesktopController internal constructor(
         statsDirty = true
         flushStats(force = sessionStarted)
     }
-    private fun recordMetrics(active: SingBoxRuntime.Running, metrics: SingBoxRuntime.Metrics) = synchronized(statsLock) {
+    private fun recordMetrics(active: SingBoxRuntime.Running, metrics: SingBoxRuntime.Metrics,
+        owner: ConnectedWatchdogPolicy.Owner? = watchdog.currentOwner()) = synchronized(statsLock) {
         if (runtime.restored() != active || !state.value.running) return@synchronized
+        if (metrics.primaryReceivedProgress && owner != null && owner.generationId == connectionGeneration &&
+            owner.tunnelIdentity == active.pid && owner.coreIdentity == active.startedAt)
+            watchdog.recordEvidence(WatchdogEvidence.UID_TRAFFIC, owner)
         val previous = statsCursor?.takeIf { it.optInt("pid") == active.pid && it.optLong("started_at") == active.startedAt }
         if (previous != null && (metrics.downloadTotal < previous.optLong("download") || metrics.uploadTotal < previous.optLong("upload")))
             return@synchronized // A concurrent, older HTTP response cannot move the durable cursor backwards.
@@ -2173,14 +2291,12 @@ class DesktopController internal constructor(
 
     private suspend fun stopRuntime(restoreInternet: Boolean = true, retainConnection: Boolean = false, preserveYoutube: Boolean = false) {
         if (!retainConnection) stopWatchdog()
-        if (!preserveYoutube) runCatching { stopYoutubeAccess(waitForCleanup = false) }
-            .onFailure { recordDiagnosticFailure("youtube_local_stop_failed", it, "vpn") }
+        if (!preserveYoutube) stopYoutubeAccess(waitForCleanup = false)
         try { runtime.stop(restoreInternet) }
         catch (error: Exception) {
             if (!retainConnection) runtime.restored()?.let { startWatchdog(it, state.value.verified) }
             throw error
         }
-        appliedYoutubeConfig = null
         if (!retainConnection) {
             activeConnection = null
             Files.deleteIfExists(vault.directory.resolve("connection.dpapi"))

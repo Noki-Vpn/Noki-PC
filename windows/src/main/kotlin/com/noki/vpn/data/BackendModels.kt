@@ -341,6 +341,25 @@ data class BackendRuWireGuardConfig(
     val allowedIps: List<String>,
 )
 
+data class YoutubeAccessRequest(
+    val deviceId: String,
+    val deviceKey: String?,
+    val deviceNonce: String,
+    val deviceSignature: String,
+    val requestId: String,
+    val publicKeyId: String,
+)
+
+data class BackendYoutubeAccess(
+    val mode: String,
+    val status: String,
+    val grantId: String,
+    val generation: Int,
+    val expiresAtEpochMillis: Long,
+    val revokeToken: String,
+    val publicKeyId: String? = null,
+    val wireguard: BackendRuWireGuardConfig? = null,
+)
 
 sealed interface BackendRuWireGuardSession {
     val identity: BackendRuWireGuardIdentity

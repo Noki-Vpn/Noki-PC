@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.addOutline
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -51,6 +52,7 @@ import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.TextRange
@@ -67,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.noki.vpn.data.AccentPalette
@@ -119,9 +122,14 @@ internal val LocalPcCardColor = staticCompositionLocalOf { DesktopUiKit.Surface 
 internal fun Modifier.pcConnectionShadow(): Modifier = drawWithCache {
     val path = Path().apply { addOutline(DesktopUiKit.PanelShape.createOutline(size, layoutDirection, this@drawWithCache)) }
     val shadow = DropShadowPainter(DesktopUiKit.PanelShape, DesktopUiKit.ConnectionShadow)
-    onDrawWithContent {
+    // Skiko's direct painter rebuilds its native mask on every draw; retain it with this cache.
+    val layer = obtainGraphicsLayer()
+    layer.record {
         // Match the design's unchecked "Show behind transparent areas" option.
         clipPath(path, ClipOp.Difference) { with(shadow) { draw(size) } }
+    }
+    onDrawWithContent {
+        drawLayer(layer)
         drawContent()
     }
 }
@@ -319,7 +327,8 @@ internal fun Modifier.pcConnectionShadow(): Modifier = drawWithCache {
         } })
 }
 
-@Composable internal fun PcToggle(label: String, value: Boolean, enabled: Boolean = true, detail: String? = null, onChange: (Boolean) -> Unit) {
+@Composable internal fun PcToggle(label: String, value: Boolean, enabled: Boolean = true, detail: String? = null,
+    help: String? = null, onChange: (Boolean) -> Unit) {
     val style = LocalDesktopStyle.current
     val russian = LocalDesktopLanguage.current == AppLanguage.RU
     Row(Modifier.fillMaxWidth().heightIn(min = if (detail == null) 64.dp else 76.dp).pcCard(shape = DesktopUiKit.MenuShape)
@@ -327,13 +336,36 @@ internal fun Modifier.pcConnectionShadow(): Modifier = drawWithCache {
         .semantics { stateDescription = if (value) { if (russian) "Включено" else "On" } else { if (russian) "Выключено" else "Off" } }
         .padding(horizontal = 20.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            PcText(label, size = 14, lineHeight = 20)
+            if (help == null) PcText(label, size = 14, lineHeight = 20)
+            else Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                PcText(label, Modifier.weight(1f, fill = false), size = 14, lineHeight = 20)
+                PcSettingHelp(label, help)
+            }
             detail?.let { PcText(it, size = 12, lineHeight = 16, color = Color(0xFFB9B9B9)) }
         }
         Spacer(Modifier.width(16.dp))
         Box(Modifier.size(34.dp, 20.dp).background(if (value) style.selected else DesktopUiKit.Muted, CircleShape)) {
             Box(Modifier.align(if (value) Alignment.CenterEnd else Alignment.CenterStart)
                 .padding(horizontal = 3.dp).size(14.dp).background(DesktopUiKit.Text, CircleShape))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun PcSettingHelp(label: String, description: String) {
+    val state = rememberTooltipState(isPersistent = true)
+    val scope = rememberCoroutineScope()
+    val russian = LocalDesktopLanguage.current == AppLanguage.RU
+    TooltipBox(positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(), state = state, focusable = false,
+        tooltip = { PlainTooltip(containerColor = DesktopUiKit.Surface, contentColor = DesktopUiKit.Text) {
+            PcText(description, Modifier.widthIn(max = 280.dp), size = 12, lineHeight = 17)
+        } }) {
+        Box(Modifier.offset(y = (-4).dp).size(24.dp).pcClickable(role = Role.Button, shape = CircleShape) {
+            if (state.isVisible) state.dismiss() else scope.launch { state.show() }
+        }.semantics { contentDescription = if (russian) "О функции «$label»" else "About $label" }, contentAlignment = Alignment.Center) {
+            Box(Modifier.size(14.dp).border(1.dp, DesktopUiKit.Muted, CircleShape), contentAlignment = Alignment.Center) {
+                PcText("?", Modifier.clearAndSetSemantics { }, size = 10, lineHeight = 12, color = DesktopUiKit.Muted)
+            }
         }
     }
 }

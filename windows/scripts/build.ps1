@@ -42,7 +42,6 @@ try {
         'COPYING-GPLv3' = 'sing-box\COPYING'
         'NOTICE-native' = 'sing-box\THIRD_PARTY_NOTICES.txt'
         'LICENSE-WinDivert' = 'WinDivert\LICENSE.txt'
-        'LICENSE-ByeDPI' = 'ByeDPI\LICENSE'
     }
     foreach ($name in $notices.Keys) {
         $destination = [IO.Path]::GetFullPath((Join-Path $licenses $notices[$name]))
@@ -63,7 +62,7 @@ try {
     $null = $platform.Handle
     if (!$platform.WaitForExit(30000)) { $platform.Kill(); throw 'Packaged platform preflight timed out' }
     $platform.Refresh()
-    if ($null -eq $platform.ExitCode -or $platform.ExitCode -ne 0 -or !([IO.File]::ReadAllText($platformOutput).Contains('platform-preflight: ok')) -or !([IO.File]::ReadAllText($platformOutput).Contains('platform-preflight: velopack=ok')) -or !([IO.File]::ReadAllText($platformOutput).Contains('platform-preflight: byedpi=ok')) -or [IO.File]::ReadAllText($platformError).Trim()) {
+    if ($null -eq $platform.ExitCode -or $platform.ExitCode -ne 0 -or !([IO.File]::ReadAllText($platformOutput).Contains('platform-preflight: ok')) -or !([IO.File]::ReadAllText($platformOutput).Contains('platform-preflight: velopack=ok')) -or [IO.File]::ReadAllText($platformError).Trim()) {
         throw ('Packaged Win32 preflight failed (exit ' + $platform.ExitCode + '): ' + [IO.File]::ReadAllText($platformError))
     }
     Get-Content -LiteralPath $platformOutput

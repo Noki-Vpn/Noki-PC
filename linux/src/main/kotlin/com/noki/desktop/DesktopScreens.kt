@@ -288,7 +288,8 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
                     if (page in homePages) {
                         if (page != DesktopPage.SERVERS && page != DesktopPage.MULTIHOP)
                             HomeConnectionPane(state, app, Modifier.fillMaxSize(), protocolOpen = page == DesktopPage.PROTOCOL,
-                                uiActive = earthVisible, reducedMotion = reducedMotion || state.reducedMotion, onPage = onPage)
+                                uiActive = earthVisible, reducedMotion = reducedMotion || state.reducedMotion, onPage = onPage,
+                                onConnectionSettings = { dialog = { ConnectionSettingsDialog(app) { dialog = null } } })
                         if (page == DesktopPage.SERVERS || page == DesktopPage.MULTIHOP) {
                             Column(Modifier.padding(start = 110.dp, top = 32.dp, bottom = 32.dp, end = 20.dp)
                                 .widthIn(max = DesktopUiKit.HomePanelWidth).fillMaxWidth().fillMaxHeight()
@@ -733,21 +734,7 @@ private fun copyText(value: String, app: DesktopController) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         PcText(tr(state, "Расширенные настройки", "Advanced settings"), size = DesktopUiKit.SectionTitleSize)
         SettingsSection(tr(state, "Соединение", "Connection")) {
-            PcToggle(tr(state, "Автовосстановление соединения", "Automatic connection recovery"),
-                state.autoRecoveryEnabled, !state.loading, onChange = app::setAutoRecovery)
-            PcToggle("Kill switch", settings.killSwitchEnabled, !state.loading) { value ->
-                app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(killSwitchEnabled = value)) }
-            }
-            if (!com.noki.vpn.SettingsPreparedStatePolicy.isFreePlan(state.androidState())) {
-                PcToggle(tr(state, "RU-реле", "RU relay"), settings.ruRelayEnabled, !state.loading) { value ->
-                    app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = value)) }
-                }
-                PcToggle(tr(state, "Игровой режим", "Gaming mode"), settings.gamingModeEnabled, !state.loading,
-                    onChange = app::setGamingMode)
-                PcToggle(tr(state, "YouTube без рекламы", "YouTube without ads"), settings.youtubeAdBlockEnabled, !state.loading) { value ->
-                    app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = value)) }
-                }
-            }
+            ConnectionSettingsControls(state, app)
         }
         SettingsSection(tr(state, "Управление трафиком", "Traffic control")) {
             PcMenuRow(tr(state, "Маршрутизация", "Routing"), tr(state, "Сайты, IP-адреса и приложения", "Websites, IP addresses and applications")) { onPage(DesktopPage.ROUTING) }
@@ -763,6 +750,38 @@ private fun copyText(value: String, app: DesktopController) {
         }
         PcMenuRow(tr(state, "Статистика использования", "Usage statistics"), tr(state, "Трафик, время подключения и задержка", "Traffic, connection time and latency")) { onPage(DesktopPage.STATS) }
         if (state.running) PcText(tr(state, "Изменения соединения применятся при следующем подключении", "Connection changes apply on your next connection"), size = 11, color = Color(0xFFB9B9B9))
+    }
+}
+
+@Composable private fun ConnectionSettingsDialog(app: DesktopController, onDismiss: () -> Unit) {
+    val state by app.state.collectAsState()
+    PcDialog(tr(state, "Настройки соединения", "Connection settings"), onDismiss,
+        dismissLabel = tr(state, "Готово", "Done")) {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) { ConnectionSettingsControls(state, app) }
+        if (state.running) PcText(tr(state, "Изменения соединения применятся при следующем подключении", "Connection changes apply on your next connection"),
+            Modifier.padding(12.dp), size = 11, color = DesktopUiKit.Muted)
+    }
+}
+
+@Composable private fun ConnectionSettingsControls(state: DesktopState, app: DesktopController) {
+    val settings = state.settings.advancedSettings
+    PcToggle(tr(state, "Автовосстановление соединения", "Automatic connection recovery"), state.autoRecoveryEnabled, !state.loading,
+        help = tr(state, "Если связь пропадёт, Noki попробует подключиться снова.", "If the connection drops, Noki will try to reconnect."), onChange = app::setAutoRecovery)
+    PcToggle("Kill switch", settings.killSwitchEnabled, !state.loading,
+        help = tr(state, "При обрыве VPN останавливает трафик, который должен идти через него.", "If the VPN disconnects, blocks traffic that should pass through it.")) { value ->
+        app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(killSwitchEnabled = value)) }
+    }
+    if (!com.noki.vpn.SettingsPreparedStatePolicy.isFreePlan(state.androidState())) {
+        PcToggle(tr(state, "RU-реле", "RU relay"), settings.ruRelayEnabled, !state.loading,
+            help = tr(state, "Подключает к выбранному зарубежному серверу через сервер в России.", "Connects to the selected foreign server through a server in Russia.")) { value ->
+            app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = value)) }
+        }
+        PcToggle(tr(state, "Игровой режим", "Gaming mode"), settings.gamingModeEnabled, !state.loading,
+            help = tr(state, "Использует игровой профиль NokiNV. При включении отключает RU-реле.", "Uses the NokiNV gaming profile and turns off RU relay."), onChange = app::setGamingMode)
+        PcToggle(tr(state, "YouTube без рекламы", "YouTube without ads"), settings.youtubeAdBlockEnabled, !state.loading,
+            help = tr(state, "Направляет YouTube через отдельный российский сервер. Остальной трафик сохраняет обычный маршрут.", "Routes YouTube through a separate Russian server. Other traffic keeps its usual route.")) { value ->
+            app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = value)) }
+        }
     }
 }
 
@@ -1602,6 +1621,7 @@ internal fun openDesktopUrl(value: String) {
     uiActive: Boolean = true,
     reducedMotion: Boolean = state.reducedMotion,
     onPage: (DesktopPage) -> Unit,
+    onConnectionSettings: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val displayed = state.displayedSettings
@@ -1695,13 +1715,17 @@ internal fun openDesktopUrl(value: String) {
                             compact = true, glass = true, glassColor = DesktopUiKit.Glass, shape = DesktopUiKit.PanelShape,
                             enabled = !state.loading && !state.settings.advancedSettings.ruRelayEnabled && !state.settings.advancedSettings.gamingModeEnabled,
                             onClick = { onPage(DesktopPage.PROTOCOL) })
-                        Spacer(Modifier.height(20.dp))
+                        Spacer(Modifier.height(8.dp))
                         PcSurface(Modifier.padding(start = 1.dp).fillMaxWidth().height(50.dp).pcConnectionShadow(), onClick = { onPage(DesktopPage.ROUTING) }) {
                             Row(Modifier.align(Alignment.Center), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 PcIcon("routing", null, Modifier.size(23.dp, 18.dp))
                                 PcText(tr(state, "Маршрутизация", "Routing"), size = 14)
                             }
                         }
+                        Spacer(Modifier.height(8.dp))
+                        PcButton(tr(state, "Настройки соединения", "Connection settings"), Modifier.padding(start = 1.dp).fillMaxWidth().height(50.dp).pcConnectionShadow(),
+                            compact = true, glass = true, glassColor = DesktopUiKit.Glass, shape = DesktopUiKit.PanelShape,
+                            enabled = !state.loading, onClick = onConnectionSettings)
                     }
                     Spacer(Modifier.height(20.dp))
                     Row(Modifier.padding(start = 1.dp).fillMaxWidth().height(81.dp),

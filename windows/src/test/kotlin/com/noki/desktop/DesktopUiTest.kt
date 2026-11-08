@@ -60,6 +60,92 @@ import javax.imageio.ImageIO
 
 class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun homeConnectionSettingsOpensTheLiveDialog() = connectionUiFixture { app ->
+        val user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false)
+        val scene = ImageComposeScene(1050, 674) {
+            val state by app.state.collectAsState()
+            DesktopWorkspace(state.copy(user = user, earthDisabled = true), app, DesktopPage.HOME, earthVisible = false)
+        }
+        fun nodes(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); node.children.forEach { yieldAll(nodes(it)) } }
+        fun all() = scene.semanticsOwners.asSequence().flatMap { nodes(it.rootSemanticsNode) }
+        fun text(label: String) = all().firstOrNull { node -> node.config.getOrNull(SemanticsProperties.Text)?.any { it.text == label } == true }
+        fun render() { repeat(4) { scene.render(System.nanoTime()).close() } }
+        fun screenshot(name: String) {
+            val output = java.nio.file.Path.of("build/screenshots/$name.png")
+            Files.createDirectories(output.parent)
+            scene.render(System.nanoTime()).use { image -> image.encodeToData(EncodedImageFormat.PNG)!!.use { Files.write(output, it.bytes) } }
+        }
+        fun click(node: SemanticsNode) {
+            val point = node.boundsInRoot.center
+            scene.sendPointerEvent(PointerEventType.Press, point, buttons = PointerButtons(isPrimaryPressed = true), button = PointerButton.Primary)
+            scene.sendPointerEvent(PointerEventType.Release, point, buttons = PointerButtons(), button = PointerButton.Primary)
+            render()
+        }
+        try {
+            render()
+            val settings = text("Настройки соединения")
+            assertNotNull("The home panel must expose connection settings", settings)
+            val routing = checkNotNull(text("Маршрутизация"))
+            val protocol = all().first { node -> node.config.getOrNull(SemanticsProperties.Text)?.any { it.text.startsWith("Протокол:") } == true }
+            assertEquals(58f, routing.boundsInRoot.center.y - protocol.boundsInRoot.center.y, 1f)
+            assertEquals(58f, settings!!.boundsInRoot.center.y - routing.boundsInRoot.center.y, 1f)
+            screenshot("home-connection-settings")
+            click(settings)
+            assertNotNull(text("Автовосстановление соединения"))
+            assertNotNull(text("Kill switch"))
+            screenshot("connection-settings-dialog")
+            val help = all().firstOrNull { it.config.getOrNull(SemanticsProperties.ContentDescription)?.contains("О функции «Kill switch»") == true }
+            assertNotNull("Each connection option must expose its help", help)
+            val before = app.state.value.settings.advancedSettings.killSwitchEnabled
+            scene.sendPointerEvent(PointerEventType.Move, help!!.boundsInRoot.center)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (text("При обрыве VPN останавливает трафик, который должен идти через него.") == null && System.nanoTime() < deadline) {
+                Thread.sleep(25); render()
+            }
+            assertNotNull("Hover must explain the connection option", text("При обрыве VPN останавливает трафик, который должен идти через него."))
+            repeat(12) { Thread.sleep(20); render() }
+            screenshot("connection-settings-tooltip")
+            click(help)
+            assertEquals("Opening help must not toggle the setting", before, app.state.value.settings.advancedSettings.killSwitchEnabled)
+            scene.sendPointerEvent(PointerEventType.Move, Offset(10f, 10f)); render()
+            click(checkNotNull(text("Готово")))
+            assertNull(text("Kill switch"))
+        } finally { scene.close() }
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun connectionSettingHelpFollowsTheExistingPlanRestrictions() = connectionUiFixture { app ->
+        val user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false)
+        for ((plan, count) in listOf("free" to 2, "free-plus" to 5, "plus-monthly" to 5)) {
+            val state = DesktopState(user = user, subscription = BackendSubscription("active", plan, null, 0.0, null,
+                planTier = if (plan == "plus-monthly") "plus" else plan))
+            val scene = ImageComposeScene(1050, 674) { DesktopWorkspace(state, app, DesktopPage.ADVANCED, earthVisible = false) }
+            fun nodes(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); node.children.forEach { yieldAll(nodes(it)) } }
+            try {
+                repeat(4) { scene.render().close() }
+                val help = scene.semanticsOwners.asSequence().flatMap { nodes(it.rootSemanticsNode) }
+                    .count { node -> node.config.getOrNull(SemanticsProperties.ContentDescription)?.any { it.startsWith("О функции «") } == true }
+                assertEquals("Help must exist for every available connection option on $plan", count, help)
+            } finally { scene.close() }
+        }
+    }
+
+    private fun connectionUiFixture(block: (DesktopController) -> Unit) {
+        val build = java.nio.file.Path.of("build").toAbsolutePath().normalize()
+        val directory = Files.createTempDirectory(build, "connection-ui-")
+        val vault = WindowsVault(directory, hardwareIdentity = { "fixture" })
+        val app = DesktopController(vault, stoppedTestRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
+        try {
+            runBlocking { withTimeout(5_000) { app.state.first { !it.loading } } }
+            block(app)
+        } finally {
+            app.close()
+            check(directory.toRealPath().startsWith(build.toRealPath()) && directory != build)
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
     @Test fun startupFailureProvidesSafeDetailsAndRetry() {
         val secret = "private-value-must-not-be-copied"
         val cause = if (DesktopBuild.IS_LINUX) java.io.IOException(secret) else com.sun.jna.platform.win32.Win32Exception(13)

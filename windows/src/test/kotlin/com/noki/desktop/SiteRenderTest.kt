@@ -1,6 +1,9 @@
 package com.noki.desktop
 
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.ImageComposeScene
 import androidx.compose.ui.Modifier
@@ -121,5 +124,32 @@ class SiteRenderTest {
             assertEquals(0xE5484D, off.getRGB(x, x) and 0xffffff)
             on.close(); off.close()
         }
+    }
+
+    @Test fun `tray stays connected with the established home session during an unverified probe`() {
+        var state by mutableStateOf(DesktopState())
+        val tooltip = java.util.concurrent.atomic.AtomicReference<String>()
+        val tray = DesktopTray({}, {}, { action, data ->
+            if (action == 0 || action == 1) tooltip.set(data.getWideString(40))
+            1
+        }, readLightTheme = { false })
+        val owner = tray.windowHandle
+        val scene = ImageComposeScene(1, 1, density = Density(1f)) { DesktopTrayEffect(tray, state) }
+        fun expect(next: DesktopState, label: String) {
+            state = next
+            repeat(4) { scene.render().close() }
+            assertEquals(label, tooltip.get())
+            assertEquals(owner, tray.windowHandle)
+        }
+        try {
+            expect(DesktopState(running = true, connecting = true), "Отключено")
+            val connected = DesktopState(running = true, verified = true, connectedAtMillis = 1_000)
+            expect(connected, "Подключено")
+            expect(connected.copy(verified = false), "Подключено")
+            expect(connected.copy(verified = false, networkRebinding = true), "Подключено")
+            expect(connected.copy(verified = false, connecting = true), "Отключено")
+            expect(DesktopState(), "Отключено")
+        } finally { scene.close(); tray.close() }
+        assertFalse(com.sun.jna.platform.win32.User32.INSTANCE.IsWindow(owner))
     }
 }

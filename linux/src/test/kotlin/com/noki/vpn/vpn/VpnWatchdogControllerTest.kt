@@ -8,6 +8,60 @@ import org.junit.Test
 
 class VpnWatchdogControllerTest {
     @Test
+    fun `received primary traffic keeps a working tunnel healthy when all probe targets fail`() {
+        var now = 1_000L
+        val controller = VpnWatchdogController(WatchdogScheduler(), { now },
+            { _, _ -> CancelableTask {} }, { false })
+        val owner = watchdogOwner(40L)
+        controller.start(owner, DefaultStoredSettingsFactory.create(), initialXrayEvidence = true)
+        repeat(3) {
+            now += 60_000L
+            controller.forceProbe()
+            controller.recordEvidence(WatchdogEvidence.UID_TRAFFIC)
+            assertEquals(WatchdogProbeOutcome.Healthy, controller.completeProbe(owner, null))
+        }
+    }
+
+    @Test
+    fun `primary evidence expires and a dead core or stale network cannot use it`() {
+        var now = 1_000L
+        val controller = VpnWatchdogController(WatchdogScheduler(), { now },
+            { _, _ -> CancelableTask {} }, { false })
+        val owner = watchdogOwner(41L)
+        controller.start(owner, DefaultStoredSettingsFactory.create(), initialXrayEvidence = true)
+        controller.recordEvidence(WatchdogEvidence.UID_TRAFFIC, owner)
+        controller.forceProbe()
+        assertEquals(WatchdogProbeOutcome.Unhealthy(WatchdogAction.None), controller.completeProbe(owner, null, runtimeAlive = false))
+        now += ConnectedWatchdogPolicy.PROBE_AFTER_IDLE_MS
+        assertEquals(WatchdogAction.Refresh, failedProbe(controller, owner))
+        controller.networkChanged()
+        val current = checkNotNull(controller.currentOwner())
+        controller.recordEvidence(WatchdogEvidence.UID_TRAFFIC, owner)
+        assertEquals(WatchdogAction.None, failedProbe(controller, current))
+        assertEquals(WatchdogAction.Refresh, failedProbe(controller, current))
+    }
+
+    @Test
+    fun `primary receive progress postpones scheduled probes until the tunnel is idle`() {
+        var now = 1_000L
+        val scheduler = WatchdogScheduler()
+        var probes = 0
+        val controller = VpnWatchdogController(scheduler, { now },
+            { _, _ -> probes++; CancelableTask {} }, { false })
+        val owner = watchdogOwner(42L)
+        controller.start(owner, DefaultStoredSettingsFactory.create(), initialXrayEvidence = true)
+        repeat(5) {
+            now += 60_000L
+            controller.recordEvidence(WatchdogEvidence.UID_TRAFFIC, owner)
+            scheduler.runPending()
+        }
+        assertEquals(0, probes)
+        now += ConnectedWatchdogPolicy.PROBE_AFTER_IDLE_MS
+        scheduler.runPending()
+        assertEquals(1, probes)
+    }
+
+    @Test
     fun `explicit server remains diagnostic even after repeated failures in and outside lockdown`() {
         for (lockdown in listOf(false, true)) {
             val recoveries = ArrayDeque<Long>()

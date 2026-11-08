@@ -2,8 +2,8 @@ package com.noki.vpn.vpn
 
 import com.noki.vpn.data.AdvancedSettings
 import com.noki.vpn.data.BackendRuWireGuardConfig
+import com.noki.vpn.data.BackendYoutubeAccess
 import com.noki.vpn.data.DomainRulePolicy
-import com.noki.vpn.data.EndpointSelector
 import com.noki.vpn.data.EndpointSecurityPolicy
 import com.noki.vpn.data.VlessProfile
 import com.noki.vpn.data.VpnProfileValidator
@@ -12,14 +12,21 @@ import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 
-data class YoutubeConnectionConfig(val port: Int) {
-    init { require(port in 1..65535) { "youtube_local_port_invalid" } }
+data class YoutubeConnectionConfig(val wireguard: BackendRuWireGuardConfig, val privateKey: ByteArray) {
+
+    companion object {
+        fun fromReady(access: BackendYoutubeAccess, publicKeyId: String, privateKey: ByteArray): YoutubeConnectionConfig {
+            require(access.status == "ready" && access.mode == "wireguard") { "youtube_access_not_ready" }
+            require(access.publicKeyId == publicKeyId) { "youtube_access_key_mismatch" }
+            return YoutubeConnectionConfig(requireNotNull(access.wireguard), privateKey)
+        }
+    }
 }
 
 object VpnConfigFactory {
     private const val DNS_TAG = "noki-node-dns"
     private const val BOOTSTRAP_TAG = "bootstrap"
-    private const val YOUTUBE_TAG = "youtube-local"
+    private const val YOUTUBE_TAG = "youtube-ru"
 
     // The same V2Fly private set used by the server compiler, including CGNAT/reserved ranges.
     private val privateCidrs = listOf(
@@ -59,7 +66,7 @@ object VpnConfigFactory {
                 .put("allowed_ips", JSONArray(config.allowedIps)).put("persistent_keepalive_interval", keepalive)))
     }
 
-    /** Compose from the main config; a missing local process blocks only the YouTube branch. */
+    /** Compose only from the unchanged main config, so expired admissions cannot leave an old route behind. */
     fun withYoutube(baseConfig: JSONObject, connection: YoutubeConnectionConfig?, geositeBytes: ByteArray): JSONObject {
         val config = JSONObject(baseConfig.toString())
         val youtube = domainMatch(listOf("geosite:youtube"), GeositeAsset.resolveDomains(geositeBytes, setOf("geosite:youtube")))
@@ -81,8 +88,6 @@ object VpnConfigFactory {
                         .put(JSONObject(youtube.toString())).put(extra))
                 rules.put(match(JSONObject().put("ip_version", 6)).put("action", "reject"))
                 rules.put(match(JSONObject().put("network", "udp")).put("action", "reject"))
-                if (connection != null) rules.put(match(JSONObject().put("network", "tcp"))
-                    .put("action", "resolve").put("server", DNS_TAG).put("strategy", "ipv4_only"))
                 rules.put(match(JSONObject().put("network", "tcp")).put("action", if (connection == null) "reject" else "route")
                     .apply { if (connection != null) put("outbound", YOUTUBE_TAG) })
             }
@@ -92,9 +97,11 @@ object VpnConfigFactory {
         val dnsRules = dns.getJSONArray("rules")
         dns.put("rules", JSONArray().put(JSONObject(youtube.toString()).put("server", DNS_TAG))
             .apply { for (index in 0 until dnsRules.length()) put(dnsRules.getJSONObject(index)) })
-        if (connection != null) config.getJSONArray("outbounds").put(JSONObject()
-            .put("type", "socks").put("tag", YOUTUBE_TAG).put("server", "127.0.0.1")
-            .put("server_port", connection.port).put("version", "5").put("network", "tcp"))
+        if (connection != null) {
+            val endpoints = config.optJSONArray("endpoints") ?: JSONArray().also { config.put("endpoints", it) }
+            endpoints.put(wireGuardEndpoint(connection.wireguard, connection.privateKey, YOUTUBE_TAG, keepalive = 0)
+                .put("domain_resolver", resolver(BOOTSTRAP_TAG)))
+        }
         return config
     }
 

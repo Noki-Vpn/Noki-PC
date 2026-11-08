@@ -165,7 +165,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
     fun writeEncrypted(name: String, value: String) {
         require(name.matches(Regex("[a-zA-Z0-9.-]+")))
         if (name in CACHE_FILES) synchronized(cacheLock) { writeEncryptedFile(name, value) }
-        else if (name in PROCESS_FILES) synchronized(runtimeLock) { writeEncryptedFile(name, value) }
+        else if (name == "runtime.dpapi") synchronized(runtimeLock) { writeEncryptedFile(name, value) }
         else writeEncryptedFile(name, value)
     }
 
@@ -189,7 +189,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
 
     fun readEncrypted(name: String): String? {
         require(name.matches(Regex("[a-zA-Z0-9.-]+")))
-        return if (name in PROCESS_FILES) synchronized(runtimeLock) { readEncryptedFile(name) }
+        return if (name == "runtime.dpapi") synchronized(runtimeLock) { readEncryptedFile(name) }
         else readEncryptedFile(name)
     }
 
@@ -217,13 +217,12 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
         }
     }
 
-    internal fun <T> loadRuntimeRecord(canRecover: () -> Boolean, name: String = "runtime.dpapi", decode: (String?) -> T): T = synchronized(runtimeLock) {
-        require(name in PROCESS_FILES)
-        try { decode(readEncrypted(name)) }
+    internal fun <T> loadRuntimeRecord(canRecover: () -> Boolean, decode: (String?) -> T): T = synchronized(runtimeLock) {
+        try { decode(readEncrypted("runtime.dpapi")) }
         catch (error: Exception) {
-            // Recover identity only after its owner proves the corresponding process has stopped.
+            // A lost process identity is recoverable only after the runtime proves no core is running.
             if (!invalidStoredData(error) || !canRecover()) throw error
-            synchronized(cacheLock) { preserveUnreadableFile(name, error) }
+            synchronized(cacheLock) { preserveUnreadableFile("runtime.dpapi", error) }
             decode(null)
         }
     }
@@ -398,7 +397,6 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
     companion object {
         private val runtimeLocks = java.util.concurrent.ConcurrentHashMap<Path, Any>()
         private val CACHE_FILES = setOf("stats.dpapi", "account-local.dpapi", "endpoint-health.dpapi", "window.dpapi")
-        private val PROCESS_FILES = setOf("runtime.dpapi", "byedpi.dpapi")
         private const val MAX_CACHE_BYTES = 16 * 1024 * 1024
         private fun invalidStoredData(error: Exception): Boolean = error is JSONException || error is javax.crypto.BadPaddingException ||
             error is Win32Exception && error.errorCode in setOf(WinError.ERROR_INVALID_DATA, WinError.ERROR_INVALID_PARAMETER)

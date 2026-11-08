@@ -176,10 +176,26 @@ internal suspend fun windowsTaskbarIcon(nativeHandle: () -> Long, light: Boolean
     windowsTaskbarIcon(HWND(com.sun.jna.Pointer(handle)), light).use { awaitCancellation() }
 }
 
-internal fun windowsTaskbarIcon(hwnd: HWND, light: Boolean): AutoCloseable {
+internal suspend fun windowsTaskbarIcon(window: dev.nucleusframework.window.tao.TaoWindow, light: Boolean): Nothing {
+    // Tao owns ICON_SMALL; give it the same artwork without sharing our native ICON_BIG handle.
+    windowsTaskbarImage(light).use { image ->
+        Bitmap().use { bitmap ->
+            val info = ImageInfo(image.width, image.height, ColorType.RGBA_8888, ColorAlphaType.PREMUL)
+            check(bitmap.allocPixels(info) && image.readPixels(bitmap))
+            window.setIcon(image.width, image.height, checkNotNull(bitmap.readPixels(info)))
+        }
+    }
+    windowsTaskbarIcon({ window.nativeHandle }, light)
+}
+
+private fun windowsTaskbarImage(light: Boolean): Image {
     val resource = if (light) "/noki/desktop/taskbar-light.png" else "/noki/desktop/taskbar.png"
     val bytes = checkNotNull(DesktopTray::class.java.getResourceAsStream(resource)).use { it.readAllBytes() }
-    val icon = Image.makeFromEncoded(bytes).use(::windowsIcon)
+    return Image.makeFromEncoded(bytes)
+}
+
+internal fun windowsTaskbarIcon(hwnd: HWND, light: Boolean): AutoCloseable {
+    val icon = windowsTaskbarImage(light).use(::windowsIcon)
     val user = User32.INSTANCE
     // Tao sets ICON_SMALL only; Windows 10's taskbar needs ICON_BIG separately.
     val previous = user.SendMessage(hwnd, 0x80, WPARAM(1), LPARAM(com.sun.jna.Pointer.nativeValue(icon.pointer)))

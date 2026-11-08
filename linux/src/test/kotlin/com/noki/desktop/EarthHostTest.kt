@@ -40,6 +40,47 @@ class EarthHostTest {
     private fun resource(name: String) = requireNotNull(javaClass.getResourceAsStream("/noki/desktop/earth/$name")) { name }.use { it.readBytes() }
     private val manifest get() = JSONObject(resource("manifest.json").toString(Charsets.UTF_8))
 
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun `connection shadow reuses its native bitmap while the scene redraws`() {
+        val statistics = org.jetbrains.skia.impl.Stats
+        val previouslyEnabled = statistics.enabled
+        val previousCounts = statistics.allocated
+        val bitmapCreations = AtomicInteger()
+        statistics.allocated = object : java.util.concurrent.ConcurrentHashMap<String, Int>() {
+            override fun merge(key: String, value: Int, remappingFunction: java.util.function.BiFunction<in Int, in Int, out Int?>): Int? {
+                if (key == "Bitmap" && value > 0) bitmapCreations.incrementAndGet()
+                return super.merge(key, value, remappingFunction)
+            }
+        }
+        statistics.enabled = true
+        val redraw = mutableIntStateOf(0)
+        val scene = ImageComposeScene(240, 180) {
+            Box(Modifier.padding(24.dp).size(160.dp, 100.dp).pcConnectionShadow().drawWithContent {
+                redraw.intValue
+                drawContent()
+            })
+        }
+        try {
+            repeat(4) { scene.render(it * 100_000_000L).close() }
+            val output = Path.of("build/screenshots/earth-memory"); Files.createDirectories(output)
+            scene.render(400_000_000L).use { image ->
+                image.encodeToData(EncodedImageFormat.PNG)!!.use { data ->
+                    Files.write(output.resolve("connection-shadow.png"), data.bytes)
+                    val pixels = ImageIO.read(data.bytes.inputStream())
+                    assertEquals("The shadow must remain clipped out of the transparent panel", 0, pixels.getRGB(100, 80) ushr 24)
+                    assertTrue("The exterior shadow must still be visible", (24 until 184).any { x -> pixels.getRGB(x, 128) ushr 24 > 0 })
+                }
+            }
+            val bitmaps = bitmapCreations.get()
+            assertTrue("The fixture must draw a raster shadow", bitmaps > 0)
+            repeat(12) { frame ->
+                redraw.intValue++
+                scene.render(500_000_000L + frame * 100_000_000L).close()
+            }
+            assertEquals("Redraw must reuse the shadow bitmap instead of leaving native masks for the cleaner", bitmaps, bitmapCreations.get())
+        } finally { scene.close(); statistics.enabled = previouslyEnabled; statistics.allocated = previousCounts }
+    }
+
     @Test fun `last Earth window releases ANGLE display and restores without breaking sibling or headless contexts`() {
         org.junit.Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"))
         val log = Files.createTempFile("noki-earth-lifecycle-", ".log")
@@ -704,6 +745,11 @@ class EarthHostTest {
 internal object EarthMemoryProbe {
     @JvmStatic fun main(args: Array<String>) {
         val output = Path.of(args[0])
+        val started = System.nanoTime()
+        val allocations = java.lang.management.ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        check(allocations.isThreadAllocatedMemorySupported)
+        allocations.isThreadAllocatedMemoryEnabled = true
+        org.jetbrains.skia.impl.Stats.enabled = true
         if (DesktopBuild.IS_LINUX) LinuxPlatform::class.java.getDeclaredField("key").apply { isAccessible = true }.set(null, ByteArray(32))
         val vault = WindowsVault(Files.createTempDirectory(Path.of("build"), "earth-memory-"), hardwareIdentity = { "fixture" })
         val app = DesktopController(vault, SingBoxRuntime(vault), com.noki.vpn.data.BackendApiClient(baseUrl = "http://127.0.0.1:9"))
@@ -711,6 +757,11 @@ internal object EarthMemoryProbe {
         var gpu: dev.nucleusframework.window.tao.TaoOpenGlRenderContext? = null
         fun sample(phase: String) {
             val row = JSONObject().put("phase", phase)
+                .put("elapsed_ms", (System.nanoTime() - started) / 1_000_000)
+                .put("time", java.time.Instant.now().toString())
+                .put("allocated_bytes", allocations.totalThreadAllocatedBytes)
+                .put("gc_count", java.lang.management.ManagementFactory.getGarbageCollectorMXBeans().sumOf { it.collectionCount.coerceAtLeast(0) })
+                .put("native_bitmaps", org.jetbrains.skia.impl.Stats.allocated.getOrDefault("Bitmap", 0))
             if (DesktopBuild.IS_LINUX) {
                 val values = Files.readAllLines(Path.of("/proc/self/smaps_rollup")).filter { ':' in it }
                     .associate { it.substringBefore(':') to it.substringAfter(':').trim().substringBefore(' ').toLongOrNull() }
@@ -738,6 +789,7 @@ internal object EarthMemoryProbe {
             var page by remember { mutableStateOf(DesktopPage.HOME) }
             var country by remember { mutableStateOf("") }
             var signedIn by remember { mutableStateOf(true) }
+            var reducedMotion by remember { mutableStateOf(false) }
             val base = DesktopState(user = if (signedIn) user else null, earthDisabled = !earth)
             val state = base.copy(settings = base.settings.copy(userProfile = base.settings.userProfile.copy(
                 serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.COUNTRY, selectedCountryCode = country)))
@@ -746,7 +798,7 @@ internal object EarthMemoryProbe {
                     position = androidx.compose.ui.window.WindowPosition(-2000.dp, -2000.dp))) {
                 val context = dev.nucleusframework.window.tao.rememberTaoGpuRenderContext() as? dev.nucleusframework.window.tao.TaoOpenGlRenderContext
                 SideEffect { gpu = context }
-                key(page) { DesktopContent(state, app, initialPage = page) }
+                key(page) { DesktopContent(state, app, initialPage = page, reducedMotion = reducedMotion) }
                 LaunchedEffect(Unit) {
                     try {
                         kotlinx.coroutines.delay(5_000); System.gc(); kotlinx.coroutines.delay(1_000); sample("map")
@@ -754,6 +806,16 @@ internal object EarthMemoryProbe {
                         kotlinx.coroutines.delay(15_000); sample("earth-active")
                         System.gc(); kotlinx.coroutines.delay(1_000); sample("earth-after-gc")
                         kotlinx.coroutines.delay(10_000); sample("earth-active-later")
+                        System.gc(); kotlinx.coroutines.delay(1_000); sample("earth-second-gc")
+                        reducedMotion = true
+                        kotlinx.coroutines.delay(1_000); sample("earth-still-start")
+                        kotlinx.coroutines.delay(10_000); sample("earth-still")
+                        reducedMotion = false
+                        kotlinx.coroutines.delay(1_000); sample("earth-moving-start")
+                        kotlinx.coroutines.delay(10_000); sample("earth-moving")
+                        repeat(3) { interval ->
+                            kotlinx.coroutines.delay(10_000); sample("earth-moving-${(interval + 2) * 10}s")
+                        }
                         for (code in listOf("NL", "US", "PL", "FI")) { country = code; kotlinx.coroutines.delay(2_000) }
                         sample("earth-after-flights")
                         page = DesktopPage.SECURITY

@@ -55,7 +55,7 @@ class LegalDocument(HTMLParser):
 
 def capture(slug, title):
     url = f"{ORIGIN}/legal/{slug}"
-    with urlopen(Request(url, headers={"User-Agent": "Noki-Installer-Packaging"}), timeout=45) as response:
+    with urlopen(Request(url, headers={"User-Agent": "Noki-Installer-Packaging", "Accept-Language": "ru-RU,ru;q=0.9"}), timeout=45) as response:
         if response.url.rstrip("/") != url or response.headers.get_content_type() != "text/html":
             raise ValueError(f"Unexpected legal page response: {url}")
         source = response.read().decode("utf-8")

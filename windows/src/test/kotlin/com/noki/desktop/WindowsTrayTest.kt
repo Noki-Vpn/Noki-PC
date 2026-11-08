@@ -1,6 +1,7 @@
 package com.noki.desktop
 
 import com.noki.vpn.data.AppLanguage
+import com.noki.vpn.ui.nokiPainterResource
 import com.sun.jna.platform.win32.User32
 import com.sun.jna.platform.win32.WinDef.HWND
 import com.sun.jna.platform.win32.WinDef.LPARAM
@@ -24,6 +25,25 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 class WindowsTrayTest {
+    @Test(timeout = 35_000)
+    fun `production decorated window retains shell icons after close and reopen`() {
+        val build = Path.of("build").toAbsolutePath().normalize()
+        val directory = Files.createTempDirectory(build, "icon-lifecycle-")
+        val child = ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java.exe").toString(),
+            "-cp", System.getProperty("noki.test.classpath"), DesktopInstanceRestoreProbe::class.java.name,
+            directory.toString(), "icons").redirectErrorStream(true).redirectOutput(directory.resolve("probe.log").toFile()).start()
+        try {
+            val completed = child.waitFor(30, TimeUnit.SECONDS)
+            assertTrue("Isolated icon lifecycle timed out: ${Files.readString(directory.resolve("probe.log"))}", completed)
+            assertEquals(Files.readString(directory.resolve("probe.log")), 0, child.exitValue())
+            assertEquals(listOf("0", "1", "2"), Files.readAllLines(directory.resolve("verified")))
+        } finally {
+            if (child.isAlive) { child.destroyForcibly(); child.waitFor(5, TimeUnit.SECONDS) }
+            check(directory.startsWith(build) && directory != build)
+            directory.toFile().deleteRecursively()
+        }
+    }
+
     @Test(timeout = 60_000)
     fun `second process restores hidden or minimized window without a tray`() {
         val build = Path.of("build").toAbsolutePath().normalize()
@@ -81,7 +101,7 @@ class WindowsTrayTest {
         failure?.let { throw it }
     }
 
-    @Test fun `taskbar icon supplies ICON_BIG without replacing Tao titlebar icon`() {
+    @Test fun `taskbar icon supplies both sizes and preserves a later Tao titlebar replacement`() {
         var failure: Throwable? = null
         dev.nucleusframework.window.tao.TaoApplication.run { app ->
             val window = app.openWindow(title = "Noki icon probe", visible = false)
@@ -99,7 +119,7 @@ class WindowsTrayTest {
                         windowsTaskbarIcon(hwnd, light).use {
                             val taskbar = User32.INSTANCE.SendMessage(hwnd, 0x7F, WPARAM(1), LPARAM(0)).toLong()
                             assertNotEquals(0L, taskbar)
-                            assertEquals(small, User32.INSTANCE.SendMessage(hwnd, 0x7F, WPARAM(0), LPARAM(0)).toLong())
+                            assertEquals(taskbar, User32.INSTANCE.SendMessage(hwnd, 0x7F, WPARAM(0), LPARAM(0)).toLong())
                             if (light) {
                                 window.setIcon(32, 32, ByteArray(32 * 32 * 4) { if (it % 4 == 3) -1 else 0 })
                                 delay(100)
@@ -351,6 +371,7 @@ class WindowsTrayTest {
 internal object DesktopInstanceRestoreProbe {
     @JvmStatic fun main(args: Array<String>) {
         val directory = Path.of(args[0])
+        if (args[1] == "icons") { iconLifecycle(directory); return }
         val hidden = args[1] == "hidden"
         SingleInstanceManager.configuration = SingleInstanceManager.Configuration(directory, "noki-instance")
         nucleusApplication(backend = NucleusBackend.Tao, enableSingleInstance = true) {
@@ -375,6 +396,44 @@ internal object DesktopInstanceRestoreProbe {
                             while (User32.INSTANCE.GetWindowLong(handle, GWL_STYLE) and WS_MINIMIZE == 0) delay(10)
                             Files.writeString(directory.resolve("ready"), ProcessHandle.current().pid().toString())
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun iconLifecycle(directory: Path) {
+        nucleusApplication(backend = NucleusBackend.Tao, enableSingleInstance = false) {
+            var shown by remember { mutableStateOf(true) }
+            var round by remember { mutableStateOf(0) }
+            LaunchedEffect(shown) {
+                if (!shown) { delay(100); round++; shown = true }
+            }
+            if (shown) key(round) {
+                DecoratedWindow(onCloseRequest = ::exitApplication, title = "Noki isolated icon probe", visible = false,
+                    icon = nokiPainterResource("noki/desktop/taskbar.png")) {
+                    val window = checkNotNull(nucleusWindow.unsafe.taoWindow)
+                    WindowsTaskbarIcon(window, false)
+                    LaunchedEffect(window) {
+                        withTimeout(5_000) {
+                            while (window.nativeHandle == 0L) delay(10)
+                            val hwnd = HWND(com.sun.jna.Pointer(window.nativeHandle))
+                            while (User32.INSTANCE.SendMessage(hwnd, 0x7f, WPARAM(0), LPARAM(0)).toLong() == 0L ||
+                                User32.INSTANCE.SendMessage(hwnd, 0x7f, WPARAM(1), LPARAM(0)).toLong() == 0L) delay(10)
+                        }
+                        delay(200)
+                        val hwnd = HWND(com.sun.jna.Pointer(window.nativeHandle))
+                        if (round == 1) {
+                            for (size in 0L..1L) User32.INSTANCE.SendMessage(hwnd, 0x80, WPARAM(size), LPARAM(0))
+                            withTimeout(3_000) {
+                                while (User32.INSTANCE.SendMessage(hwnd, 0x7f, WPARAM(0), LPARAM(0)).toLong() == 0L ||
+                                    User32.INSTANCE.SendMessage(hwnd, 0x7f, WPARAM(1), LPARAM(0)).toLong() == 0L) delay(10)
+                            }
+                        }
+                        check(User32.INSTANCE.SendMessage(hwnd, 0x7f, WPARAM(0), LPARAM(0)).toLong() != 0L)
+                        check(User32.INSTANCE.SendMessage(hwnd, 0x7f, WPARAM(1), LPARAM(0)).toLong() != 0L)
+                        Files.writeString(directory.resolve("verified"), "$round\n", java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)
+                        if (round == 2) exitApplication() else shown = false
                     }
                 }
             }

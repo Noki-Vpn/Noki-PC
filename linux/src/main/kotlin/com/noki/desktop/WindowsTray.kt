@@ -15,7 +15,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.jetbrains.skia.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 
 internal data class DesktopPoint(val x: Int, val y: Int)
@@ -173,18 +172,14 @@ internal suspend fun windowsTaskbarIcon(nativeHandle: () -> Long, light: Boolean
     // Tao returns before its OS window exists; HWND 0 cannot receive WM_SETICON.
     var handle = nativeHandle()
     while (handle == 0L) { delay(10); handle = nativeHandle() }
-    windowsTaskbarIcon(HWND(com.sun.jna.Pointer(handle)), light).use { awaitCancellation() }
+    var repair: () -> Unit = {}
+    windowsTaskbarIcon(HWND(com.sun.jna.Pointer(handle)), light) { repair = it }.use {
+        while (true) { delay(500); if (nativeHandle() == handle) repair() }
+    }
 }
 
 internal suspend fun windowsTaskbarIcon(window: dev.nucleusframework.window.tao.TaoWindow, light: Boolean): Nothing {
-    // Tao owns ICON_SMALL; give it the same artwork without sharing our native ICON_BIG handle.
-    windowsTaskbarImage(light).use { image ->
-        Bitmap().use { bitmap ->
-            val info = ImageInfo(image.width, image.height, ColorType.RGBA_8888, ColorAlphaType.PREMUL)
-            check(bitmap.allocPixels(info) && image.readPixels(bitmap))
-            window.setIcon(image.width, image.height, checkNotNull(bitmap.readPixels(info)))
-        }
-    }
+    // Bind both shell sizes after the real HWND exists; do not depend on a queued Tao icon update.
     windowsTaskbarIcon({ window.nativeHandle }, light)
 }
 
@@ -194,13 +189,22 @@ private fun windowsTaskbarImage(light: Boolean): Image {
     return Image.makeFromEncoded(bytes)
 }
 
-internal fun windowsTaskbarIcon(hwnd: HWND, light: Boolean): AutoCloseable {
+internal fun windowsTaskbarIcon(hwnd: HWND, light: Boolean, onBound: ((() -> Unit) -> Unit)? = null): AutoCloseable {
     val icon = windowsTaskbarImage(light).use(::windowsIcon)
     val user = User32.INSTANCE
-    // Tao sets ICON_SMALL only; Windows 10's taskbar needs ICON_BIG separately.
-    val previous = user.SendMessage(hwnd, 0x80, WPARAM(1), LPARAM(com.sun.jna.Pointer.nativeValue(icon.pointer)))
+    val handle = com.sun.jna.Pointer.nativeValue(icon.pointer)
+    val previous = (0L..1L).associateWith { size -> user.SendMessage(hwnd, 0x80, WPARAM(size), LPARAM(handle)).toLong() }
+    onBound?.invoke {
+        if (user.IsWindow(hwnd)) for (size in 0L..1L) {
+            if (user.SendMessage(hwnd, 0x7f, WPARAM(size), LPARAM(0)).toLong() == 0L)
+                user.SendMessage(hwnd, 0x80, WPARAM(size), LPARAM(handle))
+        }
+    }
     return AutoCloseable {
-        if (user.IsWindow(hwnd)) user.SendMessage(hwnd, 0x80, WPARAM(1), LPARAM(previous.toLong()))
+        if (user.IsWindow(hwnd)) for ((size, old) in previous) {
+            if (user.SendMessage(hwnd, 0x7f, WPARAM(size), LPARAM(0)).toLong() == handle)
+                user.SendMessage(hwnd, 0x80, WPARAM(size), LPARAM(old))
+        }
         user.DestroyIcon(icon)
     }
 }

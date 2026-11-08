@@ -87,8 +87,10 @@ class DesktopUiTest {
             assertNotNull("The home panel must expose connection settings", settings)
             val routing = checkNotNull(text("Маршрутизация"))
             val protocol = all().first { node -> node.config.getOrNull(SemanticsProperties.Text)?.any { it.text.startsWith("Протокол:") } == true }
-            assertEquals(58f, routing.boundsInRoot.center.y - protocol.boundsInRoot.center.y, 1f)
-            assertEquals(58f, settings!!.boundsInRoot.center.y - routing.boundsInRoot.center.y, 1f)
+            assertEquals(62f, routing.boundsInRoot.center.y - protocol.boundsInRoot.center.y, 1f)
+            assertEquals(62f, settings!!.boundsInRoot.center.y - routing.boundsInRoot.center.y, 1f)
+            assertEquals(protocol.boundsInRoot.height, routing.boundsInRoot.height, .1f)
+            assertEquals(protocol.boundsInRoot.height, settings.boundsInRoot.height, .1f)
             screenshot("home-connection-settings")
             click(settings)
             assertNotNull(text("Автовосстановление соединения"))

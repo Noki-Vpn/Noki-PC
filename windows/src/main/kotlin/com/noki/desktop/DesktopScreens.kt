@@ -757,7 +757,7 @@ private fun copyText(value: String, app: DesktopController) {
     val state by app.state.collectAsState()
     PcDialog(tr(state, "Настройки соединения", "Connection settings"), onDismiss,
         dismissLabel = tr(state, "Готово", "Done")) {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) { ConnectionSettingsControls(state, app) }
+        ConnectionSettingsControls(state, app)
         if (state.running) PcText(tr(state, "Изменения соединения применятся при следующем подключении", "Connection changes apply on your next connection"),
             Modifier.padding(12.dp), size = 11, color = DesktopUiKit.Muted)
     }
@@ -765,6 +765,7 @@ private fun copyText(value: String, app: DesktopController) {
 
 @Composable private fun ConnectionSettingsControls(state: DesktopState, app: DesktopController) {
     val settings = state.settings.advancedSettings
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
     PcToggle(tr(state, "Автовосстановление соединения", "Automatic connection recovery"), state.autoRecoveryEnabled, !state.loading,
         help = tr(state, "Если связь пропадёт, Noki попробует подключиться снова.", "If the connection drops, Noki will try to reconnect."), onChange = app::setAutoRecovery)
     PcToggle("Kill switch", settings.killSwitchEnabled, !state.loading,
@@ -782,6 +783,7 @@ private fun copyText(value: String, app: DesktopController) {
             help = tr(state, "Направляет YouTube через отдельный российский сервер. Остальной трафик сохраняет обычный маршрут.", "Routes YouTube through a separate Russian server. Other traffic keeps its usual route.")) { value ->
             app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = value)) }
         }
+    }
     }
 }
 
@@ -1670,7 +1672,7 @@ internal fun openDesktopUrl(value: String) {
             Box(Modifier.matchParentSize().pcConnectionShadow().layerBackdrop(panelBackdrop)
                 .pcGlass(DesktopUiKit.Glass, DesktopUiKit.PanelShape, blurRadius = 63.dp, lightIntensity = .18f, rimWidth = .5.dp, depth = 14.dp, refraction = .73f))
             CompositionLocalProvider(LocalDesktopStyle provides style.copy(backdrop = panelBackdrop)) {
-                Column(Modifier.fillMaxSize().padding(start = 12.dp, end = 12.dp, top = 15.dp, bottom = 10.dp)) {
+                Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 15.dp)) {
                     Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                         PcSurface(Modifier.fillMaxWidth().height(90.dp).pcConnectionShadow(), enabled = !state.loading, onClick = { onPage(DesktopPage.SERVERS) }) {
                             Row(Modifier.fillMaxSize().padding(horizontal = 15.dp), verticalAlignment = Alignment.CenterVertically,
@@ -1715,14 +1717,14 @@ internal fun openDesktopUrl(value: String) {
                             compact = true, glass = true, glassColor = DesktopUiKit.Glass, shape = DesktopUiKit.PanelShape,
                             enabled = !state.loading && !state.settings.advancedSettings.ruRelayEnabled && !state.settings.advancedSettings.gamingModeEnabled,
                             onClick = { onPage(DesktopPage.PROTOCOL) })
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(12.dp))
                         PcSurface(Modifier.padding(start = 1.dp).fillMaxWidth().height(50.dp).pcConnectionShadow(), onClick = { onPage(DesktopPage.ROUTING) }) {
                             Row(Modifier.align(Alignment.Center), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 PcIcon("routing", null, Modifier.size(23.dp, 18.dp))
-                                PcText(tr(state, "Маршрутизация", "Routing"), size = 14)
+                                PcText(tr(state, "Маршрутизация", "Routing"), size = 12)
                             }
                         }
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(12.dp))
                         PcButton(tr(state, "Настройки соединения", "Connection settings"), Modifier.padding(start = 1.dp).fillMaxWidth().height(50.dp).pcConnectionShadow(),
                             compact = true, glass = true, glassColor = DesktopUiKit.Glass, shape = DesktopUiKit.PanelShape,
                             enabled = !state.loading, onClick = onConnectionSettings)

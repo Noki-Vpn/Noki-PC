@@ -1,5 +1,7 @@
 package com.noki.desktop
 
+import androidx.compose.material.icons.automirrored.outlined.HelpOutline
+
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -363,9 +365,8 @@ internal fun Modifier.pcConnectionShadow(): Modifier = drawWithCache {
         Box(Modifier.offset(y = (-4).dp).size(24.dp).pcClickable(role = Role.Button, shape = CircleShape) {
             if (state.isVisible) state.dismiss() else scope.launch { state.show() }
         }.semantics { contentDescription = if (russian) "О функции «$label»" else "About $label" }, contentAlignment = Alignment.Center) {
-            Box(Modifier.size(14.dp).border(1.dp, DesktopUiKit.Muted, CircleShape), contentAlignment = Alignment.Center) {
-                PcText("?", Modifier.clearAndSetSemantics { }, size = 10, lineHeight = 12, color = DesktopUiKit.Muted)
-            }
+            Icon(androidx.compose.material.icons.Icons.AutoMirrored.Outlined.HelpOutline, null,
+                Modifier.size(12.dp).clearAndSetSemantics { }, tint = DesktopUiKit.Muted)
         }
     }
 }

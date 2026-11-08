@@ -174,6 +174,13 @@ internal fun runWindowsPlatformPreflight() {
             check(tray.isRegistered) { "Explorer rejected the tray icon" }
             tray.update(true, AppLanguage.RU)
             check(tray.isRegistered) { "Explorer rejected the tray icon update" }
+            var repairIcons: () -> Unit = {}
+            windowsTaskbarIcon(owner, false) { repairIcons = it }.use {
+                for (size in 0L..1L) user.SendMessage(owner, 0x80, WinDef.WPARAM(size), WinDef.LPARAM(0))
+                repairIcons()
+                for (size in 0L..1L) check(user.SendMessage(owner, 0x7f, WinDef.WPARAM(size), WinDef.LPARAM(0)).toLong() != 0L)
+            }
+            println("platform-preflight: taskbar-icons=ok")
             Memory(40).use { identifier ->
                 identifier.clear(); identifier.setInt(0, 40)
                 identifier.setPointer(8, owner.pointer); identifier.setInt(16, 1)

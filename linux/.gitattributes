@@ -3,3 +3,6 @@ packaging/linux/* text eol=lf
 scripts/build-linux.sh text eol=lf
 scripts/*linux*.py text eol=lf
 gradlew text eol=lf
+vendor/sing-box/LICENSE text eol=lf
+vendor/sing-box/COPYING text eol=lf
+vendor/sing-box/NOTICE text eol=lf

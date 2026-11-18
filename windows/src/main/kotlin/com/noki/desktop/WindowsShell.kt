@@ -21,6 +21,8 @@ import com.sun.jna.ptr.PointerByReference
 import com.sun.jna.ptr.IntByReference
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
+import java.nio.file.StandardCopyOption
 
 internal fun windowsBuildNumber(): Int = Memory(284).use { version ->
     version.clear(); version.setInt(0, 284) // RTL_OSVERSIONINFOEXW.
@@ -284,6 +286,104 @@ internal object WindowsShell {
     private fun <T> apartment(block: () -> T): T {
         checkHr(Ole32.INSTANCE.CoInitializeEx(null, 2).toInt())
         try { return block() } finally { Ole32.INSTANCE.CoUninitialize() }
+    }
+
+    internal fun <T> withShortcut(path: Path?, block: (Pointer, Pointer, Pointer) -> T): T = apartment {
+        val link = create("00021401-0000-0000-C000-000000000046", "000214F9-0000-0000-C000-000000000046")
+        fun query(iid: String): Pointer {
+            val result = PointerByReference()
+            checkHr(callWindowsCom(link, 0, GUID(iid), result))
+            return checkNotNull(result.value)
+        }
+        try {
+            val persisted = query("0000010B-0000-0000-C000-000000000046")
+            try {
+                val store = query("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")
+                try {
+                    if (path != null) checkHr(callWindowsCom(persisted, 5, WString(path.toString()), 2))
+                    block(link, persisted, store)
+                } finally { callWindowsCom(store, 2) }
+            } finally { callWindowsCom(persisted, 2) }
+        } finally { callWindowsCom(link, 2) }
+    }
+
+    internal fun shortcutText(link: Pointer, slot: Int): String = Memory(32768L * Native.WCHAR_SIZE).use { buffer ->
+        buffer.clear()
+        checkHr(when (slot) {
+            3 -> callWindowsCom(link, slot, buffer, 32768, null, 4)
+            16 -> callWindowsCom(link, slot, buffer, 32768, IntByReference())
+            else -> callWindowsCom(link, slot, buffer, 32768)
+        })
+        buffer.getWideString(0)
+    }
+
+    internal fun shortcutAppId(store: Pointer, value: String? = null): String? = Memory(20).use { key ->
+        val guid = GUID("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3")
+        guid.write(); key.write(0, guid.pointer.getByteArray(0, 16), 0, 16); key.setInt(16, 5)
+        Memory(24).use { variant ->
+            variant.clear()
+            if (value == null) {
+                checkHr(callWindowsCom(store, 5, key, variant))
+                try { if (variant.getShort(0).toInt() == 31) variant.getPointer(8)?.getWideString(0) else null }
+                finally { Function.getFunction("ole32", "PropVariantClear", Function.ALT_CONVENTION).invokeInt(arrayOf(variant)) }
+            } else Memory((value.length + 1L) * Native.WCHAR_SIZE).use { text ->
+                text.setWideString(0, value); variant.setShort(0, 31); variant.setPointer(8, text)
+                checkHr(callWindowsCom(store, 6, key, variant)); checkHr(callWindowsCom(store, 7))
+                value
+            }
+        }
+    }
+
+    /** Velopack creates shortcuts; startup only repairs this product's orphan or its own stale icon. */
+    internal fun repairNokiShortcut(currentDirectory: Path,
+        shortcut: Path = Path.of(System.getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Noki Vpn.lnk"),
+        createMissing: Boolean = false): Boolean {
+        val current = currentDirectory.toAbsolutePath().normalize()
+        val root = current.parent ?: return false
+        val stub = root.resolve("Noki Vpn.exe")
+        val icon = current.resolve("Noki.exe")
+        if (current.fileName.toString() != "current" || root.toRealPath() != root || current.toRealPath() != current ||
+            listOf(stub, icon, root.resolve("Update.exe"), current.resolve("sq.version")).any { !Files.isRegularFile(it, NOFOLLOW_LINKS) }) return false
+        val manifest = Files.readString(current.resolve("sq.version"))
+        if (listOf("<id>Noki.Desktop</id>", "<mainExe>Noki.exe</mainExe>", "<shortcutAumid>velopack.Noki.Desktop</shortcutAumid>").any { it !in manifest }) return false
+        val exists = Files.exists(shortcut, NOFOLLOW_LINKS)
+        if (exists && !Files.isRegularFile(shortcut, NOFOLLOW_LINKS)) return false
+        if (!exists && (!createMissing || windowsUninstallCommand(current) == null)) return false
+        return withShortcut(shortcut.takeIf { exists }) { link, persisted, store ->
+            if (exists) {
+                if (shortcutAppId(store) != "velopack.Noki.Desktop") return@withShortcut false
+                val targetText = shortcutText(link, 3)
+                if (!targetText.matches(Regex("^[A-Za-z]:[\\\\/].*"))) return@withShortcut false
+                val target = Path.of(targetText).toAbsolutePath().normalize()
+                if (target != stub && target != icon) {
+                    if (Files.exists(target) || !(target.fileName.toString().equals("Noki Vpn.exe", true) ||
+                        target.fileName.toString().equals("Noki.exe", true) && target.parent?.fileName?.toString() == "current")) return@withShortcut false
+                }
+                val iconIndex = IntByReference()
+                val iconText = Memory(32768L * Native.WCHAR_SIZE).use { buffer ->
+                    checkHr(callWindowsCom(link, 16, buffer, 32768, iconIndex)); buffer.getWideString(0)
+                }
+                if (target == stub && iconText.equals(icon.toString(), true) && iconIndex.value == 0) return@withShortcut false
+                val working = shortcutText(link, 8)
+                if (working.isNotBlank() && working.matches(Regex("^[A-Za-z]:[\\\\/].*")) && !Files.exists(Path.of(working)))
+                    checkHr(callWindowsCom(link, 9, WString(root.toString())))
+            } else {
+                checkHr(callWindowsCom(link, 9, WString(root.toString())))
+                checkHr(callWindowsCom(link, 7, WString("Noki Vpn")))
+                shortcutAppId(store, "velopack.Noki.Desktop")
+            }
+            checkHr(callWindowsCom(link, 20, WString(stub.toString())))
+            checkHr(callWindowsCom(link, 17, WString(icon.toString()), 0))
+            Files.createDirectories(shortcut.parent)
+            val temporary = Files.createTempFile(shortcut.parent, ".noki-shortcut-", ".lnk")
+            try {
+                checkHr(callWindowsCom(persisted, 6, WString(temporary.toString()), 1))
+                Files.move(temporary, shortcut, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } finally { Files.deleteIfExists(temporary) }
+            Function.getFunction("shell32", "SHChangeNotify", Function.ALT_CONVENTION)
+                .invokeVoid(arrayOf(0x2000, 5, WString(shortcut.toString()), null))
+            true
+        }
     }
 
     fun pickPath(owner: Pointer?, title: String, extensions: String?, folder: Boolean, saveName: String? = null): Path? = if (DesktopBuild.IS_LINUX) LinuxPlatform.pickPath(title, folder, saveName) else apartment {

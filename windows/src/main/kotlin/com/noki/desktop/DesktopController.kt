@@ -131,6 +131,7 @@ data class DesktopState(
     val networkBlocked: Boolean = false,
     val youtubeMessage: String? = null,
     val routingRules: List<DesktopRoutingRule> = emptyList(),
+    val latencyRefreshing: Boolean = false,
 ) {
     val servers: List<VpnServer> get() = locations.flatMap { it.servers }.distinctBy { it.id }
     val displayedSettings: StoredSettings get() = if (running) connectionSettings ?: settings else settings
@@ -642,7 +643,11 @@ class DesktopController internal constructor(
         val previousYoutube = previous.advancedSettings.youtubeAdBlockEnabled
         val changed = transform(state.value.settings)
         val advanced = changed.advancedSettings.let {
-            if (it.ruRelayEnabled && !previousRuRelay) it.copy(gamingModeEnabled = false) else it
+            when {
+                it.ruRelayEnabled && !previousRuRelay -> it.copy(gamingModeEnabled = false, multiHop = it.multiHop.copy(enabled = false))
+                it.multiHop.enabled && !previous.advancedSettings.multiHop.enabled -> it.copy(ruRelayEnabled = false)
+                else -> it
+            }
         }
         val normalized = changed.copy(advancedSettings = DomainRulePolicy.normalizeSettings(advanced.normalizeRouteModes()))
         if (preparationSettings(normalized) != preparationSettings(previous)) invalidatePreparation()
@@ -1195,7 +1200,7 @@ class DesktopController internal constructor(
         endpointOptions = emptyList(),
         userProfile = settings.userProfile.copy(serverSelectionMode = ServerSelectionMode.AUTO,
             selectedCountryCode = "", selectedNodeId = "", selectedServerCode = ""),
-        advancedSettings = settings.advancedSettings.copy(protocol = VpnProtocol.AUTO, ruRelayEnabled = false, gamingModeEnabled = false,
+        advancedSettings = settings.advancedSettings.copy(protocol = VpnProtocol.AUTO, gamingModeEnabled = false,
             multiHop = settings.advancedSettings.multiHop.copy(enabled = false), endpointSelectionMode = EndpointSelectionMode.AUTO,
             manualEndpointCode = "", manualEndpointGroupKey = ""),
     )
@@ -1339,7 +1344,7 @@ class DesktopController internal constructor(
         check(networkSnapshot().signature == network.signature) { "Сеть изменилась. Повторите подключение" }
         val multiHop = resolveMultiHop(settings.advancedSettings.multiHop, locations.flatMap { it.servers })
         val nodes: List<VpnServer?> = if (multiHop.enabled) listOf(locations.flatMap { it.servers }.first { it.id == multiHop.entry?.nodeId }) else servers
-        check(nodes.isNotEmpty()) { "Нет доступных серверов для выбранного маршрута" }
+        check(nodes.isNotEmpty()) { unavailableSelection(settings) }
         val geositeBytes = geosites.await()
         var lastFailure: Exception = IllegalStateException("Выбранный протокол недоступен. Выберите другой протокол или Auto")
         for ((index, server) in nodes.withIndex()) {
@@ -1368,8 +1373,9 @@ class DesktopController internal constructor(
         if (completed != true) throw java.net.SocketTimeoutException("Время ожидания подключения истекло")
     }
 
-    private suspend fun connectWithinDeadline(requestedSettings: StoredSettings, onlyNodeId: String?, excludedNodeIds: Set<String>,
+    private suspend fun connectWithinDeadline(originalSettings: StoredSettings, onlyNodeId: String?, excludedNodeIds: Set<String>,
         protectUntilVerified: Boolean): Unit = coroutineScope {
+        val requestedSettings = withCurrentAutoExclusions(originalSettings)
         val requestedAt = monotonicMillis()
         check(!state.value.running) { "VPN уже запущен" }
         val publishSelection = requestedSettings == state.value.settings
@@ -1650,7 +1656,8 @@ class DesktopController internal constructor(
         var leaseTimer: Job? = null
         var createAttempted = false
         var nodeSamples: List<RuRelayRttSample>? = null
-        val requestId = java.util.UUID.randomUUID().toString()
+        var requestId = java.util.UUID.randomUUID().toString()
+        var identityRecreates = 0
         var retryMillis = 2_000L
         suspend fun receive(previous: BackendYoutubeAccess?, renewal: Boolean = false,
                             call: suspend () -> BackendYoutubeAccess): BackendYoutubeAccess = withContext(NonCancellable) {
@@ -1743,6 +1750,22 @@ class DesktopController internal constructor(
                                     break
                                 } catch (cancelled: CancellationException) { throw cancelled }
                                 catch (error: Exception) {
+                                    if (error is BackendException && error.statusCode == 409 && error.message == "youtube_wireguard_identity_changed") {
+                                        if (identityRecreates >= 2) throw error
+                                        identityRecreates++
+                                        leaseTimer?.cancel()
+                                        apply(null, tr(state.value, "Подготавливаем канал YouTube. YouTube пока заблокирован",
+                                            "Preparing the YouTube channel. YouTube is blocked for now"))
+                                        withContext(NonCancellable) {
+                                            youtubeGrantId = null
+                                            revokeYoutubePending()
+                                        }
+                                        grant = null
+                                        nodeSamples = null
+                                        createAttempted = false
+                                        requestId = java.util.UUID.randomUUID().toString()
+                                        break
+                                    }
                                     if (!BackendRetryPolicy.isTransient(error)) throw error
                                     delay(retryMillis); retryMillis = (retryMillis * 2).coerceAtMost(30_000)
                                 }
@@ -1770,8 +1793,11 @@ class DesktopController internal constructor(
                 }
             }
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { apply(null, tr(state.value,
-            "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
+        catch (error: Exception) {
+            recordDiagnosticFailure("youtube_access_failed", error, "vpn")
+            apply(null, tr(state.value,
+                "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked"))
+        }
         finally {
             leaseTimer?.cancel()
             keyBytes?.fill(0)
@@ -2006,6 +2032,10 @@ class DesktopController internal constructor(
         val user = state.value.user?.id
         check(user == null || cached.optString("user_id").ifBlank { user } == user) { "Аккаунт соединения изменился" }
         val settings = vault.decodeSettings(cached.getString("settings"))
+        if (settings.userProfile.serverSelectionMode == ServerSelectionMode.AUTO) {
+            val server = state.value.servers.firstOrNull { it.id == cached.optString("server_id") } ?: return false
+            if (EndpointRankingPolicy.isAutoExcluded(server, withCurrentAutoExclusions(settings).userProfile)) return false
+        }
         if (!VpnProfileValidator.isUsable(settings.profile, settings.advancedSettings)) return false
         if (settings.profile.entryRoute && (settings.profile.entryRouteExpiresAt ?: 0L) <= System.currentTimeMillis()) return false
         // RU authorization must be reissued by its control plane; never reuse a revoked lease.
@@ -2198,7 +2228,7 @@ class DesktopController internal constructor(
             val inventory = authorized { api.ruRelayCatalog(it, device.id, vault.deviceKey) }
             val permittedExits = ruExits(requestedSettings, inventory.foreignNodes)
                 .filter { it.id !in excludedNodeIds && (onlyNodeId == null || it.id == onlyNodeId) }
-            check(permittedExits.isNotEmpty()) { "ru_relay_pair_unavailable" }
+            check(permittedExits.isNotEmpty()) { unavailableSelection(requestedSettings) }
             val ingress = inventory.relays.filter { it.available && it.pairReady }.map { relay ->
                 VpnServer(relay.id, relay.name, "RU", "RU", relay.probeHost.orEmpty(), relay.probePort, true,
                     weight = relay.weight, metricsAt = relay.metricsAt, probeHost = relay.probeHost, probeIp = relay.probeIp)
@@ -2220,7 +2250,8 @@ class DesktopController internal constructor(
             var lastFailure: Exception = IllegalStateException("ru_relay_pair_unavailable")
             for (relay in relays) {
                 val credential = try {
-                    if (cachedCredential?.relayNodeId == relay.id) cachedCredential else {
+                    if (cachedCredential?.relayNodeId == relay.id && inventory.relays.first { it.id == relay.id }.wireguardEndpoint == cachedCredential.wireguard.endpoint)
+                        cachedCredential else {
                         if (keyId == null) keyId = withDeviceProof(device.id) { token, nonce, signature ->
                             api.registerRuWireGuardKey(token, device.id, vault.deviceKey, nonce, signature, keys.second).id
                         }
@@ -2489,7 +2520,23 @@ class DesktopController internal constructor(
         }
     }
 
-    suspend fun refreshServerLatencies() = withContext(Dispatchers.IO) { refreshClientLatencies(force = true) }
+    private fun withCurrentAutoExclusions(settings: StoredSettings): StoredSettings =
+        if (settings.userProfile.serverSelectionMode != ServerSelectionMode.AUTO) settings else settings.copy(userProfile = settings.userProfile.copy(
+            autoExcludedCountryCodes = state.value.settings.userProfile.autoExcludedCountryCodes,
+            autoExcludedNodeIds = state.value.settings.userProfile.autoExcludedNodeIds))
+
+    private fun unavailableSelection(settings: StoredSettings): String =
+        if (settings.userProfile.serverSelectionMode == ServerSelectionMode.AUTO &&
+            (settings.userProfile.autoExcludedCountryCodes.isNotEmpty() || settings.userProfile.autoExcludedNodeIds.isNotEmpty()))
+            "Для автовыбора не осталось серверов. Верните хотя бы один сервер и его страну в настройках автовыбора."
+        else "Нет доступных серверов для выбранного маршрута"
+
+    suspend fun refreshServerLatencies(selectedNodeOnly: Boolean = false) = withContext(Dispatchers.IO) {
+        latencyJob?.cancelAndJoin()
+        val job = refreshClientLatencies(force = true, selectedNodeOnly = selectedNodeOnly)
+        job?.join()
+        job != null && !job.isCancelled
+    }
 
     private suspend fun measureSelectionNodes(nodes: List<VpnServer>, network: WindowsNetworkSnapshot): List<VpnServer> {
         if (!network.available || nodes.isEmpty()) return nodes.map { it.copy(latencyMs = null) }
@@ -2499,43 +2546,71 @@ class DesktopController internal constructor(
         return nodes.map { node -> node.copy(latencyMs = ServerLocationMapper.latencyTargetKey(node)?.let(samples::get)) }
     }
 
-    @Synchronized private fun refreshClientLatencies(force: Boolean = false) {
-        if (latencyJob?.isActive == true) return
-        if (!windowVisible && !force) return
-        if (state.value.connecting) return
-        val owner = attempt() ?: return
+    @Synchronized private fun refreshClientLatencies(force: Boolean = false, selectedNodeOnly: Boolean = false): Job? {
+        if (latencyJob?.isActive == true) { if (!force) return null else latencyJob?.cancel() }
+        if (!windowVisible && !force) return null
+        if (state.value.connecting) return null
+        val owner = attempt() ?: return null
         val network = try { networkSnapshot() }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { recordDiagnosticFailure("latency_network_read_failed", error, "vpn"); return }
-        val locations = state.value.connectionLocations
-        val ruRelay = state.value.settings.advancedSettings.ruRelayEnabled
-        fun target(state: DesktopState) = state.connectionLocations.filter { it.isOnline }.flatMap { location ->
+            catch (error: Exception) { recordDiagnosticFailure("latency_network_read_failed", error, "vpn"); return null }
+        fun ruMode(state: DesktopState) = (if (selectedNodeOnly) state.displayedSettings else state.settings).advancedSettings.ruRelayEnabled
+        val ruRelay = ruMode(state.value)
+        val locations = state.value.locationsFor(ruRelay)
+        val selectedId = state.value.selectedServerId
+        fun target(state: DesktopState) = state.locationsFor(ruMode(state)).filter { it.isOnline }.flatMap { location ->
             if (location.servers.isEmpty()) listOf(ServerLocationMapper.latencyTargetKey(location))
-            else location.servers.filter { it.isOnline }.map { ServerLocationMapper.latencyTargetKey(it) }
+            else location.servers.filter { it.isOnline && (!selectedNodeOnly || it.id == state.selectedServerId) }.map { ServerLocationMapper.latencyTargetKey(it) }
         }.toSet()
         val requestedTarget = target(state.value)
-        if (!network.available || locations.isEmpty()) return
+        if (!network.available || (!force && locations.isEmpty())) return null
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val ownJob = currentCoroutineContext()[Job]
+            mutable.update { old ->
+                if (!force) old.copy(latencyRefreshing = true) else old.copy(latencyRefreshing = true,
+                    locations = if (ruRelay) old.locations else old.locations.map { location ->
+                        val retained = location.servers.filterNot { !selectedNodeOnly || it.id == selectedId }.mapNotNull { server ->
+                            server.latencyMs?.let { latency -> ServerLocationMapper.latencyTargetKey(server)?.let { it to latency } }
+                        }.toMap()
+                        ServerLocationMapper.withLatencies(location, retained)
+                    },
+                    ruForeignNodes = if (!ruRelay) old.ruForeignNodes else old.ruForeignNodes.map { node ->
+                        if (!selectedNodeOnly || node.id == selectedId) node.copy(latencyMs = null) else node
+                    })
+            }
             try {
-                val samples = latencySampler(network).measure(locations)
+                var foreign = state.value.ruForeignNodes
+                var catalog: List<BackendLocation>? = null
+                val freshLocations = if (!force) locations else if (ruRelay) {
+                    foreign = authorized { api.ruRelayCatalog(it, vault.deviceId, vault.deviceKey) }.foreignNodes
+                    state.value.copy(ruForeignNodes = foreign).locationsFor(true)
+                } else {
+                    catalog = authorized { api.serverLocations(it, vault.deviceId, vault.deviceKey) }
+                    ServerLocationMapper.mapLocations(checkNotNull(catalog), state.value.language, emptyMap())
+                }
+                val targets = if (!selectedNodeOnly) freshLocations else freshLocations.map {
+                    it.copy(servers = it.servers.filter { server -> server.id == selectedId })
+                }.filter { it.servers.isNotEmpty() }
+                val samples = latencySampler(network).measure(targets)
                 currentCoroutineContext().ensureActive()
                 synchronized(this@DesktopController) {
                     if (latencyJob !== ownJob || !current(owner) || state.value.connecting ||
-                        state.value.settings.advancedSettings.ruRelayEnabled != ruRelay ||
+                        ruMode(state.value) != ruRelay ||
                         networkSnapshot().signature != network.signature || target(state.value) != requestedTarget) return@launch
-                    val serverKeys = locations.flatMap { it.servers }.associate { it.id to ServerLocationMapper.latencyTargetKey(it) }
+                    val serverKeys = freshLocations.flatMap { it.servers }.associate { it.id to ServerLocationMapper.latencyTargetKey(it) }
+                    catalog?.let { catalogLocations = it }
                     mutable.update { old ->
-                        if (!current(owner) || old.connecting || old.settings.advancedSettings.ruRelayEnabled != ruRelay ||
+                        if (!current(owner) || old.connecting || ruMode(old) != ruRelay ||
                             target(old) != requestedTarget) old else {
-                            val keepPrevious = old.running && network.signature == lastNetwork?.signature
-                            val measured = if (!keepPrevious) samples else old.servers.mapNotNull { server ->
+                            val keepPrevious = (!force && old.running || selectedNodeOnly) && network.signature == lastNetwork?.signature
+                            val measured = if (!keepPrevious) samples else old.locationsFor(ruRelay).flatMap { it.servers }
+                                .filterNot { force && selectedNodeOnly && it.id == selectedId }.mapNotNull { server ->
                                 server.latencyMs?.let { latency -> ServerLocationMapper.latencyTargetKey(server)?.let { it to latency } }
                             }.toMap() + samples
                             old.copy(
-                                locations = if (ruRelay) old.locations else old.locations.map { ServerLocationMapper.withLatencies(it, measured) },
-                                ruForeignNodes = if (!ruRelay) old.ruForeignNodes else old.ruForeignNodes.map { node ->
-                                    node.copy(latencyMs = serverKeys[node.id]?.let(samples::get) ?: node.latencyMs.takeIf { keepPrevious })
+                                locations = if (ruRelay) old.locations else freshLocations.map { ServerLocationMapper.withLatencies(it, measured) },
+                                ruForeignNodes = if (!ruRelay) old.ruForeignNodes else foreign.map { node ->
+                                    node.copy(latencyMs = serverKeys[node.id]?.let(measured::get))
                                 })
                         }
                     }
@@ -2546,11 +2621,13 @@ class DesktopController internal constructor(
             finally {
                 synchronized(this@DesktopController) { if (latencyJob === ownJob) {
                     latencyJob = null
+                    mutable.update { it.copy(latencyRefreshing = false) }
                 } }
             }
         }
         latencyJob = job
         job.start()
+        return job
     }
 
     private suspend fun <T> authorized(block: suspend (String) -> T): T {

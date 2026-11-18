@@ -17,6 +17,75 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 class WindowsUpdatesTest {
+    @Test fun `Noki shortcut repair preserves metadata is idempotent and leaves another live installation alone`() {
+        val root = Files.createTempDirectory("noki-shortcut-owner").toRealPath()
+        try {
+            val current = shortcutRoot(root.resolve("portable"), portable = true)
+            val link = root.resolve("Noki Vpn.lnk")
+            val missing = root.resolve("removed/current/Noki.exe")
+            WindowsShell.withShortcut(null) { shell, persisted, store ->
+                assertEquals(0, callWindowsCom(shell, 20, com.sun.jna.WString(missing.toString())))
+                callWindowsCom(shell, 11, com.sun.jna.WString("--tray"))
+                callWindowsCom(shell, 7, com.sun.jna.WString("My Noki shortcut"))
+                callWindowsCom(shell, 13, 0x024e.toShort())
+                callWindowsCom(shell, 15, 3)
+                WindowsShell.shortcutAppId(store, "velopack.Noki.Desktop")
+                assertEquals(0, callWindowsCom(persisted, 6, com.sun.jna.WString(link.toString()), 1))
+            }
+            assertTrue(WindowsShell.repairNokiShortcut(current, link))
+            val repaired = Files.readAllBytes(link)
+            WindowsShell.withShortcut(link) { shell, _, store ->
+                assertEquals(current.parent.resolve("Noki Vpn.exe").toString(), WindowsShell.shortcutText(shell, 3))
+                assertEquals(current.resolve("Noki.exe").toString(), WindowsShell.shortcutText(shell, 16))
+                assertEquals("--tray", WindowsShell.shortcutText(shell, 10))
+                assertEquals("My Noki shortcut", WindowsShell.shortcutText(shell, 6))
+                assertEquals("velopack.Noki.Desktop", WindowsShell.shortcutAppId(store))
+                com.sun.jna.Memory(4).use { value ->
+                    callWindowsCom(shell, 12, value); assertEquals(0x024e, value.getShort(0).toInt())
+                    callWindowsCom(shell, 14, value); assertEquals(3, value.getInt(0))
+                }
+            }
+            assertFalse(WindowsShell.repairNokiShortcut(current, link))
+            assertArrayEquals(repaired, Files.readAllBytes(link))
+            val other = shortcutRoot(root.resolve("other"), portable = false)
+            assertFalse(WindowsShell.repairNokiShortcut(other, link, createMissing = true))
+            assertArrayEquals(repaired, Files.readAllBytes(link))
+            WindowsShell.withShortcut(link) { _, persisted, store ->
+                WindowsShell.shortcutAppId(store, "Other.Application")
+                callWindowsCom(persisted, 6, com.sun.jna.WString(link.toString()), 1)
+            }
+            val foreign = Files.readAllBytes(link)
+            assertFalse(WindowsShell.repairNokiShortcut(current, link))
+            assertArrayEquals(foreign, Files.readAllBytes(link))
+        } finally { Files.walk(root).use { it.sorted(Comparator.reverseOrder()).forEach(Files::delete) } }
+    }
+
+    @Test fun `Noki shortcut creation requires an owned installed root and fresh portable creates nothing`() {
+        val root = Files.createTempDirectory("noki-shortcut-install").toRealPath()
+        try {
+            val portable = shortcutRoot(root.resolve("portable"), portable = true)
+            val link = root.resolve("Noki Vpn.lnk")
+            assertFalse(WindowsShell.repairNokiShortcut(portable, link, createMissing = true))
+            assertFalse(Files.exists(link))
+            val installed = shortcutRoot(root.resolve("installed"), portable = false)
+            assertFalse(WindowsShell.repairNokiShortcut(installed, link))
+            assertTrue(WindowsShell.repairNokiShortcut(installed, link, createMissing = true))
+            assertFalse(WindowsShell.repairNokiShortcut(installed, link, createMissing = true))
+            WindowsShell.withShortcut(link) { shell, _, store ->
+                assertEquals(installed.parent.resolve("Noki Vpn.exe").toString(), WindowsShell.shortcutText(shell, 3))
+                assertEquals("velopack.Noki.Desktop", WindowsShell.shortcutAppId(store))
+            }
+        } finally { Files.walk(root).use { it.sorted(Comparator.reverseOrder()).forEach(Files::delete) } }
+    }
+
+    private fun shortcutRoot(root: Path, portable: Boolean): Path {
+        val current = Files.createDirectories(root.resolve("current"))
+        Files.writeString(current.resolve("sq.version"), "<package><id>Noki.Desktop</id><mainExe>Noki.exe</mainExe><shortcutAumid>velopack.Noki.Desktop</shortcutAumid></package>")
+        for (file in listOf(root.resolve("Noki Vpn.exe"), root.resolve("Update.exe"), current.resolve("Noki.exe"))) Files.write(file, byteArrayOf(77, 90))
+        Files.write(root.resolve(if (portable) ".portable" else "unins000.exe"), byteArrayOf())
+        return current
+    }
+
     private fun native() = VelopackNative(Path.of("build/tools/velopack_libc_win_x64_msvc.dll"))
 
     @Test fun `uninstall skips the system idle process while enumerating Windows processes`() {

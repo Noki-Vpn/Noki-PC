@@ -241,14 +241,15 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
 
     private val settingsCodec = StoredSettingsCodec {
         DefaultStoredSettingsFactory.create().copy(filterMode = AppFilterMode.ALL_APPS, selectedPackages = emptySet(),
-            advancedSettings = AdvancedSettings(), securitySettings = SecuritySettings(biometricEnabled = false))
+            advancedSettings = AdvancedSettings(ruRelayEnabled = true), securitySettings = SecuritySettings(biometricEnabled = false))
     }
 
     fun loadSettings(): StoredSettings {
         var raw = readEncrypted("settings.dpapi")
-        raw?.let(::JSONObject)?.takeIf { it.optInt("desktop_ru_relay_reset_version") < 1 }?.let { legacy ->
-            if (legacy.optJSONObject("multiHopSettings")?.optBoolean("enabled") != true) legacy.put("ruRelayEnabled", false)
-            legacy.put("desktop_ru_relay_reset_version", 1)
+        raw?.let(::JSONObject)?.takeIf { it.optInt("desktop_ru_relay_default_version") < 1 }?.let { legacy ->
+            legacy.put("ruRelayEnabled", true)
+            legacy.optJSONObject("multiHopSettings")?.put("enabled", false)
+            legacy.put("desktop_ru_relay_default_version", 1)
             raw = legacy.toString()
             writeEncrypted("settings.dpapi", checkNotNull(raw))
         }
@@ -270,6 +271,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
                 } }
             val migrated = settings.copy(advancedSettings = settings.advancedSettings.copy(alwaysOnDomains = emptyList(), bypassDomains = emptyList()))
             writeEncrypted("settings.dpapi", JSONObject(settingsCodec.encode(migrated))
+                .put("desktop_ru_relay_default_version", 1)
                 .put("desktop_auto_recovery", json.optBoolean("desktop_auto_recovery", true))
                 .put("desktop_reduced_motion", json.optBoolean("desktop_reduced_motion"))
                 .put("desktop_earth_disabled", json.optBoolean("desktop_earth_disabled"))
@@ -294,6 +296,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
         return settings
     }
     fun saveSettings(settings: StoredSettings) = writeEncrypted("settings.dpapi", JSONObject(settingsCodec.encode(settings))
+        .put("desktop_ru_relay_default_version", 1)
         .put("desktop_auto_recovery", loadAutoRecovery())
         .put("desktop_reduced_motion", loadReducedMotion())
         .put("desktop_earth_disabled", loadEarthDisabled())
@@ -321,6 +324,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
                 require(file.parent == directory.toAbsolutePath().normalize() && Files.isRegularFile(file)) { "Файл списка не найден. Добавьте его заново" }
         }
         writeEncrypted("settings.dpapi", JSONObject(settingsCodec.encode(loadSettings()))
+            .put("desktop_ru_relay_default_version", 1)
             .put("desktop_auto_recovery", loadAutoRecovery())
             .put("desktop_reduced_motion", loadReducedMotion())
             .put("desktop_earth_disabled", loadEarthDisabled())

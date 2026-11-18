@@ -19,6 +19,180 @@ import java.util.concurrent.CopyOnWriteArrayList
 import okio.Buffer
 
 class DesktopConnectionTest {
+    @Test fun `RU and MultiHop toggles are exclusive and keep both chosen hops`() = runBlocking {
+        Fixture(nodeCount = 2).use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            val nodes = f.app.state.value.servers
+            val hops = MultiHopSettings(true, HopSelection(ServerSelectionMode.SERVER, nodeId = nodes[0].id),
+                HopSelection(ServerSelectionMode.SERVER, nodeId = nodes[1].id))
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(multiHop = hops)) }.join()
+            assertFalse(f.app.state.value.settings.advancedSettings.ruRelayEnabled)
+            assertEquals(hops, f.app.state.value.settings.advancedSettings.multiHop)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            assertTrue(f.app.state.value.settings.advancedSettings.ruRelayEnabled)
+            assertEquals(hops.copy(enabled = false), f.app.state.value.settings.advancedSettings.multiHop)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(multiHop = hops)) }.join()
+            assertFalse(f.app.state.value.settings.advancedSettings.ruRelayEnabled)
+            assertEquals(hops, f.app.state.value.settings.advancedSettings.multiHop)
+            assertTrue(f.runtime.starts.isEmpty())
+        }
+    }
+
+    @Test fun `automatic launch preserves RU preference and never falls back to direct when relays fail`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            val original = f.app.state.value.settings
+            for (enabled in listOf(true, false)) {
+                val launch = f.app.automaticLaunchSettings(original.copy(advancedSettings = original.advancedSettings.copy(ruRelayEnabled = enabled)))
+                assertEquals(enabled, launch.advancedSettings.ruRelayEnabled)
+            }
+            f.app.updateSettings { f.app.automaticLaunchSettings(it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true))) }.join()
+            f.relayIds.forEach { f.ruEnrollStatus[it] = 503 }
+            f.connect()
+            assertFalse(f.app.state.value.running)
+            assertTrue(f.sessionRequests.isEmpty())
+            assertTrue(f.runtime.starts.isEmpty())
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = false)) }.join()
+            f.connect()
+            assertTrue(f.app.state.value.verified)
+            assertEquals(1, f.sessionRequests.size)
+        }
+    }
+
+    @Test fun `YouTube endpoint promotion revokes then recreates with a fresh request id and a bounded budget`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.youtubeLeaseSeconds = 2
+            f.youtubeIdentityFailures.set(3)
+            f.connect(); f.enableYoutube()
+            withTimeout(20_000) { while (f.youtubeRenewCalls.get() < 3 || f.app.state.value.youtubeMessage?.contains("недоступен") != true) delay(20) }
+            val creates = f.youtubeRequests.filter { it.method == "POST" && it.url.encodedPath == "/v1/vpn/youtube-access" }
+            assertEquals(3, creates.size)
+            val ids = creates.map { request -> Buffer().also { request.body!!.writeTo(it) }.readUtf8().let(::JSONObject).getString("request_id") }
+            assertEquals(3, ids.toSet().size)
+            val lifecycle = f.youtubeRequests.filter { it.method == "DELETE" || it.url.encodedPath == "/v1/vpn/youtube-access" }.map { it.method }
+            assertEquals(listOf("POST", "DELETE", "POST", "DELETE", "POST"), lifecycle.take(5))
+            assertEquals(1, f.sessionRequests.size)
+            assertTrue(f.app.state.value.running)
+            assertTrue(f.app.state.value.verified)
+            assertNull(youtubeEndpoint(f.runtime.starts.last()))
+        }
+    }
+
+    @Test fun `RU cached credential needs the same confirmed endpoint and old catalogs still enroll`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            f.probeLatencies["8.8.8.8"] = 10; f.probeLatencies["1.1.1.1"] = 400
+            suspend fun cycle() {
+                f.connect(); assertTrue(f.app.state.value.message, f.app.state.value.verified)
+                f.app.disconnect(); withTimeout(5_000) { f.app.state.first { !it.loading && !it.running } }
+            }
+            cycle(); cycle()
+            assertEquals(1, f.ruEntryRequests.size)
+            f.ruEndpoint = "1.0.0.1:51820"
+            cycle()
+            assertEquals(2, f.ruEntryRequests.size)
+            assertEquals(f.ruEndpoint, JSONObject(checkNotNull(f.vault.readEncrypted("ru-entry.dpapi"))).getJSONObject("wireguard").getString("endpoint"))
+            f.ruEndpointConfirmed = false
+            cycle()
+            assertEquals(3, f.ruEntryRequests.size)
+        }
+    }
+
+    @Test fun `Auto exclusions apply to recovery cache and fallback without moving a healthy session`() = runBlocking {
+        Fixture(nodeCount = 2).use { f ->
+            f.ready(); f.app.setWindowVisible(false); f.connect()
+            val original = f.app.state.value.selectedServerId
+            val starts = f.runtime.starts.size
+            f.app.updateSettings { it.copy(userProfile = it.userProfile.copy(autoExcludedNodeIds = setOf(original))) }.join()
+            assertEquals(starts, f.runtime.starts.size)
+            assertEquals(original, f.app.state.value.selectedServerId)
+            f.runtime.failProbes.set(2)
+            f.app.verifyConnection()
+            withTimeout(5_000) { f.app.state.first { !it.verified } }
+            f.app.verifyConnection()
+            withTimeout(15_000) { f.app.state.first { !it.loading && it.verified && it.selectedServerId != original } }
+            assertEquals(starts + 1, f.runtime.starts.size)
+            assertNotEquals(original, f.runtime.active?.serverId)
+        }
+    }
+
+    @Test fun `all Auto candidates excluded give a clear result without admission or manual fallback`() = runBlocking {
+        Fixture(nodeCount = 2).use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = ServerSelectionMode.AUTO,
+                autoExcludedCountryCodes = setOf("DE"))) }.join()
+            val admissions = f.sessionRequests.size
+            f.connect()
+            assertFalse(f.app.state.value.running)
+            assertTrue(f.app.state.value.message.orEmpty().contains("автовыбора"))
+            assertEquals(admissions, f.sessionRequests.size)
+            assertTrue(f.runtime.starts.isEmpty())
+            val id = f.app.state.value.servers.first().id
+            f.app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = ServerSelectionMode.SERVER, selectedNodeId = id)) }.join()
+            f.connect()
+            assertTrue(f.app.state.value.verified)
+            assertEquals(id, f.app.state.value.selectedServerId)
+        }
+    }
+
+    @Test fun `RU physical refresh measures the selected foreign node and keeps YouTube independent`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true, errorLogsEnabled = true)) }.join()
+            f.connect(); f.enableYoutube(); f.awaitYoutubeReady()
+            val starts = f.runtime.starts.size
+            val grants = f.youtubeCreateCalls.get()
+            f.probedHosts.clear()
+            f.probeLatencies["9.9.9.9"] = 31
+            f.app.refreshServerLatencies(selectedNodeOnly = true)
+            assertEquals(31L, f.app.state.value.latencyMs)
+            assertEquals(31, f.app.state.value.connectionLocations.single().latencyMs)
+            assertEquals(setOf("9.9.9.9"), f.probedHosts.toSet())
+            f.ruForeignProbeAvailable = false
+            f.probedHosts.clear()
+            f.app.refreshServerLatencies(selectedNodeOnly = true)
+            assertNull(f.app.state.value.latencyMs)
+            assertTrue(f.probedHosts.isEmpty())
+            assertEquals(starts, f.runtime.starts.size)
+            assertEquals(grants, f.youtubeCreateCalls.get())
+            assertTrue(f.app.state.value.verified)
+        }
+    }
+
+    @Test fun `manual physical refresh replaces an in flight sample instead of waiting for its cache`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            val gate = java.util.concurrent.CountDownLatch(1)
+            f.tcpProbeGate = gate
+            val first = launch { f.measureLatencies() }
+            try {
+                withTimeout(3_000) { while (f.tcpCalls.get() == 0) delay(10) }
+                f.tcpProbeGate = null
+                f.tcpLatency.set(77)
+                withTimeout(3_000) { f.measureLatencies() }
+                assertEquals(77, f.app.state.value.servers.single().latencyMs)
+            } finally { gate.countDown(); first.cancelAndJoin() }
+        }
+    }
+
+    @Test fun `manual physical refresh clears failed evidence without replacing active YouTube or VPN`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.connect(); f.enableYoutube(); f.awaitYoutubeReady()
+            f.tcpLatency.set(42); f.measureLatencies()
+            assertEquals(42L, f.app.state.value.latencyMs)
+            val starts = f.runtime.starts.size
+            val grants = f.youtubeCreateCalls.get()
+            f.tcpLatency.set(-1); f.measureLatencies()
+            assertNull(f.app.state.value.latencyMs)
+            assertEquals(starts, f.runtime.starts.size)
+            assertEquals(grants, f.youtubeCreateCalls.get())
+            assertTrue(f.app.state.value.verified)
+        }
+    }
+
     @Test fun `RU enrollment retries unavailable relay but preserves authorization failure and explicit exit`() = runBlocking {
         for (status in listOf(503, 403)) Fixture().use { f ->
             f.ready()
@@ -2103,14 +2277,19 @@ class DesktopConnectionTest {
         val ruCatalogCalls = AtomicInteger()
         val ruEntryRequests = CopyOnWriteArrayList<JSONObject>()
         val ruEnrollStatus = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        @Volatile var ruForeignProbeAvailable = true
+        @Volatile var ruEndpoint = "8.8.4.4:51820"
+        @Volatile var ruEndpointConfirmed = true
         val relayIds = listOf("33333333-3333-4333-8333-333333333331", "33333333-3333-4333-8333-333333333332")
         val foreignId = "55555555-5555-4555-8555-555555555555"
         val probeLatencies = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        @Volatile var tcpProbeGate: java.util.concurrent.CountDownLatch? = null
         val probesWhileActive = CopyOnWriteArrayList<String>()
         val probedHosts = CopyOnWriteArrayList<String>()
         val wireGuardRegistrationCalls = AtomicInteger()
         val youtubePollCalls = AtomicInteger()
         val youtubeRenewCalls = AtomicInteger()
+        val youtubeIdentityFailures = AtomicInteger()
         val youtubeRevokeCalls = AtomicInteger()
         val ruRevokeCalls = AtomicInteger()
         @Volatile var ruRevokeGate: java.util.concurrent.CountDownLatch? = null
@@ -2122,7 +2301,7 @@ class DesktopConnectionTest {
         private var challengeNonce: String? = null
         private val deviceId = "22222222-2222-4222-8222-222222222222"
         private val youtubeKeyId = "11111111-1111-4111-8111-111111111111"
-        private val youtubeGrantId = "44444444-4444-4444-8444-444444444444"
+        private var youtubeGrantId = "44444444-4444-4444-8444-444444444444"
         @Volatile var youtubeCreatePending = false
         @Volatile var youtubeReadyKeyId: String? = null
         @Volatile var youtubePendingAfterRenew = false
@@ -2216,10 +2395,12 @@ class DesktopConnectionTest {
                     ruCatalogCalls.incrementAndGet()
                     JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL).put("exit_node_id", JSONObject.NULL)
                         .put("foreign_nodes", JSONArray().put(JSONObject().put("id", foreignId).put("name", "DE exit").put("country_code", "DE")
-                            .put("probe_host", "9.9.9.9").put("probe_port", 443).put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString())))
+                            .put("probe_host", if (ruForeignProbeAvailable) "9.9.9.9" else JSONObject.NULL).put("probe_port", if (ruForeignProbeAvailable) 443 else JSONObject.NULL)
+                            .put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString())))
                         .put("relays", JSONArray(relayIds.mapIndexed { index, id -> JSONObject().put("id", id).put("name", "RU $index")
                             .put("country_code", "RU").put("available", true).put("pair_ready", true)
                             .put("probe_host", if (index == 0) "8.8.8.8" else "1.1.1.1").put("probe_port", 443)
+                            .put("wireguard_endpoint", if (ruEndpointConfirmed) ruEndpoint else JSONObject.NULL)
                             .put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString()) }))
                 }
                 "/v1/vpn/ru-entry" -> {
@@ -2228,7 +2409,7 @@ class DesktopConnectionTest {
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
                     JSONObject().put("relay_node_id", payload.getString("relay_node_id")).put("route_gateway", "10.240.3.1")
                         .put("expires_at", java.time.Instant.now().plusSeconds(600).toString()).put("wireguard", JSONObject()
-                            .put("endpoint", "192.0.2.50:51820").put("address", "10.240.3.2/32")
+                            .put("endpoint", ruEndpoint).put("address", "10.240.3.2/32")
                             .put("server_public_key", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 }))
                             .put("mtu", 1280).put("dns", JSONArray().put("1.1.1.1")).put("allowed_ips", JSONArray().put("0.0.0.0/0")))
                 }
@@ -2249,6 +2430,7 @@ class DesktopConnectionTest {
                     synchronized(proofLock) {
                         val requestId = payload.getString("request_id")
                         if (youtubeRequestId != requestId) {
+                            if (youtubeRequestId != null) youtubeGrantId = java.util.UUID.randomUUID().toString()
                             youtubeRequestId = requestId
                             youtubeGeneration = 1
                             youtubeExpiresAt = System.currentTimeMillis() + youtubeLeaseSeconds * 1_000
@@ -2283,6 +2465,10 @@ class DesktopConnectionTest {
                     youtubeRequests += request
                     youtubeRenewCalls.incrementAndGet()
                     if (!consumeProof(request.header("X-Device-Nonce"))) status = 403
+                    if (youtubeIdentityFailures.getAndUpdate { (it - 1).coerceAtLeast(0) } > 0) {
+                        status = 409
+                        JSONObject().put("detail", "youtube_wireguard_identity_changed")
+                    } else {
                     synchronized(proofLock) {
                         if (youtubeStatus == "blocked") status = 409 else when (payload.getInt("generation")) {
                             youtubeGeneration -> {
@@ -2295,6 +2481,7 @@ class DesktopConnectionTest {
                         }
                     }
                     youtubeResponse()
+                    }
                 }
                 "/v1/vpn/session" -> {
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
@@ -2334,11 +2521,13 @@ class DesktopConnectionTest {
         init {
             vault.deviceId = deviceId
             vault.saveTokens(BackendAuthTokens("fixture-access", null))
+            vault.saveSettings(vault.loadSettings().let { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = false)) })
             if (!automaticLogs) vault.saveSettings(vault.loadSettings().let {
                 it.copy(advancedSettings = it.advancedSettings.copy(anonymousLogsEnabled = false))
             })
             app = DesktopController(vault, runtime, api, {}, network,
                 latencySampler = { ClientLatencySampler(tcpConnect = { host, _, _ -> tcpCalls.incrementAndGet();
+                    tcpProbeGate?.await(10, java.util.concurrent.TimeUnit.SECONDS)
                     probedHosts += host
                     if (runtime.active != null) probesWhileActive += host
                     (probeLatencies[host] ?: tcpLatency.get()).takeIf { it >= 0 } }, icmpPing = { _, _, _ -> null }) },
@@ -2368,14 +2557,18 @@ class DesktopConnectionTest {
             app.setWindowVisible(false)
         }
         suspend fun enableYoutube() {
+            // A RU toggle may still own a coalesced refresh whose bootstrap was captured before this fixture's plan change.
+            app.refresh().join()
             bootstrap.getJSONObject("subscription").put("plan_code", "pro").put("plan_name", "Pro")
             app.refresh().join()
             app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(youtubeAdBlockEnabled = true)) }.join()
         }
         suspend fun awaitYoutubeReady() {
-            withTimeout(12_000) {
+            try { withTimeout(12_000) {
                 while (!app.state.value.running || app.state.value.loading ||
                     runtime.starts.lastOrNull()?.let(::youtubeEndpoint) == null) delay(10)
+            } } catch (error: TimeoutCancellationException) {
+                throw AssertionError("YouTube not ready: message=${app.state.value.message}, youtube=${app.state.value.youtubeMessage}, create=${youtubeCreateCalls.get()}, keys=${wireGuardRegistrationCalls.get()}, starts=${runtime.starts.size}, running=${app.state.value.running}, loading=${app.state.value.loading}", error)
             }
         }
         fun mainConfig(): JSONObject = (DesktopController::class.java.getDeclaredField("activeConnection")

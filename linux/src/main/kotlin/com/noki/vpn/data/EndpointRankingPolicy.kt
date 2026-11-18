@@ -3,6 +3,10 @@ package com.noki.vpn.data
 import java.util.Locale
 
 object EndpointRankingPolicy {
+    fun isAutoExcluded(server: VpnServer, profile: UserProfile): Boolean =
+        profile.serverSelectionMode == ServerSelectionMode.AUTO &&
+            (server.id in profile.autoExcludedNodeIds || profile.autoExcludedCountryCodes.any { it.equals(server.countryCode, true) })
+
     /** Rank each physical server once, before selecting its transport endpoints. */
     fun rankServers(
         servers: List<VpnServer>,
@@ -11,7 +15,7 @@ object EndpointRankingPolicy {
         random: () -> Double = { kotlin.random.Random.nextDouble() },
     ): List<VpnServer> {
         val remaining = servers.distinctBy { it.id }.filter { server ->
-            server.isOnline && server.weight > 0 && when (profile.serverSelectionMode) {
+            server.isOnline && server.weight > 0 && !isAutoExcluded(server, profile) && when (profile.serverSelectionMode) {
                 ServerSelectionMode.AUTO -> true
                 ServerSelectionMode.COUNTRY -> server.countryCode.equals(profile.selectedCountryCode, true)
                 ServerSelectionMode.SERVER -> server.id == profile.selectedNodeId

@@ -13,6 +13,17 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RuRelayCatalogTest {
+    @Test fun confirmedWireguardEndpointIsSeparateFromPhysicalProbeAddress() {
+        val relay = "22222222-2222-4222-8222-222222222222"
+        fun parse(endpoint: String?) = RuRelayCatalogJsonParser.parse(JSONObject("""{"route_version":1,"entry_node_id":null,"exit_node_id":null,
+            "relays":[{"id":"$relay","name":"RU","country_code":"RU","available":true,"pair_ready":true,"probe_ip":"1.1.1.1"}],"foreign_nodes":[]}""")
+            .apply { endpoint?.let { getJSONArray("relays").getJSONObject(0).put("wireguard_endpoint", it) } }, null).relays.single()
+        assertEquals("8.8.8.8:51820", parse("8.8.8.8:51820").wireguardEndpoint)
+        assertEquals("1.1.1.1", parse("8.8.8.8:51820").probeIp)
+        for (endpoint in listOf(null, "127.0.0.1:51820", "10.0.0.1:51820", "example.invalid:51820", "8.8.8.8:0", "8.8.8.8:65536"))
+            assertEquals(null, parse(endpoint).wireguardEndpoint)
+    }
+
     @Test
     fun relayRttQueueSharesTheSameBudgetAndCancelsItsProbe() = runBlocking {
         val entries = (1..7).map { index -> RuRelayCatalogEntry("relay-$index", "RU", "RU", true, null,

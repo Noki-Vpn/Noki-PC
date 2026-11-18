@@ -325,9 +325,7 @@ internal object RuWireGuardSessionJsonParser {
 
     fun parseConfig(json: JSONObject): BackendRuWireGuardConfig {
         val endpoint = json.getString("endpoint")
-        val host = endpoint.substringBeforeLast(':', "")
-        val port = endpoint.substringAfterLast(':', "").toIntOrNull()
-        require(isIpv4(host) && port != null && port in 1..65535) { "ru_wireguard_endpoint_invalid" }
+        parseEndpoint(endpoint)
         val address = json.getString("address")
         require(address.endsWith("/32") && isIpv4(address.removeSuffix("/32"))) {
             "ru_wireguard_address_invalid"
@@ -373,6 +371,13 @@ internal object RuWireGuardSessionJsonParser {
             "ru_wireguard_key_invalid"
         }
         return key
+    }
+
+    internal fun parseEndpoint(endpoint: String): Pair<String, Int> {
+        val host = endpoint.substringBeforeLast(':', "")
+        val port = endpoint.substringAfterLast(':', "").toIntOrNull()
+        require(isIpv4(host) && port != null && port in 1..65535) { "ru_wireguard_endpoint_invalid" }
+        return host to port
     }
 
     private fun isIpv4(raw: String): Boolean {

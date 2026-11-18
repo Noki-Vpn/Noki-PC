@@ -82,6 +82,7 @@ internal class VelopackNative(path: Path) {
             sdk.void("app_run", null)
             installed = sdk
             registerWindowsUninstaller(directory)
+            runCatching { WindowsShell.repairNokiShortcut(directory, createMissing = ownsWindowsInstall(directory)) }
         }
         fun current(): VelopackNative? = installed
     }
@@ -138,12 +139,18 @@ internal fun windowsUninstallCommand(currentDirectory: Path): String? {
 
 internal fun registerWindowsUninstaller(currentDirectory: Path) {
     val command = windowsUninstallCommand(currentDirectory) ?: return
+    if (!ownsWindowsInstall(currentDirectory)) return
     val key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Noki.Desktop"
-    if (!Advapi32Util.registryKeyExists(WinReg.HKEY_CURRENT_USER, key)) return
-    val location = Advapi32Util.registryGetStringValue(WinReg.HKEY_CURRENT_USER, key, "InstallLocation")
-    if (Path.of(location).toAbsolutePath().normalize() != currentDirectory.toAbsolutePath().normalize().parent) return
     Advapi32Util.registrySetStringValue(WinReg.HKEY_CURRENT_USER, key, "UninstallString", "$command /LOG")
     Advapi32Util.registrySetStringValue(WinReg.HKEY_CURRENT_USER, key, "QuietUninstallString", "$command /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG")
+}
+
+private fun ownsWindowsInstall(currentDirectory: Path): Boolean {
+    if (windowsUninstallCommand(currentDirectory) == null) return false
+    val key = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Noki.Desktop"
+    if (!Advapi32Util.registryKeyExists(WinReg.HKEY_CURRENT_USER, key)) return false
+    val location = Advapi32Util.registryGetStringValue(WinReg.HKEY_CURRENT_USER, key, "InstallLocation")
+    return Path.of(location).toAbsolutePath().normalize() == currentDirectory.toAbsolutePath().normalize().parent
 }
 
 internal fun stopWindowsUninstallProcess(pid: Long, installedExecutables: Set<Path>): Boolean {

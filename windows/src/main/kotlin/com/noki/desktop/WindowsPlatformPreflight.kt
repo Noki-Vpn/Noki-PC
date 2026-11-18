@@ -138,6 +138,26 @@ internal fun runWindowsPlatformPreflight() {
     check(Crypt32Util.cryptUnprotectData(Crypt32Util.cryptProtectData(plaintext)).contentEquals(plaintext))
     val storage = java.nio.file.Files.createTempDirectory("noki-vault-preflight").toAbsolutePath().normalize()
     try {
+        val shortcutRoot = java.nio.file.Files.createDirectory(storage.resolve("shortcut"))
+        val current = java.nio.file.Files.createDirectory(shortcutRoot.resolve("current"))
+        for (file in listOf(shortcutRoot.resolve("Noki Vpn.exe"), shortcutRoot.resolve("Update.exe"), current.resolve("Noki.exe")))
+            java.nio.file.Files.write(file, byteArrayOf(77, 90))
+        java.nio.file.Files.write(shortcutRoot.resolve(".portable"), byteArrayOf())
+        java.nio.file.Files.writeString(current.resolve("sq.version"),
+            "<package><id>Noki.Desktop</id><mainExe>Noki.exe</mainExe><shortcutAumid>velopack.Noki.Desktop</shortcutAumid></package>")
+        val shortcut = storage.resolve("Noki Vpn.lnk")
+        WindowsShell.withShortcut(null) { link, persisted, store ->
+            check(callWindowsCom(link, 20, com.sun.jna.WString(storage.resolve("removed/current/Noki.exe").toString())) >= 0)
+            WindowsShell.shortcutAppId(store, "velopack.Noki.Desktop")
+            check(callWindowsCom(persisted, 6, com.sun.jna.WString(shortcut.toString()), 1) >= 0)
+        }
+        check(WindowsShell.repairNokiShortcut(current, shortcut))
+        check(!WindowsShell.repairNokiShortcut(current, shortcut))
+        WindowsShell.withShortcut(shortcut) { link, _, store ->
+            check(WindowsShell.shortcutAppId(store) == "velopack.Noki.Desktop")
+            check(WindowsShell.shortcutText(link, 3) == shortcutRoot.resolve("Noki Vpn.exe").toString())
+        }
+        println("platform-preflight: shortcut-owner-repair=ok")
         val directory = storage.resolve("Desktop")
         val vault = WindowsVault(directory) { "preflight-fixture" }
         val settings = vault.loadSettings()

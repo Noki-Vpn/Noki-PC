@@ -361,16 +361,37 @@ class WindowsVaultTest {
         assertEquals(restored.backendAccessToken, codec.decode(malformed.toString()).backendAccessToken)
     }
 
-    @Test fun `upgrade disables old RU relay once and preserves later user choice`() {
+    @Test fun `upgrade enables RU once including an old false and preserves the next manual off`() {
         val directory = Files.createTempDirectory("noki-relay-upgrade")
         try {
             val vault = WindowsVault(directory)
-            vault.writeEncrypted("settings.dpapi", """{"ruRelayEnabled":true,"anonymousLogsEnabled":false}""")
+            assertTrue(vault.loadSettings().advancedSettings.ruRelayEnabled)
+            vault.writeEncrypted("settings.dpapi", """{"ruRelayEnabled":false,"anonymousLogsEnabled":false,"desktop_ru_relay_reset_version":1,
+                "multiHopSettings":{"enabled":true,"entry":{"kind":"COUNTRY","countryCode":"DE"},"exit":{"kind":"COUNTRY","countryCode":"FR"}}}""")
             val migrated = vault.loadSettings()
-            assertFalse(migrated.advancedSettings.ruRelayEnabled)
+            assertTrue(migrated.advancedSettings.ruRelayEnabled)
+            assertFalse(migrated.advancedSettings.multiHop.enabled)
+            assertEquals("DE", migrated.advancedSettings.multiHop.entry?.countryCode)
+            assertEquals("FR", migrated.advancedSettings.multiHop.exit?.countryCode)
             assertFalse(migrated.advancedSettings.anonymousLogsEnabled)
-            vault.saveSettings(migrated.copy(advancedSettings = migrated.advancedSettings.copy(ruRelayEnabled = true)))
-            assertTrue(WindowsVault(directory).loadSettings().advancedSettings.ruRelayEnabled)
+            vault.saveSettings(migrated.copy(advancedSettings = migrated.advancedSettings.copy(ruRelayEnabled = false)))
+            assertFalse(WindowsVault(directory).loadSettings().advancedSettings.ruRelayEnabled)
+            vault.saveEarthDisabled(true)
+            assertFalse(WindowsVault(directory).loadSettings().advancedSettings.ruRelayEnabled)
+        } finally { Files.list(directory).use { it.forEach(Files::delete) }; Files.delete(directory) }
+    }
+
+    @Test fun `automatic exclusions round trip in settings without changing explicit choices`() {
+        val directory = Files.createTempDirectory("noki-auto-exclusions")
+        try {
+            val vault = WindowsVault(directory)
+            val settings = vault.loadSettings().let { it.copy(userProfile = it.userProfile.copy(
+                serverSelectionMode = com.noki.vpn.data.ServerSelectionMode.SERVER,
+                selectedNodeId = "11111111-1111-4111-8111-111111111111",
+                autoExcludedCountryCodes = setOf("DE", "FR"),
+                autoExcludedNodeIds = setOf("11111111-1111-4111-8111-111111111111"))) }
+            vault.saveSettings(settings)
+            assertEquals(settings.userProfile, WindowsVault(directory).loadSettings().userProfile)
         } finally { Files.list(directory).use { it.forEach(Files::delete) }; Files.delete(directory) }
     }
 
@@ -689,6 +710,17 @@ class WindowsVaultTest {
                 assertArrayEquals(saved, Files.readAllBytes(directory.resolve("settings.dpapi")))
                 assertEquals(listOf(rule), vault.loadRoutingRules())
             }
+        } finally { Files.list(directory).use { it.forEach(Files::delete) }; Files.delete(directory) }
+    }
+
+    @Test fun `routing rule saves preserve a manual RU off after the default migration`() {
+        val directory = Files.createTempDirectory("noki-routing-ru-default")
+        try {
+            val vault = WindowsVault(directory)
+            vault.saveSettings(vault.loadSettings().let { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = false)) })
+            vault.saveRoutingRules(listOf(DesktopRoutingRule.RUSSIAN_RESOURCES))
+            assertFalse(WindowsVault(directory).loadSettings().advancedSettings.ruRelayEnabled)
+            assertEquals(1, org.json.JSONObject(checkNotNull(vault.readEncrypted("settings.dpapi"))).getInt("desktop_ru_relay_default_version"))
         } finally { Files.list(directory).use { it.forEach(Files::delete) }; Files.delete(directory) }
     }
 

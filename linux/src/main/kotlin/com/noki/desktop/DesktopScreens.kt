@@ -31,6 +31,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.automirrored.filled.RotateLeft
@@ -300,10 +305,11 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
                                         Box(Modifier.weight(1f)) {
                                             PcPageHeading(tr(state, "Локации", "Locations")) { navigate(DesktopPage.HOME) }
                                         }
-                                        ServerRefreshButton(state, earthVisible, reducedMotion || state.reducedMotion) { app.refresh().await() }
+                                        ServerRefreshButton(state, earthVisible, reducedMotion || state.reducedMotion) { app.refreshServerLatencies() }
                                     }
                                     CountryCatalog(state, Modifier.weight(1f).fillMaxWidth(),
-                                        HopSelection(state.settings.userProfile.serverSelectionMode, state.settings.userProfile.selectedCountryCode, state.selectedServerId), onSelect = ::selectLocation)
+                                        HopSelection(state.settings.userProfile.serverSelectionMode, state.settings.userProfile.selectedCountryCode, state.selectedServerId),
+                                        onAutoConfigure = { dialog = { AutoSelectionDialog(state, app) { dialog = null } } }, onSelect = ::selectLocation)
                                      val multiHopAvailable = !state.settings.advancedSettings.ruRelayEnabled
                                      if (!isFreePlan) Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).pcCard(DesktopUiKit.Surface, DesktopUiKit.MenuShape).border(.5.dp, Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape).pcClickable(enabled = multiHopAvailable, shape = DesktopUiKit.MenuShape) { navigate(DesktopPage.MULTIHOP) }.padding(horizontal = 16.dp, vertical = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1685,7 +1691,10 @@ internal fun openDesktopUrl(value: String) {
                                     Icon(Icons.Rounded.AutoAwesome, tr(state, "Автовыбор сервера", "Automatic server selection"), Modifier.size(36.dp), tint = style.accent)
                                 }
                                 Column(Modifier.weight(1f)) {
-                                    PcText(title, size = 24, lineHeight = 28, maxLines = if (multiHop.enabled || displayed.advancedSettings.ruRelayEnabled) 2 else 1)
+                                    val routeTitle = multiHop.enabled || displayed.advancedSettings.ruRelayEnabled
+                                    PcText(if (routeTitle) title.replace(Regex(" (?=\\d+(?: →|$))"), "\u00a0") else title,
+                                        size = if (routeTitle) 20 else 24, lineHeight = if (routeTitle) 24 else 28,
+                                        maxLines = if (routeTitle) 2 else 1)
                                     subtitle?.takeIf { it.isNotBlank() }?.let { PcText(it, size = 12, lineHeight = 16, color = Color(0xFFB9B9B9), maxLines = 2) }
                                 }
                             }
@@ -1701,14 +1710,15 @@ internal fun openDesktopUrl(value: String) {
                             for (metricRow in metrics.chunked(2)) Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 for ((icon, value, unit) in metricRow) PcSurface(Modifier.weight(1f).fillMaxHeight().pcConnectionShadow()
                                     .then(if (icon == "latency" && state.running) Modifier.semantics { contentDescription = tr(state, "Обновить пинг", "Refresh latency") } else Modifier),
-                                    enabled = !state.loading, onClick = if (icon == "latency" && state.running) ({ scope.launch { app.refreshServerLatencies() } }) else null) {
+                                    enabled = !state.loading, onClick = if (icon == "latency" && state.running) ({ scope.launch { app.refreshServerLatencies(selectedNodeOnly = true) } }) else null) {
                                     Row(Modifier.align(Alignment.Center), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Box(Modifier.size(14.dp), contentAlignment = Alignment.Center) {
                                             PcIcon(icon, null, Modifier.size(
                                                 (when (icon) { "latency" -> 14f; "traffic" -> 10.4601f; else -> 8.78003f }).dp,
                                                 (when (icon) { "latency" -> 14f; "traffic" -> 11.5103f; else -> 10.6925f }).dp))
                                         }
-                                        PcText(value, size = 15, metric = true, maxLines = 1)
+                                        if (icon == "latency" && state.latencyRefreshing) CircularProgressIndicator(Modifier.size(15.dp), color = style.accent, strokeWidth = 1.5.dp)
+                                        else PcText(value, size = 15, metric = true, maxLines = 1)
                                         PcText(unit, size = 12, metric = true, color = DesktopUiKit.Muted, maxLines = 1)
                                     }
                                 }
@@ -1820,22 +1830,38 @@ internal fun desktopProtocolLabel(state: DesktopState): String {
     } else "00:00:00", size = 18, maxLines = 1)
 }
 
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable internal fun CountryCatalog(state: DesktopState, modifier: Modifier, selection: HopSelection, allowAuto: Boolean = true,
-    locations: List<ServerLocation> = state.connectionLocations, onSelect: (HopSelection) -> Unit) {
+    locations: List<ServerLocation> = state.connectionLocations, onAutoConfigure: (() -> Unit)? = null, onSelect: (HopSelection) -> Unit) {
     var expandedCountry by rememberSaveable { mutableStateOf(if (selection.kind == ServerSelectionMode.SERVER)
         locations.firstOrNull { country -> country.servers.any { it.id == selection.nodeId } }?.code else null) }
     val listState = rememberLazyListState()
     val accent = LocalDesktopStyle.current.accent
+    var autoMenu by remember { mutableStateOf(false) }
     LazyColumn(modifier.pointerInput(listState) {
         detectVerticalDragGestures { change, delta -> listState.dispatchRawDelta(-delta); change.consume() }
     }, state = listState, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (allowAuto) {
             item {
                 CompositionLocalProvider(LocalPcCardColor provides DesktopUiKit.Surface) {
-                    PcButton(tr(state, "Автовыбор", "Automatic"), Modifier.fillMaxWidth().height(48.dp)
-                        .border(.5.dp, if (selection.kind == ServerSelectionMode.AUTO) accent.copy(alpha = .3f) else Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape),
-                        selected = selection.kind == ServerSelectionMode.AUTO,
-                        enabled = !state.loading, onClick = { onSelect(HopSelection(ServerSelectionMode.AUTO)) })
+                    Box {
+                        PcButton(tr(state, "Автовыбор", "Automatic"), Modifier.fillMaxWidth().height(48.dp)
+                            .onPointerEvent(PointerEventType.Press) { event ->
+                                if (event.buttons.isSecondaryPressed && !state.loading && onAutoConfigure != null) {
+                                    autoMenu = true
+                                    event.changes.forEach { it.consume() }
+                                }
+                            }
+                            .border(.5.dp, if (selection.kind == ServerSelectionMode.AUTO) accent.copy(alpha = .3f) else Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape),
+                            selected = selection.kind == ServerSelectionMode.AUTO,
+                            enabled = !state.loading, onClick = { onSelect(HopSelection(ServerSelectionMode.AUTO)) })
+                        DropdownMenu(autoMenu, onDismissRequest = { autoMenu = false }, Modifier.width(160.dp), containerColor = DesktopUiKit.Surface) {
+                            DropdownMenuItem(text = { PcText(tr(state, "Настроить", "Configure")) }, onClick = {
+                                autoMenu = false
+                                onAutoConfigure?.invoke()
+                            })
+                        }
+                    }
                 }
             }
             item { PcText(tr(state, "Все страны", "All countries"), Modifier.padding(top = 8.dp, bottom = 3.dp), size = 12, color = Color(0xFFB9B9B9)) }
@@ -1882,6 +1908,35 @@ internal fun desktopProtocolLabel(state: DesktopState): String {
                 }
             }
         }
+    }
+}
+
+@Composable private fun AutoSelectionDialog(state: DesktopState, app: DesktopController, dismiss: () -> Unit) {
+    val profile = state.settings.userProfile
+    var countries by remember { mutableStateOf(profile.autoExcludedCountryCodes) }
+    var nodes by remember { mutableStateOf(profile.autoExcludedNodeIds) }
+    val catalog = state.connectionLocations
+    PcDialog(tr(state, "Настроить автовыбор", "Configure automatic selection"), dismiss,
+        tr(state, "Сохранить", "Save"), onConfirm = {
+            app.updateSettings { it.copy(userProfile = it.userProfile.copy(autoExcludedCountryCodes = countries, autoExcludedNodeIds = nodes)) }
+            dismiss()
+        }, spacing = 10.dp) {
+        PcText(tr(state, "Исключения действуют только для «Автовыбор». Ручной выбор и YouTube не меняются.",
+            "Exclusions apply only to Automatic. Manual selection and YouTube are unchanged."), size = 12, color = DesktopUiKit.Muted)
+        PcButton(tr(state, "Вернуть все", "Restore all"), Modifier.fillMaxWidth(), compact = true, onClick = { countries = emptySet(); nodes = emptySet() })
+        for (country in catalog) {
+            PcToggle(country.country, country.countryCode !in countries) { included ->
+                countries = if (included) countries - country.countryCode else countries + country.countryCode
+            }
+            for (server in country.servers) Box(Modifier.padding(start = 16.dp)) {
+                PcToggle(server.name, server.id !in nodes, enabled = country.countryCode !in countries) { included ->
+                    nodes = if (included) nodes - server.id else nodes + server.id
+                }
+            }
+        }
+        if (catalog.isNotEmpty() && catalog.flatMap { it.servers }.none { it.isOnline && it.weight > 0 && it.countryCode !in countries && it.id !in nodes })
+            PcText(tr(state, "Для автовыбора не осталось серверов. Верните хотя бы один сервер и его страну.",
+                "No servers remain for Automatic. Restore at least one server and its country."), size = 12, color = DesktopUiKit.Muted)
     }
 }
 

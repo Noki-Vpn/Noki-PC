@@ -240,6 +240,8 @@ data class UserProfile(
     val trafficLimitGb: Double? = null,
     val subscriptionExpiresAt: String? = null,
     val subscriptionStatus: String = "active",
+    val autoExcludedCountryCodes: Set<String> = emptySet(),
+    val autoExcludedNodeIds: Set<String> = emptySet(),
 )
 
 data class VpnIncidentReport(

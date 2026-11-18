@@ -60,6 +60,128 @@ import javax.imageio.ImageIO
 
 class DesktopUiTest {
     @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun autoSelectionDialogSavesExclusionsAndRestoresThemWithoutChangingManualSelection() = connectionUiFixture { app ->
+        val node = VpnServer("11111111-1111-4111-8111-111111111111", "Germany 1", "DE", "de", "example.invalid", null, true)
+        val country = ServerLocation("DE", "DE", "Germany", "", node.host, isOnline = true, servers = listOf(node))
+        runBlocking { app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = ServerSelectionMode.SERVER,
+            selectedNodeId = node.id), advancedSettings = it.advancedSettings.copy(ruRelayEnabled = false)) }.join() }
+        val scene = ImageComposeScene(1050, 674) {
+            val state by app.state.collectAsState()
+            DesktopWorkspace(state.copy(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false),
+                locations = listOf(country)), app, DesktopPage.SERVERS, earthVisible = false)
+        }
+        fun nodes(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); node.children.forEach { yieldAll(nodes(it)) } }
+        fun text(label: String) = scene.semanticsOwners.asSequence().flatMap { nodes(it.rootSemanticsNode) }
+            .lastOrNull { it.config.getOrNull(SemanticsProperties.Text)?.any { t -> t.text == label } == true }
+        var frame = 0L
+        fun render() { repeat(4) { frame += 100_000_000L; scene.render(frame).close() } }
+        fun click(label: String, secondary: Boolean = false) {
+            val point = checkNotNull(text(label)) { label }.boundsInWindow.center
+            val button = if (secondary) PointerButton.Secondary else PointerButton.Primary
+            scene.sendPointerEvent(PointerEventType.Press, point, buttons = PointerButtons(isPrimaryPressed = !secondary, isSecondaryPressed = secondary), button = button)
+            scene.sendPointerEvent(PointerEventType.Release, point, buttons = PointerButtons(), button = button)
+            render()
+        }
+        fun configure() { click("Автовыбор", true); click("Настроить"); assertNotNull(text("Настроить автовыбор")) }
+        fun saved(predicate: () -> Boolean) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (!predicate() && System.nanoTime() < deadline) { Thread.sleep(10); render() }
+            assertTrue(predicate())
+        }
+        try {
+            render(); configure()
+            click("Germany 1"); click("Germany")
+            assertNotNull(text("Для автовыбора не осталось серверов. Верните хотя бы один сервер и его страну."))
+            val output = java.nio.file.Path.of("build/screenshots/auto-selection-dialog.png")
+            Files.createDirectories(output.parent)
+            scene.render(frame).use { image -> image.encodeToData(EncodedImageFormat.PNG)!!.use { Files.write(output, it.bytes) } }
+            click("Сохранить")
+            saved { app.state.value.settings.userProfile.autoExcludedCountryCodes == setOf("DE") &&
+                app.state.value.settings.userProfile.autoExcludedNodeIds == setOf(node.id) }
+            assertEquals(ServerSelectionMode.SERVER, app.state.value.settings.userProfile.serverSelectionMode)
+            assertEquals(node.id, app.state.value.settings.userProfile.selectedNodeId)
+            configure(); click("Вернуть все"); click("Сохранить")
+            saved { app.state.value.settings.userProfile.autoExcludedCountryCodes.isEmpty() && app.state.value.settings.userProfile.autoExcludedNodeIds.isEmpty() }
+            assertEquals(node.id, app.state.value.settings.userProfile.selectedNodeId)
+        } finally { scene.close() }
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun automaticSelectionContextMenuBelongsOnlyToItsButton() = connectionUiFixture { app ->
+        var configured = 0
+        var selected = 0
+        val state = DesktopState()
+        val scene = ImageComposeScene(500, 450) {
+            CountryCatalog(state, Modifier.fillMaxSize(), com.noki.vpn.data.HopSelection(ServerSelectionMode.AUTO),
+                onAutoConfigure = { configured++ }, onSelect = { selected++ })
+        }
+        fun nodes(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); node.children.forEach { yieldAll(nodes(it)) } }
+        fun text(label: String) = scene.semanticsOwners.asSequence().flatMap { nodes(it.rootSemanticsNode) }
+            .firstOrNull { it.config.getOrNull(SemanticsProperties.Text)?.any { t -> t.text == label } == true }
+        var frame = 0L
+        fun render() { repeat(4) { frame += 100_000_000L; scene.render(frame).close() } }
+        fun click(point: Offset, secondary: Boolean) {
+            scene.sendPointerEvent(PointerEventType.Press, point, buttons = PointerButtons(isPrimaryPressed = !secondary, isSecondaryPressed = secondary),
+                button = if (secondary) PointerButton.Secondary else PointerButton.Primary)
+            scene.sendPointerEvent(PointerEventType.Release, point, buttons = PointerButtons(), button = if (secondary) PointerButton.Secondary else PointerButton.Primary)
+            render()
+        }
+        try {
+            render()
+            click(Offset(250f, 200f), true)
+            assertNull(text("Настроить"))
+            click(checkNotNull(text("Автовыбор")).boundsInRoot.center, true)
+            assertEquals(0, selected)
+            assertNotNull(text("Настроить"))
+            val output = java.nio.file.Path.of("build/screenshots/auto-context-menu.png")
+            Files.createDirectories(output.parent)
+            frame += 100_000_000L
+            scene.render(frame).use { image -> image.encodeToData(EncodedImageFormat.PNG)!!.use { Files.write(output, it.bytes) } }
+            click(checkNotNull(text("Настроить")).boundsInWindow.center, false)
+            assertEquals(1, configured)
+            assertEquals(0, selected)
+        } finally { scene.close() }
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
+    @Test fun routeTitlesRenderWithoutAnOrphanNodeNumberAndOrdinaryTitleKeepsItsSize() = connectionUiFixture { app ->
+        val lv = VpnServer("11111111-1111-4111-8111-111111111111", "Latvia 1", "LV", "lv", "example.invalid", null, true)
+        val nl = lv.copy(id = "22222222-2222-4222-8222-222222222222", name = "Netherlands 2", countryCode = "NL", locationCode = "nl")
+        val fr = lv.copy(id = "33333333-3333-4333-8333-333333333333", name = "France 2", countryCode = "FR", locationCode = "fr")
+        val base = DesktopState(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false), earthDisabled = true,
+            locations = listOf(lv, nl).map { ServerLocation(it.countryCode, it.countryCode, if (it.countryCode == "LV") "Latvia" else "Netherlands", "", it.host, isOnline = true, servers = listOf(it)) },
+            ruForeignNodes = listOf(com.noki.vpn.data.RuForeignNode(fr.id, fr.name, fr.countryCode)))
+        fun state(ru: Boolean, auto: Boolean = false, hops: Boolean = false) = base.copy(selectedServerId = if (ru) fr.id else lv.id,
+            settings = base.settings.copy(userProfile = base.settings.userProfile.copy(serverSelectionMode = if (auto) ServerSelectionMode.AUTO else ServerSelectionMode.SERVER,
+                selectedNodeId = if (ru) fr.id else lv.id), advancedSettings = base.settings.advancedSettings.copy(ruRelayEnabled = ru,
+                multiHop = com.noki.vpn.data.MultiHopSettings(hops, com.noki.vpn.data.HopSelection(ServerSelectionMode.SERVER, nodeId = lv.id),
+                    com.noki.vpn.data.HopSelection(ServerSelectionMode.SERVER, nodeId = nl.id)))))
+        for ((index, state) in listOf(state(true), state(true, auto = true), state(false, hops = true), state(false)).withIndex()) {
+            for ((width, height) in listOf(1050 to 674, 500 to 450)) {
+                val scene = ImageComposeScene(width, height) { DesktopWorkspace(state, app, DesktopPage.HOME, earthVisible = false) }
+                fun nodes(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); node.children.forEach { yieldAll(nodes(it)) } }
+                try {
+                    repeat(4) { scene.render(System.nanoTime()).close() }
+                    val title = scene.semanticsOwners.asSequence().flatMap { nodes(it.rootSemanticsNode) }.first { node ->
+                        node.config.getOrNull(SemanticsProperties.Text)?.any { if (index < 3) '→' in it.text else it.text == "Latvia" } == true }
+                    val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+                    assertTrue(title.config[androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult].action!!.invoke(layouts))
+                    val layout = layouts.single()
+                    assertEquals(if (index < 3) 20f else 24f, layout.layoutInput.style.fontSize.value, .01f)
+                    assertTrue(layout.lineCount <= if (index < 3) 2 else 1)
+                    for (line in 0 until layout.lineCount) {
+                        val visible = layout.layoutInput.text.text.substring(layout.getLineStart(line), layout.getLineEnd(line, visibleEnd = true)).trim()
+                        assertFalse("A node number must stay with its name: $visible", visible.matches(Regex("[0-9]+")))
+                    }
+                    val output = java.nio.file.Path.of("build/screenshots/pc-route-${index + 1}-${width}x$height.png")
+                    Files.createDirectories(output.parent)
+                    scene.render().use { image -> image.encodeToData(EncodedImageFormat.PNG)!!.use { Files.write(output, it.bytes) } }
+                } finally { scene.close() }
+            }
+        }
+    }
+
+    @OptIn(ExperimentalComposeUiApi::class)
     @Test fun homeConnectionSettingsOpensTheLiveDialog() = connectionUiFixture { app ->
         val user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false)
         val scene = ImageComposeScene(1050, 674) {

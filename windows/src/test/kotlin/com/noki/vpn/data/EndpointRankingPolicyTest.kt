@@ -4,6 +4,21 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class EndpointRankingPolicyTest {
+    @Test fun automaticExclusionsNeverChangeAnExplicitNodeOrCountrySelection() {
+        val nodes = listOf(VpnServer("de-1", "DE 1", "DE", "de", "1.1.1.1", 443, true),
+            VpnServer("de-2", "DE 2", "DE", "de", "8.8.8.8", 443, true),
+            VpnServer("fr-1", "FR 1", "FR", "fr", "9.9.9.9", 443, true))
+        val auto = UserProfile(serverSelectionMode = ServerSelectionMode.AUTO,
+            autoExcludedCountryCodes = setOf("FR"), autoExcludedNodeIds = setOf("de-1"))
+        assertEquals(listOf("de-2"), EndpointRankingPolicy.rankServers(nodes, auto).map { it.id })
+        assertEquals(listOf("de-1"), EndpointRankingPolicy.rankServers(nodes, auto.copy(
+            serverSelectionMode = ServerSelectionMode.SERVER, selectedNodeId = "de-1")).map { it.id })
+        assertEquals(listOf("fr-1"), EndpointRankingPolicy.rankServers(nodes, auto.copy(
+            serverSelectionMode = ServerSelectionMode.COUNTRY, selectedCountryCode = "FR")).map { it.id })
+        assertEquals(emptyList<VpnServer>(), EndpointRankingPolicy.rankServers(nodes,
+            auto.copy(autoExcludedCountryCodes = setOf("DE", "FR"))))
+    }
+
     @Test
     fun physicalNodePrefersMeasuredSelectionWeightAndKeepsLegacyMeasuredBandwidth() {
         fun catalog(selection: Int?) = org.json.JSONObject("""{"id":"location","code":"de","name":"Germany",

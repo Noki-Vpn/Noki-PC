@@ -77,6 +77,8 @@ internal class StoredSettingsCodec(
         .put("selectedCountryCode", settings.userProfile.selectedCountryCode)
         .put("serverSelectionMode", settings.userProfile.serverSelectionMode.name)
         .put("selectedNodeId", settings.userProfile.selectedNodeId)
+        .put("autoExcludedCountryCodes", JSONArray(settings.userProfile.autoExcludedCountryCodes.sorted()))
+        .put("autoExcludedNodeIds", JSONArray(settings.userProfile.autoExcludedNodeIds.sorted()))
         .put("selectedServerCode", settings.userProfile.selectedServerCode)
         .put("actualCountryCode", settings.userProfile.actualCountryCode)
         .put("trafficUsedGb", settings.userProfile.trafficUsedGb)
@@ -181,6 +183,11 @@ internal class StoredSettingsCodec(
                 ServerSelectionMode.valueOf(json.optString("serverSelectionMode", ServerSelectionMode.COUNTRY.name))
             }.getOrDefault(ServerSelectionMode.COUNTRY),
             selectedNodeId = json.optString("selectedNodeId"),
+            autoExcludedCountryCodes = json.optJSONArray("autoExcludedCountryCodes").toStringSet()
+                .filter { it.matches(Regex("[A-Za-z]{2}")) }.map { it.uppercase() }.toSet(),
+            autoExcludedNodeIds = json.optJSONArray("autoExcludedNodeIds").toStringSet()
+                .filter { runCatching { java.util.UUID.fromString(it).toString().equals(it, true) }.getOrDefault(false) }
+                .map { it.lowercase() }.toSet(),
             actualCountryCode = json.optString("actualCountryCode"),
             selectedServerCode = json.optString("selectedServerCode", "lv"),
             trafficUsedGb = json.optNullableDouble("trafficUsedGb"),

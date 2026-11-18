@@ -36,21 +36,25 @@ object VpnConfigFactory {
         "255.255.255.255/32", "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
     )
 
-    fun build(profile: VlessProfile, advancedSettings: AdvancedSettings, geositeBytes: ByteArray): String {
+    fun build(profile: VlessProfile, advancedSettings: AdvancedSettings, geositeBytes: ByteArray,
+              russianIp: List<String> = emptyList()): String {
         require(!advancedSettings.ruRelayEnabled) { "ru_wireguard_session_required" }
         val runtimeProfile = profile.copy(nokinvMode = if (advancedSettings.gamingModeEnabled) "gaming" else "balanced")
         require(VpnProfileValidator.isUsable(runtimeProfile, advancedSettings)) { "vpn_profile_invalid" }
-        return routedConfig(advancedSettings, geositeBytes, JSONArray().put(proxyOutbound(runtimeProfile)),
+        return routedConfig(advancedSettings, geositeBytes, russianIp, JSONArray().put(proxyOutbound(runtimeProfile)),
             mtu = VpnTunnelPolicy.MTU, address = "10.10.0.2/32", dnsServers = listOf(VpnTunnelPolicy.DNS_SERVER),
             remoteDnsServer = if (profile.proxyType.equals("nokinv", true)) profile.host else VpnTunnelPolicy.DNS_SERVER).toString(2)
     }
 
     fun buildWireGuard(config: BackendRuWireGuardConfig, privateKey: ByteArray,
-                       advancedSettings: AdvancedSettings, geositeBytes: ByteArray): String {
+                       advancedSettings: AdvancedSettings, geositeBytes: ByteArray, russianIp: List<String> = emptyList()): String {
         require(advancedSettings.ruRelayEnabled) { "wireguard_requires_ru_relay" }
         val endpoint = wireGuardEndpoint(config, privateKey, "proxy", keepalive = 5)
-        return routedConfig(advancedSettings, geositeBytes, JSONArray(), config.mtu, config.address, config.dns)
-            .put("endpoints", JSONArray().put(endpoint)).toString(2)
+        val endpoints = JSONArray()
+        // Windows captures IPv6 to reject protected flows in the router.
+        val tunMtu = maxOf(1280, config.mtu)
+        return routedConfig(advancedSettings, geositeBytes, russianIp, JSONArray(), tunMtu, config.address, config.dns)
+            .put("endpoints", endpoints.put(endpoint)).toString(2)
     }
 
     private fun wireGuardEndpoint(config: BackendRuWireGuardConfig, privateKey: ByteArray, tag: String,
@@ -87,7 +91,8 @@ object VpnConfigFactory {
                     .put("rules", JSONArray().put(JSONObject().put("inbound", "tun"))
                         .put(JSONObject(youtube.toString())).put(extra))
                 rules.put(match(JSONObject().put("ip_version", 6)).put("action", "reject"))
-                rules.put(match(JSONObject().put("network", "udp")).put("action", "reject"))
+                rules.put(match(JSONObject().put("network", "udp")).put("action", if (connection == null) "reject" else "route")
+                    .apply { if (connection != null) put("outbound", YOUTUBE_TAG) })
                 rules.put(match(JSONObject().put("network", "tcp")).put("action", if (connection == null) "reject" else "route")
                     .apply { if (connection != null) put("outbound", YOUTUBE_TAG) })
             }
@@ -113,13 +118,14 @@ object VpnConfigFactory {
             .put("default_domain_resolver", resolver(BOOTSTRAP_TAG)))
         .toString(2)
 
-    private fun routedConfig(settings: AdvancedSettings, geositeBytes: ByteArray, outbounds: JSONArray,
+    private fun routedConfig(settings: AdvancedSettings, geositeBytes: ByteArray, russianIp: List<String>, outbounds: JSONArray,
                               mtu: Int, address: String, dnsServers: List<String>, remoteDnsServer: String = dnsServers.first()): JSONObject {
         val normalized = DomainRulePolicy.normalizeSettings(settings)
-        val selectors = (normalized.alwaysOnDomains + normalized.bypassDomains)
+        val defaultDirect = listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)
+        val selectors = (defaultDirect + normalized.alwaysOnDomains + normalized.bypassDomains)
             .filter { it.startsWith("geosite:") }.toSet()
         val resolved = GeositeAsset.resolveDomains(geositeBytes, selectors)
-        val directDomains = domainMatch(normalized.bypassDomains, resolved)
+        val directDomains = domainMatch(normalized.bypassDomains.filterNot(defaultDirect::contains), resolved)
         val rules = JSONArray()
             .put(JSONObject().put("inbound", JSONArray().put("tun")).put("action", "sniff")
                 .put("sniffer", JSONArray().put("http").put("tls").put("quic")))
@@ -131,6 +137,9 @@ object VpnConfigFactory {
                 .put(JSONObject().put("port", JSONArray().put(443)))
                 .put(JSONObject().put("network", JSONArray().put("tcp")))).put("action", "reject"))
             .put(route(JSONObject().put("domain_suffix", JSONArray().put("googleapis.cn")), "direct"))
+        domainMatch(defaultDirect, resolved)?.let { rules.put(route(it, "direct")) }
+        if (russianIp.isNotEmpty()) rules.put(route(JSONObject().put("ip_cidr", JSONArray(russianIp)), "direct"))
+        rules
             .put(route(JSONObject().put("ip_cidr", JSONArray(privateCidrs)), "direct"))
         directDomains?.let { rules.put(route(JSONObject(it.toString()), "direct")) }
         rules.put(JSONObject().put("ip_version", 6).put("action", "reject"))
@@ -154,7 +163,8 @@ object VpnConfigFactory {
                 .put("domain_resolver", resolver(BOOTSTRAP_TAG))))
             .put("dns", JSONObject().put("servers", dns).put("final", DNS_TAG).put("strategy", "ipv4_only")
                 .put("reverse_mapping", true).put("rules", JSONArray().apply {
-                    directDomains?.let { put(JSONObject(it.toString()).put("server", BOOTSTRAP_TAG)) }
+                    domainMatch(defaultDirect + normalized.bypassDomains.filterNot(defaultDirect::contains), resolved)
+                        ?.let { put(it.put("server", BOOTSTRAP_TAG)) }
                 }))
             .put("route", JSONObject().put("rules", rules).put("final", "proxy").put("auto_detect_interface", true)
                 .put("default_domain_resolver", resolver(DNS_TAG)))

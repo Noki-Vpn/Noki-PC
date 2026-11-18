@@ -19,6 +19,118 @@ import java.util.concurrent.CopyOnWriteArrayList
 import okio.Buffer
 
 class DesktopConnectionTest {
+    @Test fun `RU enrollment retries unavailable relay but preserves authorization failure and explicit exit`() = runBlocking {
+        for (status in listOf(503, 403)) Fixture().use { f ->
+            f.ready()
+            f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = ServerSelectionMode.SERVER, selectedNodeId = f.foreignId),
+                advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            f.probeLatencies["8.8.8.8"] = 10
+            f.probeLatencies["1.1.1.1"] = 400
+            f.ruEnrollStatus[f.relayIds[0]] = status
+            f.connect()
+            assertEquals(if (status == 503) 2 else 1, f.ruEntryRequests.size)
+            assertEquals(status == 503, f.app.state.value.verified)
+            assertFalse(f.probedHosts.any { it == "9.9.9.9" })
+            if (status == 503) assertEquals(listOf(f.foreignId), f.runtime.routeSelections.toList())
+            else assertTrue(f.runtime.routeSelections.isEmpty())
+            assertEquals(f.foreignId, f.app.state.value.settings.userProfile.selectedNodeId)
+        }
+    }
+
+    @Test fun `new RU connections refresh ingress and permitted exit instead of pinning cached credential`() = runBlocking {
+        Fixture().use { f ->
+            f.ready()
+            f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = ServerSelectionMode.COUNTRY, selectedCountryCode = "DE"),
+                advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            f.probeLatencies["8.8.8.8"] = 10
+            f.probeLatencies["1.1.1.1"] = 400
+            f.connect()
+            withTimeout(10_000) { f.app.state.first { !it.loading && it.running } }
+            assertTrue(f.app.state.value.message, f.app.state.value.verified)
+            assertEquals(f.relayIds[0], f.ruEntryRequests.single().getString("relay_node_id"))
+            assertEquals(f.foreignId, f.runtime.routeSelections.last())
+            f.app.disconnect()
+            withTimeout(5_000) { f.app.state.first { !it.loading && !it.running } }
+            f.probeLatencies["8.8.8.8"] = 400
+            f.probeLatencies["1.1.1.1"] = 10
+            val previous = f.ruCatalogCalls.get()
+            f.connect()
+            withTimeout(10_000) { f.app.state.first { !it.loading && it.running } }
+            assertTrue(f.app.state.value.message, f.app.state.value.verified)
+            assertTrue(f.ruCatalogCalls.get() > previous)
+            assertEquals(f.relayIds[1], f.ruEntryRequests.last().getString("relay_node_id"))
+            assertEquals(f.foreignId, f.runtime.routeSelections.last())
+            assertEquals(ServerSelectionMode.COUNTRY, f.app.state.value.settings.userProfile.serverSelectionMode)
+        }
+    }
+
+    @Test fun `YouTube admission samples physical targets while main tunnel is active and renewal stays sticky`() = runBlocking {
+        Fixture().use { f ->
+            f.ready()
+            f.app.setWindowVisible(false)
+            f.youtubeCatalogStatus.set(200)
+            f.connect()
+            withTimeout(10_000) { f.app.state.first { !it.loading && it.verified } }
+            f.enableYoutube()
+            f.awaitYoutubeReady()
+            withTimeout(12_000) { while (f.youtubeRenewCalls.get() == 0) delay(20) }
+            assertEquals(1, f.youtubeCatalogCalls.get())
+            assertTrue(f.probesWhileActive.any { it == "9.9.9.9" })
+            val create = f.youtubeRequests.first { it.url.encodedPath == "/v1/vpn/youtube-access" }
+            val payload = Buffer().also { create.body!!.writeTo(it) }.readUtf8().let(::JSONObject)
+            assertEquals(54, payload.getJSONArray("node_rtt_samples").getJSONObject(0).getInt("rtt_ms"))
+            assertFalse(payload.has("node_id"))
+            val renewal = f.youtubeRequests.first { it.url.encodedPath.endsWith("/renew") }
+            val renewPayload = Buffer().also { renewal.body!!.writeTo(it) }.readUtf8().let(::JSONObject)
+            assertFalse(renewPayload.has("node_rtt_samples"))
+        }
+    }
+
+    @Test fun `new Auto and country connections do not reuse a cached entry node`() = runBlocking {
+        for (mode in listOf(ServerSelectionMode.AUTO, ServerSelectionMode.COUNTRY)) Fixture().use { f ->
+            f.ready()
+            f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = mode, selectedCountryCode = "DE")) }.join()
+            f.connect()
+            withTimeout(10_000) { f.app.state.first { !it.loading && it.verified } }
+            val field = DesktopController::class.java.getDeclaredField("activeConnection").apply { isAccessible = true }
+            val cache = JSONObject((field.get(f.app) as JSONObject).toString())
+            val settings = checkNotNull(f.app.state.value.connectionSettings).let { it.copy(profile = it.profile.copy(
+                entryRoute = true, entryRouteExpiresAt = System.currentTimeMillis() + 60_000)) }
+            val routingHash = DesktopController::class.java.getDeclaredMethod("routingHash").apply { isAccessible = true }.invoke(f.app)
+            cache.put("settings", f.vault.encodeSettings(settings)).put("device_id", f.vault.deviceId)
+                .put("routing_hash", routingHash).put("requested_hops", settings.advancedSettings.multiHop.toString())
+            f.vault.writeEncrypted("entry-profile.dpapi", cache.toString())
+            f.app.disconnect()
+            withTimeout(5_000) { f.app.state.first { !it.loading && !it.running } }
+            val previous = f.sessionNodes.size
+            f.connect()
+            withTimeout(10_000) { f.app.state.first { !it.loading && it.running } }
+            assertTrue("A new selection must request fresh admission", f.sessionNodes.size > previous)
+            assertTrue(f.app.state.value.verified)
+        }
+    }
+
+    @Test fun `MultiHop country selection probes eligible nodes but explicit UUIDs do not`() = runBlocking {
+        for (countrySelection in listOf(true, false)) Fixture(nodeCount = 2).use { f ->
+            f.ready()
+            f.app.setWindowVisible(false)
+            val nodes = f.bootstrap.getJSONArray("locations").getJSONObject(0).getJSONArray("servers")
+            for (index in 0 until nodes.length()) nodes.getJSONObject(index)
+                .put("multihop_entry_available", true).put("multihop_exit_available", true)
+            val first = nodes.getJSONObject(0).getString("id")
+            val second = nodes.getJSONObject(1).getString("id")
+            val entry = if (countrySelection) HopSelection(ServerSelectionMode.COUNTRY, "DE") else HopSelection(ServerSelectionMode.SERVER, nodeId = first)
+            val exit = if (countrySelection) entry else HopSelection(ServerSelectionMode.SERVER, nodeId = second)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(multiHop = MultiHopSettings(true, entry, exit))) }.join()
+            val previous = f.tcpCalls.get()
+            f.connect()
+            withTimeout(10_000) { f.app.state.first { !it.loading } }
+            assertEquals(if (countrySelection) 2 else 0, f.tcpCalls.get() - previous)
+        }
+    }
     @get:org.junit.Rule val mainDispatcher: org.junit.rules.TestRule = DesktopMainDispatcherRule()
 
     @Test fun `native runtime logs survive removal of temporary config without synthetic UI diagnostics`() = runBlocking {
@@ -1091,14 +1203,13 @@ class DesktopConnectionTest {
     }
 
     @Test fun `RU country and automatic choices use fresh weighted random and exclude zero weight`() {
-        val nodes = (1..3).map { RuForeignNode("00000000-0000-4000-8000-${it.toString().padStart(12, '0')}", "Node $it", "DE") }
-        val physical = nodes.mapIndexed { i, n -> VpnServer(n.id, n.name, "DE", "de", "example.invalid", null, true,
-            weight = listOf(1, 9, 0)[i], metricsAt = java.time.Instant.now().minusSeconds(1).toString()) }
+        val nodes = (1..3).map { RuForeignNode("00000000-0000-4000-8000-${it.toString().padStart(12, '0')}", "Node $it", "DE",
+            weight = listOf(1, 9, 0)[it - 1], metricsAt = java.time.Instant.now().minusSeconds(1).toString()) }
         for (mode in listOf(ServerSelectionMode.AUTO, ServerSelectionMode.COUNTRY)) {
             val settings = DesktopState().settings.copy(userProfile = UserProfile(serverSelectionMode = mode, selectedCountryCode = "DE"))
-            assertEquals(nodes[0], DesktopController.ruExits(settings, nodes, physical) { .01 }.first())
-            assertEquals(nodes[1], DesktopController.ruExits(settings, nodes, physical) { .5 }.first())
-            assertEquals(2, DesktopController.ruExits(settings, nodes, physical).size)
+            assertEquals(nodes[0], DesktopController.ruExits(settings, nodes) { .01 }.first())
+            assertEquals(nodes[1], DesktopController.ruExits(settings, nodes) { .5 }.first())
+            assertEquals(2, DesktopController.ruExits(settings, nodes).size)
         }
     }
 
@@ -1805,18 +1916,6 @@ class DesktopConnectionTest {
         }
     }
 
-    @Test fun `RU multihop resolves country choices with the same physical weights`() {
-        val nodes = (1..4).map { i -> RuForeignNode("00000000-0000-4000-8000-${i.toString().padStart(12, '0')}", "Node $i", if (i < 3) "DE" else "FR") }
-        val servers = nodes.mapIndexed { i, node -> VpnServer(node.id, node.name, node.countryCode, node.countryCode, "example.invalid", null, true,
-            weight = listOf(0, 1, 1, 9)[i], metricsAt = java.time.Instant.now().toString()) }
-        val method = DesktopController.Companion::class.java.getDeclaredMethod("ruServers", List::class.java, List::class.java).also { it.isAccessible = true }
-        @Suppress("UNCHECKED_CAST") val ranked = method.invoke(DesktopController.Companion, nodes, servers) as List<VpnServer>
-        val chosen = DesktopController.resolveMultiHop(MultiHopSettings(true, HopSelection(ServerSelectionMode.COUNTRY, "DE"),
-            HopSelection(ServerSelectionMode.COUNTRY, "FR")), ranked, true) { .5 }
-        assertEquals(nodes[1].id, chosen.entry?.nodeId)
-        assertEquals(nodes[3].id, chosen.exit?.nodeId)
-    }
-
     @Test fun `multihop health is isolated by network and both hops`() {
         val entry = "00000000-0000-4000-8000-000000000001"
         val exit = "00000000-0000-4000-8000-000000000002"
@@ -1891,6 +1990,11 @@ class DesktopConnectionTest {
         val rebindCalls = AtomicInteger()
         val failRebinds = AtomicInteger()
         val stops = CopyOnWriteArrayList<Boolean>()
+        val routeSelections = CopyOnWriteArrayList<String>()
+        internal override suspend fun selectEntryRoute(current: Running, exitNodeId: String, generation: Long, enrollment: Boolean): Long {
+            routeSelections += exitNodeId
+            return 30
+        }
         val failStops = AtomicInteger()
         val failYoutubeStarts = AtomicInteger()
         @Volatile var armed = false
@@ -1994,6 +2098,16 @@ class DesktopConnectionTest {
         @Volatile var bootstrapGate: java.util.concurrent.CountDownLatch? = null
         @Volatile var sessionGate: java.util.concurrent.CountDownLatch? = null
         val youtubeCreateCalls = AtomicInteger()
+        val youtubeCatalogCalls = AtomicInteger()
+        val youtubeCatalogStatus = AtomicInteger(404)
+        val ruCatalogCalls = AtomicInteger()
+        val ruEntryRequests = CopyOnWriteArrayList<JSONObject>()
+        val ruEnrollStatus = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        val relayIds = listOf("33333333-3333-4333-8333-333333333331", "33333333-3333-4333-8333-333333333332")
+        val foreignId = "55555555-5555-4555-8555-555555555555"
+        val probeLatencies = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        val probesWhileActive = CopyOnWriteArrayList<String>()
+        val probedHosts = CopyOnWriteArrayList<String>()
         val wireGuardRegistrationCalls = AtomicInteger()
         val youtubePollCalls = AtomicInteger()
         val youtubeRenewCalls = AtomicInteger()
@@ -2098,6 +2212,34 @@ class DesktopConnectionTest {
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
                     JSONObject().put("id", youtubeKeyId).put("public_key", payload.getString("public_key"))
                 }
+                "/v1/vpn/ru-relays" -> {
+                    ruCatalogCalls.incrementAndGet()
+                    JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL).put("exit_node_id", JSONObject.NULL)
+                        .put("foreign_nodes", JSONArray().put(JSONObject().put("id", foreignId).put("name", "DE exit").put("country_code", "DE")
+                            .put("probe_host", "9.9.9.9").put("probe_port", 443).put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString())))
+                        .put("relays", JSONArray(relayIds.mapIndexed { index, id -> JSONObject().put("id", id).put("name", "RU $index")
+                            .put("country_code", "RU").put("available", true).put("pair_ready", true)
+                            .put("probe_host", if (index == 0) "8.8.8.8" else "1.1.1.1").put("probe_port", 443)
+                            .put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString()) }))
+                }
+                "/v1/vpn/ru-entry" -> {
+                    ruEntryRequests += JSONObject(payload.toString())
+                    status = ruEnrollStatus[payload.getString("relay_node_id")] ?: 200
+                    if (!consumeProof(payload.getString("device_nonce"))) status = 403
+                    JSONObject().put("relay_node_id", payload.getString("relay_node_id")).put("route_gateway", "10.240.3.1")
+                        .put("expires_at", java.time.Instant.now().plusSeconds(600).toString()).put("wireguard", JSONObject()
+                            .put("endpoint", "192.0.2.50:51820").put("address", "10.240.3.2/32")
+                            .put("server_public_key", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 }))
+                            .put("mtu", 1280).put("dns", JSONArray().put("1.1.1.1")).put("allowed_ips", JSONArray().put("0.0.0.0/0")))
+                }
+                "/v1/vpn/youtube-nodes" -> {
+                    youtubeCatalogCalls.incrementAndGet()
+                    status = youtubeCatalogStatus.get()
+                    if (request.header("X-Device-Id") != deviceId || request.header("X-Device-Key") != vault.deviceKey ||
+                        request.url.queryParameter("device_id") != deviceId || request.header("X-Youtube-Transport") != null) status = 403
+                    JSONObject().put("nodes", JSONArray().put(JSONObject().put("id", foreignId).put("name", "YT").put("country_code", "DE")
+                        .put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString()).put("probe_host", "9.9.9.9").put("probe_port", 443)))
+                }
                 "/v1/vpn/youtube-access" -> {
                     youtubeRequests += request
                     val create = youtubeCreateCalls.incrementAndGet()
@@ -2196,7 +2338,10 @@ class DesktopConnectionTest {
                 it.copy(advancedSettings = it.advancedSettings.copy(anonymousLogsEnabled = false))
             })
             app = DesktopController(vault, runtime, api, {}, network,
-                latencySampler = { ClientLatencySampler(tcpConnect = { _, _, _ -> tcpCalls.incrementAndGet(); tcpLatency.get().takeIf { it >= 0 } }, icmpPing = { _, _, _ -> null }) },
+                latencySampler = { ClientLatencySampler(tcpConnect = { host, _, _ -> tcpCalls.incrementAndGet();
+                    probedHosts += host
+                    if (runtime.active != null) probesWhileActive += host
+                    (probeLatencies[host] ?: tcpLatency.get()).takeIf { it >= 0 } }, icmpPing = { _, _, _ -> null }) },
                 monotonicMillis = clock::get, dnsPolicySnapshot = { dnsSnapshot() })
         }
         suspend fun ready() = withTimeout(5_000) {
@@ -2204,6 +2349,11 @@ class DesktopConnectionTest {
             val operation = DesktopController::class.java.getDeclaredField("operation").apply { isAccessible = true }
                 .get(app) as kotlinx.coroutines.sync.Mutex
             operation.withLock { }
+        }
+        suspend fun connect() {
+            app.connect()
+            withTimeout(15_000) { (DesktopController::class.java.getDeclaredField("connectionJob")
+                .apply { isAccessible = true }.get(app) as Job?)?.join() }
         }
         suspend fun measureLatencies() {
             app.refreshServerLatencies()

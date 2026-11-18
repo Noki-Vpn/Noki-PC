@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "com.noki"
-version = "1.9.5"
+version = "1.9.7"
 
 val desktopTarget = providers.gradleProperty("desktopTarget").orElse("windows").get()
 require(desktopTarget in setOf("linux", "windows")) { "desktopTarget must be linux or windows" }
@@ -198,7 +198,9 @@ nucleus {
             imageName.set("Noki")
             maxHeapSize.set("512m")
             nativeImageConfigBaseDir.set(layout.projectDirectory.dir("graalvm"))
-            buildArgs.addAll("-J-Xmx6g", "--parallelism=3",
+            buildArgs.addAll("-J-Xmx6g", "--parallelism=3", "--no-fallback",
+                // The connection coroutine's retry loops exceed the default analysis budget.
+                "-H:MaxDuplicationFactor=20.0",
                 "-H:IncludeLocales=ru,en",
                 "-R:MaxHeapFree=4m",
                 "-H:ExcludeResources=nucleus/native/.*",

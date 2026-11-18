@@ -399,13 +399,13 @@ class DesktopControllerTest {
         val saved = MultiHopSettings(true, country, country)
         val catalog = listOf(light, heavy, node(3, 0), node(4).copy(isOnline = false),
             node(5).copy(multiHopEntryAvailable = false, multiHopExitAvailable = false))
-        val resolved = DesktopController.resolveMultiHop(saved, catalog, false) { .5 }
+        val resolved = DesktopController.resolveMultiHop(saved, catalog) { .5 }
         assertEquals(heavy.id to light.id, resolved.explicitNodeIds())
         assertEquals(country, saved.entry); assertEquals(country, saved.exit)
         val explicitExit = saved.copy(exit = HopSelection(ServerSelectionMode.SERVER, nodeId = heavy.id))
-        assertEquals(light.id to heavy.id, DesktopController.resolveMultiHop(explicitExit, catalog, false) { .5 }.explicitNodeIds())
-        assertTrue(runCatching { DesktopController.resolveMultiHop(saved, listOf(light), false) }.isFailure)
-        assertEquals(saved.copy(enabled = false), DesktopController.resolveMultiHop(saved.copy(enabled = false), emptyList(), false))
+        assertEquals(light.id to heavy.id, DesktopController.resolveMultiHop(explicitExit, catalog) { .5 }.explicitNodeIds())
+        assertTrue(runCatching { DesktopController.resolveMultiHop(saved, listOf(light)) }.isFailure)
+        assertEquals(saved.copy(enabled = false), DesktopController.resolveMultiHop(saved.copy(enabled = false), emptyList()))
         val directory = Files.createTempDirectory("noki-country-hops")
         try {
             val vault = WindowsVault(directory)
@@ -539,7 +539,7 @@ class DesktopControllerTest {
         }
     }
 
-    @Test fun `RU selection keeps explicit route nodes and never substitutes a missing exit`() {
+    @Test fun `RU selection keeps its own exit when old MultiHop settings are present`() {
         val entry = "10000000-0000-4000-8000-000000000001"
         val exit = "10000000-0000-4000-8000-000000000002"
         val other = "10000000-0000-4000-8000-000000000003"
@@ -550,10 +550,9 @@ class DesktopControllerTest {
         assertTrue(DesktopController.ruExits(settings.copy(userProfile = settings.userProfile.copy(selectedNodeId = "missing")), nodes).isEmpty())
         val hops = MultiHopSettings(true, HopSelection(ServerSelectionMode.SERVER, nodeId = entry), HopSelection(ServerSelectionMode.SERVER, nodeId = exit))
         val multi = settings.copy(advancedSettings = settings.advancedSettings.copy(multiHop = hops))
-        assertEquals(listOf(exit), DesktopController.ruExits(multi, nodes).map { it.id })
-        assertTrue(DesktopController.ruExits(multi, nodes.filterNot { it.id == exit }).isEmpty())
-        assertTrue(runCatching { DesktopController.ruExits(multi.copy(advancedSettings = multi.advancedSettings.copy(
-            multiHop = hops.copy(entry = HopSelection(ServerSelectionMode.COUNTRY, countryCode = "FI")))), nodes) }.isFailure)
+        assertEquals(listOf(other), DesktopController.ruExits(multi, nodes).map { it.id })
+        assertTrue(DesktopController.ruExits(multi, nodes.filterNot { it.id == other }).isEmpty())
+        assertEquals(hops.copy(enabled = false), multi.advancedSettings.normalizeRouteModes().multiHop)
         assertEquals(nodes.map { it.id }.toSet(), DesktopState(settings = multi, ruForeignNodes = nodes).connectionLocations.flatMap { it.servers }.map { it.id }.toSet())
     }
 
@@ -831,7 +830,7 @@ class DesktopControllerTest {
                 }
                 "/v1/locations" -> catalog.getJSONArray("locations")
                 "/v1/auth/logout" -> { if (failLogout.get()) status = 503; JSONObject() }
-                "/v1/app/geosite" -> if (invalidGeosite.get()) JSONObject().put("sha256", "invalid").put("size_bytes", 1024)
+                "/v1/app/geosite" -> if (invalidGeosite.get()) JSONObject().put("version", "invalid").put("release_size_bytes", 1024)
                     else { status = 503; JSONObject().put("detail", "offline geosite service") }
                 "/v1/vpn/access" -> JSONObject().put("can_connect", true)
                 "/v1/devices/challenge" -> JSONObject().put("device_id", "pc-device").put("nonce", "test-vpn-challenge")
@@ -1025,9 +1024,13 @@ class DesktopControllerTest {
             withTimeout(15_000) { while (app.state.value.loading || calls.none { it.first == "/v1/vpn/session" }) kotlinx.coroutines.delay(10) }
             val route = calls.last { it.first == "/v1/vpn/session" }.second
             assertEquals("auto", route.getString("profile_code"))
-            for (key in listOf("country_code", "location_code", "node_id", "exclude_location_code")) assertTrue(route.isNull(key))
-            assertEquals(entryId, route.getJSONObject("multihop").getJSONObject("entry").getString("node_id"))
-            assertEquals(exitId, route.getJSONObject("multihop").getJSONObject("exit").getString("node_id"))
+            assertEquals(setOf("device_key", "device_id", "device_nonce", "device_signature", "profile_code",
+                "capabilities", "country_code", "location_code", "node_id"), route.keySet())
+            assertEquals("DE", route.getString("country_code"))
+            assertEquals("de", route.getString("location_code"))
+            assertEquals(entryId, route.getString("node_id"))
+            assertEquals(listOf("nokinv_v1", "nokinv_release_v1", "entry_route_v1"), route.getJSONArray("capabilities").toList())
+            assertFalse("The exit is selected through the core after entry admission", route.has("multihop"))
             assertEquals(hops, app.state.value.settings.advancedSettings.multiHop)
             assertFalse(app.state.value.running)
             assertFalse(Files.exists(directory.resolve("runtime.dpapi")))
@@ -1036,7 +1039,7 @@ class DesktopControllerTest {
             val geositeRequests = calls.count { it.first == "/v1/app/geosite" }
             app.connect()
             withTimeout(10_000) { while (app.state.value.loading || calls.count { it.first == "/v1/app/geosite" } <= geositeRequests) kotlinx.coroutines.delay(10) }
-            assertEquals("Invalid geosite metadata must stop admission instead of using a fallback", admitted, calls.count { it.first == "/v1/vpn/session" })
+            assertTrue(calls.count { it.first == "/v1/vpn/session" } > admitted)
             app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(multiHop = MultiHopSettings())) }
             withTimeout(5_000) { app.state.first { !it.loading && !it.settings.advancedSettings.multiHop.enabled } }
 

@@ -33,11 +33,12 @@ internal object LinuxPlatform {
         }
     }
 
-    fun helper(action: String): JSONObject {
+    fun helper(action: String, request: JSONObject? = null): JSONObject {
         val executable = Path.of("/usr/libexec/noki/core-helper")
         check(Files.isRegularFile(executable) && (Files.getAttribute(executable, "unix:uid") as Number).toInt() == 0 &&
             (Files.getAttribute(executable, "unix:mode") as Number).toInt() and 0x12 == 0) { "Установите системный пакет Noki для Linux" }
-        val result = command(listOf("/usr/bin/pkexec", "--disable-internal-agent", executable.toString(), action, ProcessHandle.current().pid().toString()))
+        val result = command(listOf("/usr/bin/pkexec", "--disable-internal-agent", executable.toString(), action, ProcessHandle.current().pid().toString()),
+            request?.toString()?.toByteArray() ?: byteArrayOf())
         val reply = runCatching { JSONObject(result.second.trim()) }.getOrNull()
         check(result.first == 0 && reply?.optBoolean("ok") == true) { reply?.optString("error")?.takeIf(String::isNotBlank)
             ?: "Нет разрешения polkit на управление Noki VPN" }
@@ -90,8 +91,8 @@ internal object LinuxPlatform {
 
     internal fun tcpLatency(host: String, port: Int, timeoutMs: Int, interfaceIndex: Int,
         tunnelPresent: Boolean = java.net.NetworkInterface.getByName("Noki") != null): Int? {
-        // shortcut: physical probes pause with TUN; replace when a constrained interface-bound probe is available.
-        if (tunnelPresent) return null
+        if (tunnelPresent) return physicalProbes(listOf(com.noki.vpn.data.ClientLatencySampler.ProbeTarget("endpoint", host, port)),
+            interfaceIndex, startup = true)["endpoint"]
         return com.noki.vpn.data.DeviceLatency.measureTcpConnectMs(host, port, timeoutMs, onDiagnostic = {},
             socketFactory = { java.net.Socket().apply {
                 val address = java.net.NetworkInterface.getByIndex(interfaceIndex)?.inetAddresses?.toList()
@@ -99,6 +100,22 @@ internal object LinuxPlatform {
                 bind(java.net.InetSocketAddress(checkNotNull(address) { "Физическая сеть недоступна" }, 0))
             } })
     }
+
+    internal fun physicalProbes(targets: List<com.noki.vpn.data.ClientLatencySampler.ProbeTarget>, interfaceIndex: Int,
+                               startup: Boolean): Map<String, Int> = runCatching {
+        val request = JSONObject().put("interface_index", interfaceIndex).put("startup", startup)
+            .put("targets", org.json.JSONArray(targets.take(64).map { target ->
+                if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException("Physical probes cancelled")
+                val address = target.host.takeIf { target.port != null && it.isNotBlank() }?.let {
+                    com.noki.vpn.data.DeviceLatency.resolveAddress(it, 200)?.hostAddress
+                }
+                JSONObject().put("key", target.key).put("host", address).put("port", target.port.takeIf { address != null })
+                    .put("probe_ip", target.probeIp)
+            }))
+        if (targets.isEmpty()) emptyMap() else helper("probe", request).getJSONObject("samples").let { values ->
+            values.keys().asSequence().mapNotNull { key -> values.optInt(key).takeIf { it in 1..3000 }?.let { key to it } }.toMap()
+        }
+    }.getOrElse { emptyMap() }
 
     fun snapshot(): WindowsNetworkSnapshot {
         val rows = Files.readAllLines(Path.of("/proc/net/route")).drop(1).map { it.trim().split(Regex("\\s+")) }

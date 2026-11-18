@@ -622,14 +622,9 @@ class DesktopUiTest {
             render()
             assertNotNull(label("Рабочие сайты"))
             click("Российские ресурсы")
+            assertNotNull(label("Без VPN · домены, DNS и IP-адреса"))
             assertNull(label("Удалить правило"))
-            click("Отключить")
-            withTimeout(5_000) { app.state.first { !it.loading && it.routingRules.any { row -> row.id == DesktopRoutingRule.RUSSIAN_RESOURCES.id && !row.enabled } } }
-            assertFalse(vault.loadRoutingRules().single { it.id == DesktopRoutingRule.RUSSIAN_RESOURCES.id }.enabled)
-            render()
-            click("Российские ресурсы")
-            click("Включить")
-            withTimeout(5_000) { app.state.first { !it.loading && it.routingRules.any { row -> row.id == DesktopRoutingRule.RUSSIAN_RESOURCES.id && row.enabled } } }
+            assertNull(label("Отключить"))
             scene.close()
             scene = ImageComposeScene(700, 850, density = Density(1f)) {
                 val state by app.state.collectAsState()

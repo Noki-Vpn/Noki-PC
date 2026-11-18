@@ -15,7 +15,7 @@ class GeositeAssetTest {
     }
     @Test
     fun bundledRussianResourcesIncludeWholeTldsAndServicesOutsideRu() {
-        val bytes = checkNotNull(javaClass.getResourceAsStream("/noki/vpn/geosite.dat")).use { it.readBytes() }
+        val bytes = com.noki.desktop.SingBoxConfig.bundledGeosite()
         val russian = GeositeAsset.resolveDomains(bytes, setOf("geosite:category-ru")).getValue("geosite:category-ru")
         val suffixes = russian.getJSONArray("domain_suffix").toList().toSet()
         assertTrue(suffixes.containsAll(listOf("ru", "su", "xn--p1ai", "moscow")))

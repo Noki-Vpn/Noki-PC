@@ -139,19 +139,20 @@ internal class BackendContentClient(
         abis: List<String>,
     ): Boolean = androidUpdate(token, versionCode, abis).updateAvailable
 
-    suspend fun geositeMetadata(): Pair<String, Int> = withContext(Dispatchers.IO) {
+    suspend fun geodataMetadata(): Pair<String, Int>? = withContext(Dispatchers.IO) {
         val response = execute(Request.Builder().url(jsonApi.apiUrl("/app/geosite")).get().build())
-        val digest = response.getString("sha256").lowercase(Locale.ROOT)
-        val size = response.getInt("size_bytes")
-        require(digest.matches(Regex("[0-9a-f]{64}")) && size in 1024..GEOSITE_MAX_BYTES) {
-            "geosite_metadata_invalid"
+        if (!response.has("version")) return@withContext null
+        val version = response.getString("version")
+        val size = response.getInt("release_size_bytes")
+        require(version.matches(com.noki.vpn.vpn.GeositeAsset.VERSION_PATTERN) && size in 1..com.noki.vpn.vpn.GeositeAsset.MAX_RELEASE_BYTES) {
+            "geodata_metadata_invalid"
         }
-        digest to size
+        version to size
     }
 
-    suspend fun downloadGeosite(expectedSize: Int): ByteArray = withContext(Dispatchers.IO) {
-        require(expectedSize in 1024..GEOSITE_MAX_BYTES)
-        val request = Request.Builder().url(jsonApi.apiUrl("/app/geosite/file")).get().build()
+    suspend fun downloadGeodata(version: String, expectedSize: Int): ByteArray = withContext(Dispatchers.IO) {
+        require(version.matches(com.noki.vpn.vpn.GeositeAsset.VERSION_PATTERN) && expectedSize in 1..com.noki.vpn.vpn.GeositeAsset.MAX_RELEASE_BYTES)
+        val request = Request.Builder().url(jsonApi.apiUrl("/app/geosite/releases/$version")).get().build()
         val downloaded = ByteArrayOutputStream(expectedSize)
         val coroutine = currentCoroutineContext()
         jsonApi.stream(request) { body ->
@@ -401,7 +402,6 @@ internal class BackendContentClient(
         private const val AVATAR_UPLOAD_MAX_BYTES = 1L * 1024L * 1024L
         private const val AVATAR_DOWNLOAD_MAX_BYTES = 5L * 1024L * 1024L
         private const val APK_DOWNLOAD_MAX_BYTES = 256L * 1024L * 1024L
-        private const val GEOSITE_MAX_BYTES = 32 * 1024 * 1024
     }
 }
 

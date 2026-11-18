@@ -373,7 +373,7 @@ class BackendApiClient(
             .put("device_nonce", deviceNonce)
             .put("device_signature", deviceSignature)
             .put("profile_code", if (hops != null) "auto" else profileCode)
-            .put("capabilities", JSONArray().put("nokinv_v1").put("nokinv_release_v1"))
+            .put("capabilities", JSONArray().put("nokinv_v1").put("nokinv_release_v1").put("entry_route_v1"))
             .put("country_code", countryCode)
             .put("location_code", locationCode)
             .put("exclude_location_code", excludeLocationCode)
@@ -417,6 +417,16 @@ class BackendApiClient(
             .get().build())
         RuRelayCatalogJsonParser.parse(json, exitId, entryId, routeVersion)
     }
+
+    internal suspend fun enrollRuEntry(
+        token: String, deviceId: String, deviceKey: String, nonce: String, signature: String,
+        publicKeyId: String, relayNodeId: String,
+    ): RuEntryCredential = RuWireGuardSessionJsonParser.parseEntryCredential(
+        postJson("/vpn/ru-entry", JSONObject().put("device_id", deviceId).put("device_key", deviceKey)
+            .put("device_nonce", nonce).put("device_signature", signature).put("public_key_id", canonicalRuUuid(publicKeyId))
+            .put("relay_node_id", canonicalRuUuid(relayNodeId)), token),
+        expectedRelay = relayNodeId,
+    )
 
     override suspend fun createRuWireGuardSession(
         token: String,
@@ -487,6 +497,21 @@ class BackendApiClient(
         require(it.identity.hasSameAuthorization(identity)) {
             "ru_wireguard_session_changed"
         }
+    }
+
+    suspend fun youtubeNodes(token: String, deviceId: String, deviceKey: String?): List<VpnServer> = withContext(Dispatchers.IO) {
+        val url = jsonApi.apiUrl("/vpn/youtube-nodes").toHttpUrl().newBuilder()
+            .addQueryParameter("device_id", canonicalRuUuid(deviceId)).build()
+        val nodes = execute(Request.Builder().url(url).header("Authorization", "Bearer $token")
+            .currentDeviceHeaders(deviceId, deviceKey).get().build()).getJSONArray("nodes")
+        (0 until nodes.length()).map { index -> nodes.getJSONObject(index).let { node ->
+            val country = node.getString("country_code")
+            VpnServer(canonicalRuUuid(node.getString("id")), node.getString("name"), country, country.lowercase(),
+                node.optBackendString("probe_host") ?: node.optBackendString("probe_ip").orEmpty(),
+                node.optBackendInt("probe_port")?.takeIf { it in 1..65535 }, true,
+                metricsAt = node.optBackendString("metrics_at"), weight = node.selectionWeight(),
+                probeHost = node.optBackendString("probe_host"), probeIp = node.optBackendString("probe_ip"))
+        } }.also { require(it.map { node -> node.id }.distinct().size == it.size) { "youtube_nodes_duplicate" } }
     }
 
     suspend fun createYoutubeAccess(token: String, request: YoutubeAccessRequest): BackendYoutubeAccess = withContext(Dispatchers.IO) {
@@ -842,9 +867,9 @@ class BackendApiClient(
         abis: List<String>,
     ): Boolean = contentClient.androidUpdateAvailable(token, versionCode, abis)
 
-    suspend fun geositeMetadata(): Pair<String, Int> = contentClient.geositeMetadata()
+    suspend fun geodataMetadata(): Pair<String, Int>? = contentClient.geodataMetadata()
 
-    suspend fun downloadGeosite(expectedSize: Int): ByteArray = contentClient.downloadGeosite(expectedSize)
+    suspend fun downloadGeodata(version: String, expectedSize: Int): ByteArray = contentClient.downloadGeodata(version, expectedSize)
 
     suspend fun uploadAvatar(
         token: String,

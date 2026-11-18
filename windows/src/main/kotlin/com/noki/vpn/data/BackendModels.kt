@@ -264,6 +264,8 @@ data class BackendVpnSession(
     val endpointCandidates: List<BackendEndpointCandidate>,
     val connectIp: String? = null,
     val multiHop: BackendMultiHopSession? = null,
+    val entryRoute: Boolean = false,
+    val entryRouteExpiresAt: Long? = null,
     val nokinvToken: String = "",
     val nokinvCredentialGeneration: Int = 0,
 )
@@ -275,7 +277,14 @@ data class BackendMultiHopSession(
     val entryIp: String,
     val policyHash: String,
     val version: Int = 2,
-)
+) {
+    companion object {
+        internal fun atEntry(selection: MultiHopSettings): BackendMultiHopSession {
+            val (entry, exit) = checkNotNull(selection.explicitNodeIds())
+            return BackendMultiHopSession(selection, entry, exit, entryIp = "", policyHash = "", version = 3)
+        }
+    }
+}
 
 data class RuWireGuardSessionExpectation(
     val requestId: String,
@@ -332,6 +341,13 @@ data class PendingRuWireGuardRevoke(
     val provisional: Boolean = false,
 )
 
+internal data class RuEntryCredential(
+    val relayNodeId: String,
+    val wireguard: BackendRuWireGuardConfig,
+    val routeGateway: String,
+    val expiresAtEpochMillis: Long,
+)
+
 data class BackendRuWireGuardConfig(
     val endpoint: String,
     val serverPublicKey: String,
@@ -348,6 +364,7 @@ data class YoutubeAccessRequest(
     val deviceSignature: String,
     val requestId: String,
     val publicKeyId: String,
+    val nodeRttSamples: List<RuRelayRttSample> = emptyList(),
 )
 
 data class BackendYoutubeAccess(

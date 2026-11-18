@@ -6,7 +6,7 @@ fun latencyTargetKey(location: ServerLocation): String? =
     latencyTargetKey(location.code, location.host)
 
 fun latencyTargetKey(server: VpnServer): String? =
-    latencyTargetKey(server.id, "${server.host}:${server.probePort ?: 0}")
+    latencyTargetKey(server.id, "${server.probeHost ?: server.host}:${server.probePort ?: 0}" + server.probeIp?.let { "|$it" }.orEmpty())
 
 fun latencyTargetKey(node: RuForeignNode): String = "ru:${node.id}"
 

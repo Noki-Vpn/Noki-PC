@@ -1,16 +1,62 @@
 package com.noki.vpn.vpn
 import com.noki.vpn.data.DomainRulePolicy
 import java.nio.ByteBuffer
+import java.io.ByteArrayInputStream
 import java.nio.CharBuffer
 import java.nio.charset.CharsetDecoder
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.zip.ZipInputStream
 import org.json.JSONArray
 import org.json.JSONObject
 object GeositeAsset {
     const val MAX_BYTES = 32 * 1024 * 1024
+    const val MAX_RELEASE_BYTES = 2 * MAX_BYTES + 65536
+    internal val VERSION_PATTERN = Regex("[0-9a-f]{64}")
+    internal data class Release(val version: String, val geosite: ByteArray, val russianIp: List<String>)
+
+    internal fun readRelease(bytes: ByteArray): Release {
+        require(bytes.size in 1..MAX_RELEASE_BYTES) { "geodata_release_size_invalid" }
+        val entries = mutableMapOf<String, ByteArray>()
+        ZipInputStream(ByteArrayInputStream(bytes)).use { archive ->
+            while (true) {
+                val entry = archive.nextEntry ?: break
+                val limit = when (entry.name) {
+                    "manifest.json" -> 4096
+                    "geosite.dat", "geoip.dat" -> MAX_BYTES
+                    else -> error("geodata_member_invalid")
+                }
+                require(entry.name !in entries) { "geodata_duplicate_member" }
+                val member = archive.readNBytes(limit + 1)
+                require(member.size in 1..limit) { "geodata_member_size_invalid" }
+                entries[entry.name] = member
+            }
+        }
+        val manifest = JSONObject(entries.getValue("manifest.json").decodeToString())
+        fun verified(name: String): ByteArray {
+            val metadata = manifest.getJSONObject(name)
+            return entries.getValue("$name.dat").also {
+                require(it.size == metadata.getInt("size_bytes") && sha256(it) == metadata.getString("sha256")) {
+                    "geodata_checksum_mismatch"
+                }
+            }
+        }
+        val site = verified("geosite")
+        val ip = verified("geoip")
+        val version = sha256("${manifest.getJSONObject("geosite").getString("sha256")}:${manifest.getJSONObject("geoip").getString("sha256")}".encodeToByteArray())
+        require(version == manifest.getString("version")) { "geodata_version_mismatch" }
+        val ru = resolveDomains(site, setOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)).getValue(DomainRulePolicy.RUSSIAN_RESOURCES_RULE)
+        val suffixes = ru.getJSONArray("domain_suffix")
+        require(setOf("ru", "su", "xn--p1ai").all { suffix -> (0 until suffixes.length()).any { suffixes.getString(it) == suffix } }) {
+            "geodata_required_suffix_missing"
+        }
+        val match = resolveCustom(ip, "ru")
+        val cidrs = match.getJSONArray("ip_cidr")
+        require(!match.optBoolean("invert") && cidrs.length() > 0) { "geodata_ru_ip_invalid" }
+        return Release(version, site, (0 until cidrs.length()).map(cidrs::getString))
+    }
     private var validatedDigest: String? = null
     fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
         .digest(bytes).joinToString("") { "%02x".format(it) }

@@ -6,13 +6,15 @@ object EndpointSelector {
         candidate: BackendEndpointCandidate,
     ): VlessProfile {
         session.multiHop?.let { route ->
-            require(candidate.nodeId == route.exitNodeId && candidate.entryHost == route.entryIp &&
-                candidate.connectIp == route.entryIp && candidate.entryPort in 20000..29999) { "multihop_exit_mismatch" }
+            val valid = if (route.version == 3) session.entryRoute && candidate.nodeId == route.entryNodeId
+                else candidate.nodeId == route.exitNodeId && candidate.entryHost == route.entryIp &&
+                    candidate.connectIp == route.entryIp && candidate.entryPort in 20000..29999
+            require(valid) { if (route.version == 3) "multihop_entry_mismatch" else "multihop_exit_mismatch" }
         }
         return profileFromCandidate(candidate, session.vpnSecret, session.vpnUsername).copy(
             remark = "Noki ${candidate.locationName.ifBlank { session.locationName }}",
             proxyType = candidate.proxyType.ifBlank { session.proxyType },
-            multiHop = session.multiHop,
+            multiHop = session.multiHop, entryRoute = session.entryRoute, entryRouteExpiresAt = session.entryRouteExpiresAt,
             nokinvToken = if (EndpointTransportPolicy.isNokiNv(candidate)) session.nokinvToken else "",
             nokinvCredentialGeneration = if (EndpointTransportPolicy.isNokiNv(candidate)) session.nokinvCredentialGeneration else 0,
         )

@@ -12,8 +12,8 @@ import tempfile
 import urllib.request
 import zipfile
 
-VERSION = '1.14.1-extended-2.7.2-nokinv-30-pc'
-SOURCE_HASH = '7f46244f661f0ac15a885d19d8b7350bf13b5ee234b52a92880fc63f63961263'
+VERSION = '1.14.1-extended-2.7.2-nokinv-32-pc'
+SOURCE_HASH = 'fad07f758f7a8893f4c461bde9fb82689377ba6a867b86444ae47d61e0609bec'
 GO_VERSION = '1.26.9'
 GO_HASH = '42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d'
 CRONET_REVISION = 'c10c03c318db'
@@ -101,6 +101,15 @@ def main():
         source = build / 'src'
         subprocess.run([str(go), 'mod', 'download'], cwd=source, env=environment, check=True)
         subprocess.run([str(go), 'mod', 'verify'], cwd=source, env=environment, check=True)
+        upstream_tun = Path(environment['GOMODCACHE']) / 'github.com/sagernet/sing-tun@v0.9.3'
+        if digest(upstream_tun / 'flow_dispatch.go') != 'bdfc3bac4b20749310d9c61ce758fbd3c98ed2dff0fc613205f1d0319dded09e':
+            raise ValueError('Pinned flow dispatcher source mismatch')
+        patched_tun = build / 'sing-tun-pc'
+        shutil.copytree(upstream_tun, patched_tun)
+        dispatcher = patched_tun / 'flow_dispatch.go'
+        dispatcher.chmod(0o644)
+        shutil.copyfile(source / 'pc-patches/flow_dispatch.go.patch', dispatcher)
+        workspace.write_text(f'go {GO_VERSION}\n\nuse ./src\n\nreplace github.com/sagernet/sing-tun => ./sing-tun-pc\n')
         subprocess.run([str(go), 'build', f'-tags={TAGS}', '-trimpath', '-buildvcs=false',
                         f'-ldflags=-X github.com/sagernet/sing-box/constant.Version={VERSION} -s -w -buildid= -checklinkname=0',
                         '-o', str(build / 'sing-box'), './cmd/sing-box'], cwd=source, env=environment, check=True)

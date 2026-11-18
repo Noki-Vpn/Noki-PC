@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 import types
 import unittest
+import io
+import json
 from unittest.mock import patch
 
 if sys.platform != 'linux':
@@ -14,6 +16,28 @@ spec.loader.exec_module(helper)
 
 
 class LinuxHelperTest(unittest.TestCase):
+    def test_empty_physical_probe_batch_never_changes_vpn_or_guard(self):
+        with patch.object(helper.sys, 'platform', 'linux'), \
+                patch.object(helper.os, 'geteuid', return_value=0, create=True), \
+                patch.dict(helper.os.environ, {'PKEXEC_UID': '1000'}, clear=True), \
+                patch.object(helper.pwd, 'getpwuid', return_value=types.SimpleNamespace(), create=True), \
+                patch.object(helper, 'gui_scope', return_value='owned-scope'), \
+                patch.object(helper.sys, 'stdin', io.StringIO(json.dumps({'interface_index': 3, 'targets': [], 'startup': True}))), \
+                patch.object(helper, 'invoke', side_effect=AssertionError('A read-only probe must not change networking')):
+            self.assertEqual({'samples': {}}, helper.main(['probe', '42']))
+
+    def test_physical_probe_rejects_private_destinations_before_any_socket_is_opened(self):
+        request = {'interface_index': 3, 'startup': True,
+                   'targets': [{'key': 'node', 'host': '127.0.0.1', 'port': 443, 'probe_ip': None}]}
+        with patch.object(helper.sys, 'platform', 'linux'), \
+                patch.object(helper.os, 'geteuid', return_value=0, create=True), \
+                patch.dict(helper.os.environ, {'PKEXEC_UID': '1000'}, clear=True), \
+                patch.object(helper.pwd, 'getpwuid', return_value=types.SimpleNamespace(), create=True), \
+                patch.object(helper, 'gui_scope', return_value='owned-scope'), \
+                patch.object(helper.sys, 'stdin', io.StringIO(json.dumps(request))):
+            with self.assertRaisesRegex(ValueError, 'public'):
+                helper.main(['probe', '42'])
+
     def test_youtube_uses_the_existing_core_without_a_local_helper(self):
         self.assertFalse(hasattr(helper, "byedpi_start"))
         self.assertFalse(hasattr(helper, "byedpi_arguments"))

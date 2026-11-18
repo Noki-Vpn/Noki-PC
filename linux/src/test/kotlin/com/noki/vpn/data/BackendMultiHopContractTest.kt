@@ -181,7 +181,7 @@ class BackendMultiHopContractTest {
             val request = JSONObject(buffer.readUtf8())
             assertFalse(request.has("route_mode"))
             assertEquals("auto", request.getString("profile_code"))
-            assertEquals(listOf("nokinv_v1", "nokinv_release_v1"), request.getJSONArray("capabilities").toList())
+            assertEquals(listOf("nokinv_v1", "nokinv_release_v1", "entry_route_v1"), request.getJSONArray("capabilities").toList())
             assertEquals(2, request.getJSONObject("multihop").getInt("version"))
             assertEquals(selection.entry!!.nodeId, request.getJSONObject("multihop").getJSONObject("entry").getString("node_id"))
             assertEquals(selection.exit!!.nodeId, request.getJSONObject("multihop").getJSONObject("exit").getString("node_id"))

@@ -304,13 +304,16 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
                                     }
                                     CountryCatalog(state, Modifier.weight(1f).fillMaxWidth(),
                                         HopSelection(state.settings.userProfile.serverSelectionMode, state.settings.userProfile.selectedCountryCode, state.selectedServerId), onSelect = ::selectLocation)
-                                    if (!isFreePlan) Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).pcCard(DesktopUiKit.Surface, DesktopUiKit.MenuShape).border(.5.dp, Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape).pcClickable(shape = DesktopUiKit.MenuShape) { navigate(DesktopPage.MULTIHOP) }.padding(horizontal = 16.dp, vertical = 8.dp),
+                                     val multiHopAvailable = !state.settings.advancedSettings.ruRelayEnabled
+                                     if (!isFreePlan) Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).pcCard(DesktopUiKit.Surface, DesktopUiKit.MenuShape).border(.5.dp, Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape).pcClickable(enabled = multiHopAvailable, shape = DesktopUiKit.MenuShape) { navigate(DesktopPage.MULTIHOP) }.padding(horizontal = 16.dp, vertical = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                             PcText(tr(state, "Мультихоп", "MultiHop"), size = 14, lineHeight = 20)
-                                            PcText(tr(state, "Выключен", "Disabled"), size = 11, lineHeight = 14, color = DesktopUiKit.Muted)
+                                             PcText(if (multiHopAvailable) tr(state, "Выключен", "Disabled") else
+                                                 tr(state, "Недоступен при включённом RU-реле", "Unavailable while RU relay is enabled"),
+                                                 size = 11, lineHeight = 14, color = DesktopUiKit.Muted)
                                         }
-                                        PcIcon("chevronRight", null, Modifier.size(8.dp, 11.dp))
+                                         if (multiHopAvailable) PcIcon("chevronRight", null, Modifier.size(8.dp, 11.dp))
                                     }
                                 } else MultiHopPage(state, app, onBack = { navigate(if (multiHop.enabled) DesktopPage.HOME else DesktopPage.SERVERS) }, onDone = ::navigate)
                             }
@@ -793,17 +796,16 @@ private fun copyText(value: String, app: DesktopController) {
         PcButton(tr(state, "Добавить", "Add"), Modifier.height(44.dp).widthIn(min = 132.dp), iconVector = Icons.Rounded.Add, iconSize = 18.dp,
             selected = true, enabled = !state.loading, onClick = { show { RoutingRuleDialog(state, app, null) { show(null) } } })
     }
-    if (state.routingRules.isEmpty()) PcText(tr(state, "Добавьте домены, IP-адреса или приложения.", "Add domains, IP addresses or applications."), size = 13, color = DesktopUiKit.Muted)
-    for (rule in state.routingRules) {
-        val russianResources = rule.domains == DesktopRoutingRule.RUSSIAN_RESOURCES.domains && rule.ips.isEmpty() && rule.applications.isEmpty()
+    PcMenuRow(tr(state, "Российские ресурсы", "Russian resources"),
+        tr(state, "Без VPN · домены, DNS и IP-адреса", "Bypass VPN · domains, DNS and IP addresses"), enabled = false) {}
+    for (rule in state.routingRules.filterNot { it.id == DesktopRoutingRule.RUSSIAN_RESOURCES.id }) {
         val mode = tr(state, if (rule.bypass) "Без VPN" else "Через VPN", if (rule.bypass) "Bypass VPN" else "Through VPN")
         val resources = listOfNotNull(
             rule.domains.takeIf { it.isNotEmpty() }?.let { "${it.size} " + tr(state, "доменов", "domains") },
             rule.ips.takeIf { it.isNotEmpty() }?.let { "${it.size} IP" },
             rule.applications.takeIf { it.isNotEmpty() }?.let { "${it.size} " + tr(state, "приложений / папок", "applications / folders") },
             rule.ruleSets.takeIf { it.isNotEmpty() }?.let { "${it.size} " + tr(state, "списков", "lists") }).joinToString(" · ")
-        val target = if (russianResources) tr(state, "Российские ресурсы", "Russian resources") else rule.name
-        PcMenuRow(target, if (!rule.enabled) tr(state, "Отключено", "Disabled") else if (russianResources) mode else "$mode · $resources", enabled = !state.loading) {
+        PcMenuRow(rule.name, if (!rule.enabled) tr(state, "Отключено", "Disabled") else "$mode · $resources", enabled = !state.loading) {
             show { RoutingRuleDialog(state, app, rule) { show(null) } }
         }
     }
@@ -862,10 +864,7 @@ private fun copyText(value: String, app: DesktopController) {
         }
         if ((domains.isNotBlank() || ips.isNotBlank() || applications.isNotEmpty()) && rule.isFailure)
             PcText(rule.exceptionOrNull()?.message.orEmpty(), size = 12, color = DesktopUiKit.Error)
-        if (original?.id == DesktopRoutingRule.RUSSIAN_RESOURCES.id) PcButton(
-            tr(state, if (original.enabled) "Отключить" else "Включить", if (original.enabled) "Disable" else "Enable"),
-            Modifier.fillMaxWidth(), enabled = !state.loading, onClick = { app.saveRoutingRule(original.copy(enabled = !original.enabled)); dismiss() })
-        else if (original != null) PcButton(tr(state, "Удалить правило", "Delete rule"), Modifier.fillMaxWidth(), danger = true, enabled = !state.loading, onClick = { confirmDelete = true })
+        if (original != null) PcButton(tr(state, "Удалить правило", "Delete rule"), Modifier.fillMaxWidth(), danger = true, enabled = !state.loading, onClick = { confirmDelete = true })
     }
 }
 
@@ -946,6 +945,11 @@ private fun copyText(value: String, app: DesktopController) {
 }
 
 @Composable private fun ColumnScope.MultiHopPage(state: DesktopState, app: DesktopController, onBack: () -> Unit, onDone: (DesktopPage) -> Unit) {
+    if (state.settings.advancedSettings.ruRelayEnabled) {
+        PcPageHeading(tr(state, "Мультихоп", "MultiHop"), onBack)
+        PcText(tr(state, "Недоступен при включённом RU-реле", "Unavailable while RU relay is enabled"), color = DesktopUiKit.Muted)
+        return
+    }
     val current = state.settings.advancedSettings.multiHop
     var choosingRoute by rememberSaveable(current.enabled) { mutableStateOf(!current.enabled) }
     if (current.enabled && !choosingRoute) {
@@ -973,17 +977,16 @@ private fun copyText(value: String, app: DesktopController) {
     var entryStep by remember { mutableStateOf(true) }
     var entry by remember { mutableStateOf(current.entry) }
     var exit by remember { mutableStateOf(current.exit) }
-    val ruRelay = state.settings.advancedSettings.ruRelayEnabled
     val eligible = state.connectionLocations.map { country -> country.copy(servers =
-        DesktopController.multiHopServers(null, country.servers, entryStep, ruRelay)
+        DesktopController.multiHopServers(null, country.servers, entryStep)
             .filter { it.id != (if (entryStep) exit else entry)?.takeIf { it.kind == ServerSelectionMode.SERVER }?.nodeId })
     }.filter { it.servers.isNotEmpty() }
     val selected = if (entryStep) entry else exit
     val candidates = eligible.flatMap { it.servers }
     val canContinue = selected != null && selected.kind != ServerSelectionMode.AUTO &&
-        DesktopController.multiHopServers(selected, candidates, entryStep, ruRelay).isNotEmpty() &&
-        (entryStep || DesktopController.multiHopServers(entry, state.connectionLocations.flatMap { it.servers }, true, ruRelay)
-            .any { input -> DesktopController.multiHopServers(exit, candidates, false, ruRelay).any { it.id != input.id } })
+        DesktopController.multiHopServers(selected, candidates, entryStep).isNotEmpty() &&
+        (entryStep || DesktopController.multiHopServers(entry, state.connectionLocations.flatMap { it.servers }, true)
+            .any { input -> DesktopController.multiHopServers(exit, candidates, false).any { it.id != input.id } })
     PcPageHeading(tr(state, if (entryStep) "Входная локация" else "Выходная локация", if (entryStep) "Entry location" else "Exit location")) {
         if (!entryStep) entryStep = true else if (current.enabled) choosingRoute = false else onBack()
     }

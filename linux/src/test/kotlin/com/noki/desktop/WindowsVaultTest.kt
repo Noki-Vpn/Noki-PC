@@ -389,6 +389,26 @@ class WindowsVaultTest {
             lookup = { error("numeric IPv4 must not enter DNS executor") })!!.hostAddress)
     }
 
+    @Test fun `WG only node uses its advertised physical ICMP address without inventing a TCP port`() = runBlocking {
+        val targets = mutableListOf<String>()
+        val sampler = com.noki.vpn.data.ClientLatencySampler(tcpConnect = { _, _, _ -> error("No TCP listener was advertised") },
+            icmpPing = { host, _, _ -> targets += host; 23 })
+        val server = com.noki.vpn.data.VpnServer("node", "Node", "RU", "ru", "", null, true, probeIp = "8.8.8.8")
+        val location = com.noki.vpn.data.ServerLocation("ru", country = "RU", city = "", host = "", isOnline = true, servers = listOf(server))
+        assertEquals(listOf(23), sampler.measureForStartup(listOf(location)).values.toList())
+        assertEquals(listOf("8.8.8.8"), targets)
+    }
+
+    @Test fun `physical TCP sampler uses the advertised probe host`() = runBlocking {
+        val targets = mutableListOf<String>()
+        val sampler = com.noki.vpn.data.ClientLatencySampler(tcpConnect = { host, _, _ -> targets += host; 17 },
+            icmpPing = { _, _, _ -> error("TCP is reachable") })
+        val server = com.noki.vpn.data.VpnServer("node", "Node", "DE", "de", "8.8.4.4", 443, true, probeHost = "1.1.1.1")
+        val location = com.noki.vpn.data.ServerLocation("de", country = "DE", city = "", host = "", isOnline = true, servers = listOf(server))
+        assertEquals(listOf(17), sampler.measureForStartup(listOf(location)).values.toList())
+        assertEquals(listOf("1.1.1.1"), targets)
+    }
+
     @Test fun `startup sampler includes queued targets in one deadline and cancels blocking samples`() = runBlocking {
         val active = java.util.concurrent.atomic.AtomicInteger()
         val sampler = com.noki.vpn.data.ClientLatencySampler(tcpConnect = { _, _, _ ->

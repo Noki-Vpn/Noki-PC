@@ -9,6 +9,12 @@ import re
 import stat
 import subprocess
 import sys
+import ipaddress
+import socket
+import struct
+import time
+import secrets
+from concurrent.futures import ThreadPoolExecutor
 
 CORE = PurePosixPath('/usr/lib/noki/sing-box')
 STATE = Path('/var/lib/noki/guard')
@@ -143,6 +149,102 @@ def check_guard_owner(uid):
                 raise ValueError('Disconnect Noki protection in the other user session first')
 
 
+def physical_probes(request):
+    targets = request.get('targets')
+    index = request.get('interface_index')
+    startup = request.get('startup')
+    if (not isinstance(targets, list) or len(targets) > 64 or type(index) is not int or
+            index <= 0 or type(startup) is not bool):
+        raise ValueError('Invalid bounded physical probe request')
+    def address(value):
+        if value in (None, ''):
+            return None
+        try:
+            parsed = ipaddress.IPv4Address(value)
+        except (ValueError, TypeError):
+            raise ValueError('A public numeric IPv4 probe address is required')
+        if not parsed.is_global or parsed.is_multicast:
+            raise ValueError('A public numeric IPv4 probe address is required')
+        return str(parsed)
+    checked = []
+    for target in targets:
+        if not isinstance(target, dict) or not isinstance(target.get('key'), str) or not 1 <= len(target['key']) <= 512:
+            raise ValueError('Invalid physical probe identity')
+        port = target.get('port')
+        if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+            raise ValueError('Invalid physical TCP probe port')
+        checked.append((target['key'], address(target.get('host')) if port is not None else None,
+                        port, address(target.get('probe_ip'))))
+    if len({row[0] for row in checked}) != len(checked):
+        raise ValueError('Duplicate physical probe identity')
+    if not checked:
+        return {'samples': {}}
+    interface = socket.if_indextoname(index)
+    routes = [line.split() for line in Path('/proc/net/route').read_text().splitlines()[1:]]
+    defaults = [row for row in routes if len(row) >= 8 and row[0] != INTERFACE and
+                row[1] == '00000000' and int(row[3], 16) & 1]
+    if (not defaults or min(defaults, key=lambda row: int(row[6]))[0] != interface or
+            interface == INTERFACE or Path('/sys/class/net', interface, 'tun_flags').exists()):
+        raise ValueError('The physical default interface changed')
+    deadline = time.monotonic() + (0.75 if startup else 8.0)
+    def connect(ip, port, timeout):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM if port else socket.SOCK_RAW,
+                           socket.IPPROTO_TCP if port else socket.IPPROTO_ICMP) as probe:
+            # Both are mandatory. Never retry an unmarked or tunnel-routed socket.
+            probe.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_MARK', 36), MARK)
+            probe.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), interface.encode() + b'\0')
+            probe.settimeout(timeout)
+            started = time.monotonic()
+            if port:
+                probe.connect((ip, port))
+            else:
+                identity = secrets.randbits(16)
+                packet = struct.pack('!BBHHH8s', 8, 0, 0, identity, 1, b'NokiRTT1')
+                words = struct.unpack('!8H', packet)
+                total = sum(words)
+                total = (total & 0xffff) + (total >> 16)
+                checksum = ~((total & 0xffff) + (total >> 16)) & 0xffff
+                packet = packet[:2] + struct.pack('!H', checksum) + packet[4:]
+                probe.sendto(packet, (ip, 0))
+                while True:
+                    remaining = timeout - (time.monotonic() - started)
+                    if remaining <= 0:
+                        return None
+                    probe.settimeout(remaining)
+                    reply, source = probe.recvfrom(4096)
+                    header = (reply[0] & 15) * 4 if reply else 0
+                    if (source[0] == ip and len(reply) >= header + 8 and
+                            struct.unpack('!BBHHH', reply[header:header + 8])[0:2] == (0, 0) and
+                            struct.unpack('!HH', reply[header + 4:header + 8]) == (identity, 1)):
+                        break
+            return max(1, min(3000, round((time.monotonic() - started) * 1000)))
+    def measure(row):
+        key, host, port, icmp_ip = row
+        samples = []
+        for _ in range(1 if startup else 3):
+            timeout = min(0.65, deadline - time.monotonic())
+            if timeout <= 0:
+                break
+            value = None
+            try:
+                if host and port:
+                    value = connect(host, port, timeout)
+            except OSError:
+                pass
+            if value is None and icmp_ip:
+                timeout = min(0.65, deadline - time.monotonic())
+                if timeout > 0:
+                    try:
+                        value = connect(icmp_ip, None, timeout)
+                    except OSError:
+                        pass
+            if value is not None:
+                samples.append(value)
+        return (key, sorted(samples)[len(samples) // 2]) if samples else None
+    with ThreadPoolExecutor(max_workers=6) as workers:
+        return {'samples': dict(row for row in workers.map(measure, checked) if row is not None)}
+
+
 def main(arguments):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise ValueError('Linux polkit privileges are required')
@@ -165,13 +267,18 @@ def main(arguments):
                 set_guard(uid, False)
                 path.unlink(missing_ok=True)
         return {}
-    if len(arguments) != 2 or arguments[0] not in ('identity', 'start', 'stop', 'dns-on', 'on', 'off', 'status', 'refresh'):
+    if len(arguments) != 2 or arguments[0] not in ('identity', 'start', 'stop', 'dns-on', 'on', 'off', 'status', 'refresh', 'probe'):
         raise ValueError('Unsupported operation')
     uid = caller_uid(os.environ)
     account = pwd.getpwuid(uid)
     pid = int(arguments[1])
     action = arguments[0]
     scope = gui_scope(uid, pid)
+    if action == 'probe':
+        raw = sys.stdin.read(65537)
+        if len(raw) > 65536:
+            raise ValueError('Physical probe request is too large')
+        return physical_probes(json.loads(raw))
     if action in ('start', 'on'):
         check_guard_owner(uid)
     if action == 'identity':
@@ -215,6 +322,10 @@ def main(arguments):
 
 if __name__ == '__main__':
     try:
+        if sys.argv[1:2] == ['probe']:
+            # Read-only sockets must not hold the guard/start transaction lock.
+            print(json.dumps(dict(ok=True, **main(sys.argv[1:]))))
+            sys.exit(0)
         # Serialize guard transactions and the check/start pair across users.
         STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor = os.open(STATE.parent / 'control.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)

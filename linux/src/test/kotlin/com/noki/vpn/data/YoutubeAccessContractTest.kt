@@ -81,6 +81,20 @@ class YoutubeAccessContractTest {
         assertEquals(access.revokeToken, revoke.header("X-Youtube-Revoke-Token"))
     }
 
+    @Test fun `fresh YouTube admission sends bounded physical node samples only on create`() {
+        val request = YoutubeAccessRequest(deviceId, "device-key", nonce, signature,
+            "33333333-3333-4333-8333-333333333333", keyId, listOf(RuRelayRttSample(keyId, 37)))
+        val payload = request.toBackendJson()
+        assertEquals(37, payload.getJSONArray("node_rtt_samples").getJSONObject(0).getInt("rtt_ms"))
+        assertEquals(keyId, payload.getJSONArray("node_rtt_samples").getJSONObject(0).getString("node_id"))
+        assertFalse(payload.has("node_id"))
+        assertFalse(payload.has("transport"))
+        for (samples in listOf(listOf(RuRelayRttSample(keyId, 0)), listOf(RuRelayRttSample(keyId, 3001)),
+            listOf(RuRelayRttSample(keyId, 1), RuRelayRttSample(keyId, 2)))) {
+            assertThrows(IllegalArgumentException::class.java) { request.copy(nodeRttSamples = samples).toBackendJson() }
+        }
+    }
+
     @Test fun `pending and blocked expose no connection material and blocked may be expired`() {
         assertNull(BackendYoutubeAccessJsonParser.parse(base("pending"), now).wireguard)
         val blocked = base("blocked").put("expires_at", now.minusSeconds(1).toString())

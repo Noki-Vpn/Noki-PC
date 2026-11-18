@@ -7,7 +7,9 @@ class ClientLatencySampler(
     private val icmpPing: (host: String, count: Int, timeoutSeconds: Int) -> Int? = DeviceLatency::measureIcmpPingMs,
     private val locationTimeoutMillis: Long = 8_000L,
     private val tcpAttempts: Int = LATENCY_TCP_ATTEMPTS,
+    private val batchProbe: ((List<ProbeTarget>, Boolean) -> Map<String, Int>)? = null,
 ) {
+    data class ProbeTarget(val key: String, val host: String, val port: Int?, val probeIp: String? = null)
 
     suspend fun measure(
         locations: List<ServerLocation>,
@@ -26,22 +28,34 @@ class ClientLatencySampler(
     ): Map<String, Int> = coroutineScope {
         val deadlineNanos = System.nanoTime() + 750_000_000L
         val probeSlots = Semaphore(DeviceLatency.MAX_CONCURRENT_DNS_LOOKUPS)
-        locations
+        val targets = locations
             .asSequence()
             .filter { location -> location.isOnline }
             .flatMap { location ->
-                if (location.servers.isEmpty()) sequenceOf(Triple(ServerLocationMapper.latencyTargetKey(location), location.host, 443))
-                else location.servers.asSequence().filter { it.isOnline }.map { Triple(ServerLocationMapper.latencyTargetKey(it), it.host, it.probePort) }
+                if (location.servers.isEmpty()) sequenceOf(ServerLocationMapper.latencyTargetKey(location)?.let { ProbeTarget(it, location.host, 443) })
+                else location.servers.asSequence().filter { it.isOnline }.map { node -> ServerLocationMapper.latencyTargetKey(node)?.let {
+                    ProbeTarget(it, node.probeHost ?: node.host, node.probePort, node.probeIp)
+                } }
             }
-            .distinctBy { it.first }
+            .filterNotNull()
+            .distinctBy { it.key }
             .flatMap { target ->
                 if (relayTargets == null) sequenceOf(target)
-                else relayTargets[target.first].orEmpty().asSequence()
-                    .map { (host, port) -> Triple(target.first, host, port) }
+                else relayTargets[target.key].orEmpty().asSequence()
+                    .map { (host, port) -> ProbeTarget(target.key, host, port) }
             }
             .distinct()
-            .mapNotNull { (key, rawHost, port) ->
-                val targetKey = key ?: return@mapNotNull null
+            .take(64)
+            .toList()
+        batchProbe?.let { measure ->
+            // The privileged batch owns the socket deadline; allow bounded IPC startup/teardown too.
+            val samples = withTimeoutOrNull(if (startup) 1_500L else locationTimeoutMillis + 1_000L) {
+                runInterruptible(Dispatchers.IO) { measure(targets, startup) }
+            }.orEmpty()
+            val keys = targets.mapTo(mutableSetOf()) { it.key }
+            return@coroutineScope samples.filter { (key, latency) -> key in keys && latency in 1..3000 }
+        }
+        targets.map { (targetKey, rawHost, port, probeIp) ->
                 val host = rawHost.trim()
                 async {
                     fun remainingMillis() = ((deadlineNanos - System.nanoTime()) / 1_000_000L).coerceAtLeast(0)
@@ -49,10 +63,13 @@ class ClientLatencySampler(
                     val latency = withTimeoutOrNull(budget) {
                         probeSlots.withPermit {
                             runInterruptible(Dispatchers.IO) {
-                                if (port == null) null else {
+                                if (port == null && probeIp == null) null else {
                                     val samples = List(if (startup) 1 else tcpAttempts.coerceIn(1, LATENCY_TCP_ATTEMPTS)) {
                                         val timeout = if (startup) minOf(LATENCY_TCP_TIMEOUT_MS.toLong(), remainingMillis()).toInt() else LATENCY_TCP_TIMEOUT_MS
-                                        if (timeout > 0) tcpConnect(host, port, timeout) else null
+                                        if (timeout <= 0) null else {
+                                            val tcp = port?.let { tcpConnect(host, it, timeout) }
+                                            tcp ?: probeIp?.let { icmpPing(it, 1, 1) }
+                                        }
                                     }.filterNotNull().sorted()
                                     samples.getOrNull(samples.size / 2)
                                         ?: if (!startup && relayTargets == null) {
@@ -65,7 +82,6 @@ class ClientLatencySampler(
                     latency?.let { targetKey to it }
                 }
             }
-            .toList()
             .awaitAll()
             .filterNotNull()
             .groupBy({ it.first }, { it.second })

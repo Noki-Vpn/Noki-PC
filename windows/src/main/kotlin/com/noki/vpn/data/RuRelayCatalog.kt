@@ -11,10 +11,15 @@ data class RuRelayCatalogEntry(
     val probeHost: String? = null,
     val probePort: Int? = null,
     val pairReady: Boolean = false,
+    val weight: Int = 1,
+    val metricsAt: String? = null,
+    val probeIp: String? = null,
 )
 
 /** Eligible physical overlay participants; no location or proxy listener is invented. */
-data class RuForeignNode(val id: String, val name: String, val countryCode: String, val latencyMs: Int? = null)
+data class RuForeignNode(val id: String, val name: String, val countryCode: String, val latencyMs: Int? = null,
+    val weight: Int = 1, val metricsAt: String? = null, val probeHost: String? = null,
+    val probePort: Int? = null, val probeIp: String? = null)
 
 data class RuRelayCatalog(
     val exitNodeId: String?,
@@ -62,10 +67,10 @@ object RuRelayCatalogJsonParser {
             require(name.isNotEmpty() && countryCode == "RU") { "ru_relay_catalog_entry_invalid" }
             require(available || unavailableReason != null) { "ru_relay_catalog_reason_missing" }
             val probePort = item.optInt("probe_port", 0).takeIf { probeHost != null && it in 1..65535 }
-            RuRelayCatalogEntry(id, name, countryCode, available, unavailableReason, probeHost, probePort, pairReady)
+            RuRelayCatalogEntry(id, name, countryCode, available, unavailableReason, probeHost, probePort, pairReady,
+                item.selectionWeight(), item.optBackendString("metrics_at"), item.optBackendString("probe_ip"))
         }
         require(relays.map { it.id }.toSet().size == relays.size) { "ru_relay_catalog_duplicate" }
-        require(exitNodeId != null || relays.isEmpty()) { "ru_relay_catalog_route_mismatch" }
         require(exitNodeId != null || json.optJSONArray("foreign_nodes") != null) { "ru_foreign_nodes_missing" }
         val foreignItems = json.optJSONArray("foreign_nodes")
         val foreignNodes = (0 until (foreignItems?.length() ?: 0)).map { index ->
@@ -76,7 +81,9 @@ object RuRelayCatalogJsonParser {
             require(name.isNotEmpty() && country.isNotBlank() && country != "RU") {
                 "ru_foreign_node_invalid"
             }
-            RuForeignNode(id, name, country)
+            RuForeignNode(id, name, country, weight = item.selectionWeight(), metricsAt = item.optBackendString("metrics_at"),
+                probeHost = item.optBackendString("probe_host"), probePort = item.optBackendInt("probe_port")?.takeIf { it in 1..65535 },
+                probeIp = item.optBackendString("probe_ip"))
         }
         require(foreignNodes.map { it.id }.toSet().size == foreignNodes.size) { "ru_foreign_node_duplicate" }
         return RuRelayCatalog(exitNodeId, relays, entryNodeId, expectedRouteVersion, foreignNodes)

@@ -5,6 +5,18 @@ import org.junit.Test
 
 class EndpointRankingPolicyTest {
     @Test
+    fun physicalNodePrefersMeasuredSelectionWeightAndKeepsLegacyMeasuredBandwidth() {
+        fun catalog(selection: Int?) = org.json.JSONObject("""{"id":"location","code":"de","name":"Germany",
+            "entry_host":"8.8.8.8","country_code":"DE","is_online":true,"servers":[
+            {"id":"node","name":"Node","country_code":"DE","location_code":"de","host":"8.8.8.8",
+            "is_online":true,"probe_port":443,"weight":999,"metrics_at":"2026-11-18T00:00:00Z"}]}""")
+            .apply { selection?.let { getJSONArray("servers").getJSONObject(0).put("selection_weight", it) } }
+            .toBackendLocation().servers.single()
+        assertEquals(9, catalog(9).weight)
+        assertEquals("Ordinary legacy catalogs already expose measured free bandwidth", 999, catalog(null).weight)
+    }
+
+    @Test
     fun releaseAutoRespectsNokiNvCooldownAndHealth() {
         val nv = hysteriaCandidate("nv").copy(proxyType = "nokinv", transport = "nokinv", path = "/tunnel")
         val candidates = listOf(nv, nv.copy(code = "nv-other", nodeId = "other"), hysteriaCandidate("hy2"), tcpCandidate("xhttp"))

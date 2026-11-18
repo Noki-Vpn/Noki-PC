@@ -247,7 +247,8 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
     fun loadSettings(): StoredSettings {
         var raw = readEncrypted("settings.dpapi")
         raw?.let(::JSONObject)?.takeIf { it.optInt("desktop_ru_relay_reset_version") < 1 }?.let { legacy ->
-            legacy.put("ruRelayEnabled", false).put("desktop_ru_relay_reset_version", 1)
+            if (legacy.optJSONObject("multiHopSettings")?.optBoolean("enabled") != true) legacy.put("ruRelayEnabled", false)
+            legacy.put("desktop_ru_relay_reset_version", 1)
             raw = legacy.toString()
             writeEncrypted("settings.dpapi", checkNotNull(raw))
         }
@@ -396,7 +397,7 @@ class WindowsVault(val directory: Path = defaultDirectory(), hardwareIdentity: (
 
     companion object {
         private val runtimeLocks = java.util.concurrent.ConcurrentHashMap<Path, Any>()
-        private val CACHE_FILES = setOf("stats.dpapi", "account-local.dpapi", "endpoint-health.dpapi", "window.dpapi")
+        private val CACHE_FILES = setOf("stats.dpapi", "account-local.dpapi", "endpoint-health.dpapi", "window.dpapi", "entry-profile.dpapi")
         private const val MAX_CACHE_BYTES = 16 * 1024 * 1024
         private fun invalidStoredData(error: Exception): Boolean = error is JSONException || error is javax.crypto.BadPaddingException ||
             error is Win32Exception && error.errorCode in setOf(WinError.ERROR_INVALID_DATA, WinError.ERROR_INVALID_PARAMETER)

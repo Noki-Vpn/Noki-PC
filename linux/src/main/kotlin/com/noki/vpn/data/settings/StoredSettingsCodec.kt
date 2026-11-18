@@ -17,7 +17,7 @@ internal class StoredSettingsCodec(
             val migrated = stored.copy(advancedSettings = stored.advancedSettings.copy(
                 gamingModeEnabled = stored.advancedSettings.gamingModeEnabled && !stored.advancedSettings.ruRelayEnabled,
                 manualEndpointGroupKey = EndpointGroupPolicy.normalizedGroupKey(stored.advancedSettings.manualEndpointGroupKey),
-            ))
+            ).normalizeRouteModes())
             val validated = if (migrated.profile.proxyType.equals("nokinv", true) && !EndpointSecurityPolicy.isAllowedProfile(migrated.profile))
                 migrated.copy(profile = VlessProfile()) else migrated
             if (json.optInt("russianDirectDefaultsVersion") >= 1) validated else validated.copy(selectedPackages = DefaultStoredSettingsFactory.updatedDefaultPackages(
@@ -54,6 +54,8 @@ internal class StoredSettingsCodec(
         .put("publicKey", settings.profile.publicKey)
         .put("shortId", settings.profile.shortId)
         .put("spiderX", settings.profile.spiderX)
+        .put("entryRoute", settings.profile.entryRoute)
+        .put("entryRouteExpiresAt", settings.profile.entryRouteExpiresAt)
         .put("multiHopRuntime", settings.profile.multiHop?.let { route -> JSONObject()
             .put("version", route.version).put("selection", encodeMultiHopSettings(route.selection))
             .put("entryNodeId", route.entryNodeId).put("exitNodeId", route.exitNodeId)
@@ -99,7 +101,7 @@ internal class StoredSettingsCodec(
         .put("connectionLogsEnabled", settings.advancedSettings.connectionLogsEnabled)
         .put("errorLogsEnabled", settings.advancedSettings.errorLogsEnabled)
         .put("anonymousLogsEnabled", settings.advancedSettings.anonymousLogsEnabled)
-        .put("multiHopSettings", encodeMultiHopSettings(settings.advancedSettings.multiHop))
+        .put("multiHopSettings", encodeMultiHopSettings(settings.advancedSettings.normalizeRouteModes().multiHop))
         .put("killSwitchEnabled", settings.advancedSettings.killSwitchEnabled)
         .put("launchAtStartup", settings.advancedSettings.launchAtStartup)
         .put("autoConnectOnLaunch", settings.advancedSettings.autoConnectOnLaunch)
@@ -145,6 +147,8 @@ internal class StoredSettingsCodec(
             publicKey = json.optString("publicKey"),
             shortId = json.optString("shortId"),
             spiderX = json.optString("spiderX", "/"),
+            entryRoute = json.optBoolean("entryRoute"),
+            entryRouteExpiresAt = json.optLong("entryRouteExpiresAt").takeIf { it > 0 },
             multiHop = json.optJSONObject("multiHopRuntime")?.let { route -> BackendMultiHopSession(
                 selection = decodeMultiHopSettings(route.getJSONObject("selection")),
                 entryNodeId = route.getString("entryNodeId"), exitNodeId = route.getString("exitNodeId"),

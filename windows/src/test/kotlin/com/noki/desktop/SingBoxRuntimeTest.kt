@@ -1037,9 +1037,9 @@ class SingBoxRuntimeTest {
                 .put("experimental", JSONObject().put("clash_api", JSONObject()
                     .put("external_controller", "127.0.0.1:$apiPort").put("secret", secret)))
             val settings = DesktopState().settings.let { it.copy(advancedSettings = it.advancedSettings.copy(
-                alwaysOnDomains = listOf("full:private.tnt-tv.ru"))) }
+                alwaysOnDomains = listOf("full:private.corp.example", "full:private.tnt-tv.ru"))) }
             val bypass = checkNotNull(SingBoxConfig.dnsBypassMatch(settings,
-                listOf(DesktopRoutingRule("corp", "Corp", true, listOf("tnt-tv.ru"))), SingBoxConfig.bundledGeosite()))
+                listOf(DesktopRoutingRule("corp", "Corp", true, listOf("tnt-tv.ru", "corp.example"))), SingBoxConfig.bundledGeosite()))
             SingBoxConfig.applyDnsPolicy(config, bypass,
                 WindowsDnsPolicy(listOf(WindowsDnsServer("127.0.0.2", interfaceName, adapter.index, 0),
                     WindowsDnsServer("127.0.0.1", interfaceName, adapter.index, 1),
@@ -1077,21 +1077,21 @@ class SingBoxRuntimeTest {
                 assertTrue("DNS response for $name is incomplete", response.size >= 12)
                 assertEquals(request[0], response[0]); assertEquals(request[1], response[1])
                 assertEquals("Unexpected DNS status for $name", when (name) { "missing.tnt-tv.ru" -> 3; "blocked.tnt-tv.ru" -> 2; else -> 0 }, response[3].toInt() and 15)
-                if (name in listOf("empty.tnt-tv.ru", "only.scoped.tnt-tv.ru", "blocked.tnt-tv.ru") || type == 28 && name in listOf("public.example", "private.tnt-tv.ru")) {
+                if (name in listOf("empty.tnt-tv.ru", "only.scoped.tnt-tv.ru", "blocked.tnt-tv.ru") || type == 28 && name in listOf("public.example", "private.corp.example")) {
                     assertEquals("NODATA expected for $name", 0, response[7].toInt())
                 } else if (name != "missing.tnt-tv.ru") {
                     val payload = when (type) {
                         28 -> java.net.InetAddress.getByName("2001:db8::72").address
                         16 -> byteArrayOf(3, 'v'.code.toByte(), 'p'.code.toByte(), 'n'.code.toByte())
                         33 -> byteArrayOf(0, 0, 0, 1, 13, 61, 0)
-                        else -> if (name == "public.example" || name == "private.tnt-tv.ru") protectedIp else directIp
+                        else -> if (name == "public.example" || name == "private.corp.example") protectedIp else directIp
                     }
                     assertArrayEquals("Wrong answer for $name type=$type", payload, response.takeLast(payload.size).toByteArray())
                 }
             }
-            val names = listOf("term.tnt-tv.ru", "public.example", "tnt-tv.ru", "private.tnt-tv.ru", "missing.tnt-tv.ru", "public.example").map { it to 1 } +
+            val names = listOf("term.tnt-tv.ru", "public.example", "tnt-tv.ru", "private.corp.example", "private.tnt-tv.ru", "missing.tnt-tv.ru", "public.example").map { it to 1 } +
                 listOf("nodata.tnt-tv.ru" to 1, "empty.tnt-tv.ru" to 1, "v6.tnt-tv.ru" to 28, "public.example" to 28,
-                    "private.tnt-tv.ru" to 28, "txt.tnt-tv.ru" to 16, "srv.tnt-tv.ru" to 33, "only.scoped.tnt-tv.ru" to 1, "blocked.tnt-tv.ru" to 1)
+                    "private.corp.example" to 28, "txt.tnt-tv.ru" to 16, "srv.tnt-tv.ru" to 33, "only.scoped.tnt-tv.ru" to 1, "blocked.tnt-tv.ru" to 1)
             java.net.DatagramSocket(java.net.InetSocketAddress(loopback, 0)).use { udp ->
                 udp.soTimeout = 5_000
                 udp.connect(loopback, dnsPort)
@@ -1113,10 +1113,10 @@ class SingBoxRuntimeTest {
                     verify(name, type, request, input.readNBytes(input.readUnsignedShort()))
                 }
             }
-            val expectedDirect = listOf("term.tnt-tv.ru", "tnt-tv.ru", "missing.tnt-tv.ru", "nodata.tnt-tv.ru", "empty.tnt-tv.ru", "v6.tnt-tv.ru")
+            val expectedDirect = listOf("term.tnt-tv.ru", "tnt-tv.ru", "private.tnt-tv.ru", "missing.tnt-tv.ru", "nodata.tnt-tv.ru", "empty.tnt-tv.ru", "v6.tnt-tv.ru")
             assertEquals(expectedDirect.let { it + it }, directNames)
             assertEquals((expectedDirect + listOf("txt.tnt-tv.ru", "srv.tnt-tv.ru", "only.scoped.tnt-tv.ru")).let { it + it }, rejectedNames)
-            assertEquals(listOf("public.example", "private.tnt-tv.ru", "public.example").let { it + it }, protectedNames)
+            assertEquals(listOf("public.example", "private.corp.example", "public.example").let { it + it }, protectedNames)
             assertTrue("DNS fixture failed: $fixtureErrors", fixtureErrors.isEmpty())
             // Native file logging flushes every second; DNS queries can finish before the first flush.
             kotlinx.coroutines.runBlocking {

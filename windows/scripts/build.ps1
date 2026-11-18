@@ -76,6 +76,10 @@ try {
         throw 'Packaged guard did not reject the identity before vault/WFP access'
     }
     Write-Output 'Packaged guard entry point verified without changing storage or network filters'
+    $rendererLog = Join-Path $packageRoot 'debug.log'
+    if (Test-Path -LiteralPath $rendererLog -PathType Leaf) {
+        Move-Item -LiteralPath $rendererLog -Destination (Join-Path $preflightRoot 'renderer-debug.log') -Force
+    }
     $releases = Join-Path $root 'build\releases'
     New-Item -ItemType Directory -Path $releases -Force | Out-Null
     $version = [regex]::Match([IO.File]::ReadAllText((Join-Path $root 'build.gradle.kts')), '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value

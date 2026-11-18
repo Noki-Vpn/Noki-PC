@@ -35,6 +35,31 @@ class RuRelayCatalogTest {
     private val offlineId = "33333333-3333-4333-8333-333333333333"
 
     @Test
+    fun discoveryAcceptsReadyIngressBeforeAnyExitIsSelected() {
+        val catalog = RuRelayCatalogJsonParser.parse(JSONObject("""{"route_version":1,
+            "entry_node_id":null,"exit_node_id":null,"relays":[
+            {"id":"$readyId","name":"RU ingress","country_code":"RU","available":true,"pair_ready":true}],
+            "foreign_nodes":[{"id":"$exitId","name":"Exit","country_code":"DE"}]}"""), null)
+        assertEquals(null, catalog.exitNodeId)
+        assertEquals(listOf(readyId), catalog.relays.map { it.id })
+        assertEquals(listOf(exitId), catalog.foreignNodes.map { it.id })
+    }
+
+    @Test
+    fun dynamicSelectionMetadataIsUsedWithoutLegacyManualWeightsOrInventedPorts() {
+        val json = JSONObject("""{"route_version":1,"entry_node_id":null,"exit_node_id":null,"relays":[
+            {"id":"$readyId","name":"RU","country_code":"RU","available":true,"pair_ready":true,
+             "weight":999,"selection_weight":17,"metrics_at":"2026-11-18T00:00:00Z","probe_ip":"8.8.8.8"}],
+            "foreign_nodes":[{"id":"$exitId","name":"Exit","country_code":"DE","weight":888}]}""")
+        val catalog = RuRelayCatalogJsonParser.parse(json, null)
+        assertEquals(17, catalog.relays.single().weight)
+        assertEquals("2026-11-18T00:00:00Z", catalog.relays.single().metricsAt)
+        assertEquals("8.8.8.8", catalog.relays.single().probeIp)
+        assertEquals(null, catalog.relays.single().probePort)
+        assertEquals(1, catalog.foreignNodes.single().weight)
+    }
+
+    @Test
     fun discoversRealForeignParticipantsWithoutTransportEndpoints() = runBlocking {
         var observed: okhttp3.Request? = null
         val client = OkHttpClient.Builder().addInterceptor { chain ->

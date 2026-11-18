@@ -1,0 +1,13 @@
+GeoIP for V2Ray, v2fly/geoip contributors
+https://github.com/v2fly/geoip
+Licensed under Creative Commons Attribution-ShareAlike 4.0 International.
+https://creativecommons.org/licenses/by-sa/4.0/
+
+IP Geolocation by DB-IP
+https://db-ip.com/
+Licensed under Creative Commons Attribution 4.0 International.
+https://creativecommons.org/licenses/by/4.0/
+
+Noki includes the unchanged RU entry extracted from v2fly/geoip release
+202611080027 as a country-only protobuf list.
+https://github.com/v2fly/geoip/releases/tag/202611080027

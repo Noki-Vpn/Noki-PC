@@ -9,11 +9,11 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -Force
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$version = '1.14.1-extended-2.7.2-nokinv-30-pc'
-$binaryHash = '6058ec64bf5240f64dd2dca13f6aea60ee4f542ec3649c518a082824be9defff'
+$version = '1.14.1-extended-2.7.2-nokinv-32-pc'
+$binaryHash = '700b0f56c205c162cb40dec1bef2cbc7b51be0b83b53640a2ee9a6a85e4286fb'
 $cronetRevision = 'c10c03c318db'
 $cronetHash = '3217c6260fbca5f16072e0b79735742f40109a63bb0ff88fd6b96dd6b54a2928'
-$sourceHash = '7f46244f661f0ac15a885d19d8b7350bf13b5ee234b52a92880fc63f63961263'
+$sourceHash = 'fad07f758f7a8893f4c461bde9fb82689377ba6a867b86444ae47d61e0609bec'
 $goVersion = '1.26.9'
 $goArchiveHash = 'd722201a9c0c086d1610e111c48203009af690892ed708072bd5ae20160e7a59'
 $goExecutableHash = '5b25a4a434c7bbba11112a94c3fa9c1502c0f377bd971705ee8e07b8e3c12620'
@@ -127,12 +127,18 @@ if ($VerifyTests -or !(Test-Path -LiteralPath $binary) -or (Get-Sha256 $binary) 
             $patchedWindowsTun = Join-Path $patchedTun 'tun_windows.go'
             [IO.File]::SetAttributes($patchedWindowsTun, [IO.FileAttributes]::Normal)
             Copy-Item -LiteralPath (Join-Path $build 'src\pc-patches\tun_windows.go.patch') -Destination $patchedWindowsTun -Force
+            $flowDispatcher = Join-Path $patchedTun 'flow_dispatch.go'
+            if ((Get-Sha256 $flowDispatcher) -ne 'bdfc3bac4b20749310d9c61ce758fbd3c98ed2dff0fc613205f1d0319dded09e') { throw 'Pinned flow dispatcher source mismatch' }
+            [IO.File]::SetAttributes($flowDispatcher, [IO.FileAttributes]::Normal)
+            Copy-Item -LiteralPath (Join-Path $build 'src\pc-patches\flow_dispatch.go.patch') -Destination $flowDispatcher -Force
             [IO.File]::WriteAllText($workspace, "go $goVersion`n`nuse ./src`n`nreplace github.com/sagernet/sing-tun => ./sing-tun-pc`n", (New-Object Text.UTF8Encoding($false)))
             Invoke-Checked $go @('build', "-tags=$tags", '-trimpath', '-buildvcs=false',
                 "-ldflags=-X github.com/sagernet/sing-box/constant.Version=$version -s -w -buildid= -checklinkname=0",
                 '-o', (Join-Path $build 'sing-box.exe'), './cmd/sing-box')
             Copy-Item -LiteralPath $cronet -Destination (Join-Path $build 'libcronet.dll') -Force
             if ($VerifyTests) {
+                Copy-Item -LiteralPath (Join-Path $root 'src\test\native\flow_accept_lifetime_test.go') -Destination $patchedTun
+                Invoke-Checked $go @('test', '-trimpath', "-tags=$tags", '-ldflags=-checklinkname=0', '-count=1', '-timeout=1m', '-run=^TestPCAccept', 'github.com/sagernet/sing-tun')
                 $testPackages = @{
                     'core_log_test.go' = 'log'
                     'dns_capture_filter_test.go' = 'common\windivert'

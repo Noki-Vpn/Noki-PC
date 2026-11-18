@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.nio.file.Files
 import java.nio.file.Path
@@ -144,7 +143,8 @@ data class DesktopState(
         ruForeignNodes.groupBy { it.countryCode }.toSortedMap().map { (code, nodes) ->
             ServerLocation(code, code, java.util.Locale("", code).getDisplayCountry(java.util.Locale(language.tag)), "", "", isOnline = true,
                 latencyMs = nodes.mapNotNull { it.latencyMs }.minOrNull(),
-                servers = nodes.sortedBy { it.id }.map { VpnServer(it.id, it.name, code, code, "", null, true, latencyMs = it.latencyMs) })
+                servers = nodes.sortedBy { it.id }.map { VpnServer(it.id, it.name, code, code, it.probeHost ?: it.probeIp.orEmpty(), it.probePort,
+                    true, metricsAt = it.metricsAt, weight = it.weight, latencyMs = it.latencyMs, probeHost = it.probeHost, probeIp = it.probeIp) })
         }
     val language: AppLanguage get() = settings.personalizationSettings.language
     val profile: String get() = settings.advancedSettings.effectiveProtocol.name.lowercase()
@@ -180,7 +180,10 @@ class DesktopController internal constructor(
     private val latencySampler: (WindowsNetworkSnapshot) -> ClientLatencySampler = { network ->
         ClientLatencySampler(tcpConnect = { host, port, timeout ->
             network.interfaceIndex?.let { windowsTcpLatency(host, port, timeout, it) }
-        }, icmpPing = { _, _, _ -> null })
+        }, icmpPing = { host, _, _ -> network.interfaceIndex?.let { windowsIcmpLatency(host, 650, it) } },
+            batchProbe = if (!DesktopBuild.IS_LINUX) null else { targets, startup ->
+                network.interfaceIndex?.let { LinuxPlatform.physicalProbes(targets, it, startup) }.orEmpty()
+            })
     },
     private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000L },
     private val dnsPolicySnapshot: () -> WindowsDnsPolicy = ::windowsDnsPolicy,
@@ -295,7 +298,7 @@ class DesktopController internal constructor(
         val subscription: BackendSubscription?, val device: BackendDevice?)
     private data class DirectPreparation(val settings: StoredSettings, val catalog: List<BackendLocation>,
         val locations: List<ServerLocation>, val multiHop: MultiHopSettings, val nodes: List<VpnServer?>,
-        val session: BackendVpnSession, val geosites: ByteArray, val createdAt: Long)
+        val session: BackendVpnSession, val geodata: GeositeAsset.Release, val createdAt: Long)
     private val preparationLock = Any()
     private var preparationKey: PreparationKey? = null
     private var preparationJob: Deferred<DirectPreparation>? = null
@@ -411,7 +414,6 @@ class DesktopController internal constructor(
             if (state.value.settings.advancedSettings.launchAtStartup) runCatching { WindowsShell.setLaunchAtStartup(true) }
                 .onFailure { recordLog("startup_registration_failed", error = true, cause = it, category = "app") }
             if (tokens != null) syncAccount()
-            if (runtime.restored() != null && tokens != null) checkRuAuthorization()
             if (runtime.restored() != null && activeSettings().advancedSettings.youtubeAdBlockEnabled) {
                 replaceYoutubeConnection(null)
                 startYoutubeAccess()
@@ -426,7 +428,7 @@ class DesktopController internal constructor(
             state.first { !it.loading }
             operation.withLock {
                 if (restoredAtStartup != null && runtime.restored() == restoredAtStartup) {
-                    if (activeConnection?.optInt("version")?.let { it != 3 } == true) queueRecovery(0)
+                    if (activeConnection?.optInt("version")?.let { it != CONNECTION_CONFIG_VERSION } == true) queueRecovery(0)
                     else watchdog.forceProbe()
                 }
                 else if (runtime.restored() == null && tokens != null && activeConnection != null) {
@@ -489,7 +491,6 @@ class DesktopController internal constructor(
                         try {
                             lastRuStatusCheck = System.currentTimeMillis()
                             if (runtime.restored() == null) revokeRu()
-                            else if (tokens != null) checkRuAuthorization()
                             revokeYoutubePending()
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (error: Exception) {
@@ -510,7 +511,8 @@ class DesktopController internal constructor(
                                 Result.success(vault.readEncrypted("ru-revoke.dpapi")?.let(::JSONObject))
                             } catch (cancelled: CancellationException) { throw cancelled }
                             catch (error: Exception) { Result.failure(error) }
-                            val lease = journal.getOrNull()?.optLong("lease_expires_at", 0) ?: 0
+                            val lease = activeConnection?.optLong("ru_entry_expires_at", 0)?.takeIf { it > 0 }
+                                ?: journal.getOrNull()?.optLong("lease_expires_at", 0) ?: 0
                             if (journal.isFailure || lease > 0 && lease <= System.currentTimeMillis()) {
                                 stopRuntime(restoreInternet = false)
                                 clearConnectionState()
@@ -642,7 +644,7 @@ class DesktopController internal constructor(
         val advanced = changed.advancedSettings.let {
             if (it.ruRelayEnabled && !previousRuRelay) it.copy(gamingModeEnabled = false) else it
         }
-        val normalized = changed.copy(advancedSettings = DomainRulePolicy.normalizeSettings(advanced))
+        val normalized = changed.copy(advancedSettings = DomainRulePolicy.normalizeSettings(advanced.normalizeRouteModes()))
         if (preparationSettings(normalized) != preparationSettings(previous)) invalidatePreparation()
         validateMultiHop(normalized.advancedSettings.multiHop)
         if (normalized.advancedSettings.launchAtStartup != previous.advancedSettings.launchAtStartup)
@@ -1286,13 +1288,20 @@ class DesktopController internal constructor(
         server: VpnServer?, multiHop: MultiHopSettings): BackendVpnSession = withDeviceProof(device.id) { token, nonce, signature ->
         api.createVpnSession(token, device.id, device.deviceKey, nonce, signature,
             server?.countryCode, server?.locationCode, null, settings.advancedSettings.effectiveProtocol.name.lowercase(),
-            server?.id, multiHop.takeIf { it.enabled })
+            server?.id, null).let { session ->
+            if (!multiHop.enabled) session
+            else {
+                if (!session.entryRoute) throw BackendException("entry_route_unavailable", 503)
+                session.copy(multiHop = BackendMultiHopSession.atEntry(multiHop))
+            }
+        }
     }
 
     private fun eligibleCandidates(session: BackendVpnSession, settings: StoredSettings): List<BackendEndpointCandidate> {
         val advanced = settings.advancedSettings
         val candidates = SingBoxConfig.supportedCandidates(session).filter {
-            EndpointTransportPolicy.matchesProtocol(it, advanced.effectiveProtocol)
+            EndpointTransportPolicy.matchesProtocol(it, advanced.effectiveProtocol) &&
+                (!session.entryRoute || !EndpointTransportPolicy.isNokiNv(it))
         }
         return if (!advanced.gamingModeEnabled && advanced.endpointSelectionMode == EndpointSelectionMode.MANUAL)
             EndpointGroupPolicy.manualCandidates(candidates, advanced) else candidates
@@ -1311,18 +1320,25 @@ class DesktopController internal constructor(
         var locations = ServerLocationMapper.mapLocations(catalog, state.value.language, samplesFromUi)
         var visible = locations.flatMap { it.servers }.filter { it.id !in excludedNodeIds && (onlyNodeId == null || it.id == onlyNodeId) }
         var servers = EndpointRankingPolicy.rankServers(visible, settings.userProfile)
-        if (!settings.advancedSettings.multiHop.enabled && servers.size > 1) {
-            val ids = servers.mapTo(mutableSetOf()) { it.id }
-            val targets = locations.map { it.copy(servers = it.servers.filter { node -> node.id in ids }) }.filter { it.servers.isNotEmpty() }
+        val hops = settings.advancedSettings.multiHop
+        val probeIds = if (hops.enabled) {
+            listOf(hops.entry to true, hops.exit to false).flatMap { (selection, entry) ->
+                if (selection?.kind == ServerSelectionMode.COUNTRY)
+                    multiHopServers(selection, locations.flatMap { it.servers }, entry) else emptyList()
+            }.mapTo(mutableSetOf()) { it.id }
+        } else if (servers.size > 1 && settings.userProfile.serverSelectionMode != ServerSelectionMode.SERVER)
+            servers.mapTo(mutableSetOf()) { it.id } else emptySet()
+        if (probeIds.isNotEmpty()) {
+            val targets = locations.map { it.copy(servers = it.servers.filter { node -> node.id in probeIds }) }.filter { it.servers.isNotEmpty() }
             val samples = latencySampler(network).measureForStartup(targets)
             locations = locations.map { ServerLocationMapper.withLatencies(it, samples) }
-            visible = locations.flatMap { it.servers }.filter { it.id in ids }
+            visible = locations.flatMap { it.servers }.filter { it.id !in excludedNodeIds && (onlyNodeId == null || it.id == onlyNodeId) }
             servers = EndpointRankingPolicy.rankServers(visible, settings.userProfile)
         }
         currentCoroutineContext().ensureActive()
         check(networkSnapshot().signature == network.signature) { "Сеть изменилась. Повторите подключение" }
-        val multiHop = resolveMultiHop(settings.advancedSettings.multiHop, locations.flatMap { it.servers }, false)
-        val nodes: List<VpnServer?> = if (multiHop.enabled) listOf(null) else servers
+        val multiHop = resolveMultiHop(settings.advancedSettings.multiHop, locations.flatMap { it.servers })
+        val nodes: List<VpnServer?> = if (multiHop.enabled) listOf(locations.flatMap { it.servers }.first { it.id == multiHop.entry?.nodeId }) else servers
         check(nodes.isNotEmpty()) { "Нет доступных серверов для выбранного маршрута" }
         val geositeBytes = geosites.await()
         var lastFailure: Exception = IllegalStateException("Выбранный протокол недоступен. Выберите другой протокол или Auto")
@@ -1345,7 +1361,8 @@ class DesktopController internal constructor(
         excludedNodeIds: Set<String> = emptySet(), protectUntilVerified: Boolean = false) {
         // One monotonic coroutine budget includes admission, core startup and every fallback.
         val completed = withTimeoutOrNull(45_000L) {
-            connectWithinDeadline(requestedSettings, onlyNodeId, excludedNodeIds, protectUntilVerified)
+            val settings = requestedSettings.copy(advancedSettings = requestedSettings.advancedSettings.normalizeRouteModes())
+            connectWithinDeadline(settings, onlyNodeId, excludedNodeIds, protectUntilVerified)
             true
         }
         if (completed != true) throw java.net.SocketTimeoutException("Время ожидания подключения истекло")
@@ -1361,7 +1378,6 @@ class DesktopController internal constructor(
         latencyJob = null
         recordLog("connect_requested")
         val dnsPolicy = async { runInterruptible(Dispatchers.IO) { dnsPolicySnapshot() } }
-        if (runtime.restored() == null) revokeRu()
         val device = registered ?: authorized { token -> api.registerDevice(token, vault.registrationDeviceKey,
             vault.deviceId.ifBlank { null }, System.getenv(if (DesktopBuild.IS_LINUX) "HOSTNAME" else "COMPUTERNAME").orEmpty().ifBlank { if (DesktopBuild.IS_LINUX) "Linux PC" else "Windows PC" }.take(120),
             vault.publicKey, vault.deviceClaims, com.noki.desktop.DesktopBuild.PLATFORM) }.also { vault.acceptRegisteredDevice(it); registered = it }
@@ -1371,11 +1387,12 @@ class DesktopController internal constructor(
             val selectors = (requestedSettings.advancedSettings.alwaysOnDomains + requestedSettings.advancedSettings.bypassDomains +
                 state.value.routingRules.filter { it.enabled }.flatMap { it.serverDomains() }).filter { it.startsWith("geosite:") }.toSet()
             coroutineScope {
-                val geosites = async { loadGeosites(selectors) }
+                val geosites = async { loadGeosites(selectors, refresh = false) }
                 connectWireGuard(device, requestedSettings, geosites, onlyNodeId, excludedNodeIds, protectUntilVerified, dnsPolicy)
             }
             return@coroutineScope
         }
+        if (onlyNodeId == null && excludedNodeIds.isEmpty() && startCachedEntryProfile(requestedSettings)) return@coroutineScope
         val prepared = if (onlyNodeId == null && excludedNodeIds.isEmpty()) consumePreparation(requestedSettings, network) else null
         val plan = prepared ?: prepareDirect(requestedSettings, device, network, onlyNodeId, excludedNodeIds)
         val preparedAt = monotonicMillis()
@@ -1430,18 +1447,23 @@ class DesktopController internal constructor(
                 val policy = dnsPolicy.await()
                 val config = runInterruptible(Dispatchers.IO) {
                     SingBoxConfig.generate(session, candidate, controlPort, secret, probePort, NokiBackendConfig.apiBaseUrl,
-                        resolvedSettings, plan.geosites, state.value.routingRules, dnsPolicy = { policy })
+                        resolvedSettings, plan.geodata.geosite, state.value.routingRules, dnsPolicy = { policy }, russianIp = plan.geodata.russianIp)
                 }
                 try {
                     check(networkSnapshot().signature == network.signature) { "Сеть изменилась. Повторите подключение" }
                     val launchAt = monotonicMillis()
-                    val active = startRuntime(config, resolvedSettings, "${candidate.locationName.ifBlank { session.locationName }} · ${candidate.label.ifBlank { candidate.code }}",
-                        candidate.nodeId ?: server?.id, protectUntilVerified)
+                    val entryName = candidate.locationName.ifBlank { session.locationName }
+                    val exit = hops?.second?.let { id -> plan.locations.flatMap { it.servers }.firstOrNull { it.id == id } }
+                    val routeLabel = if (exit != null) "$entryName → ${exit.name}" else entryName
+                    val active = startRuntime(config, resolvedSettings, "$routeLabel · ${candidate.label.ifBlank { candidate.code }}",
+                        exit?.id ?: candidate.nodeId ?: server?.id, protectUntilVerified)
                     val readyAt = monotonicMillis()
-                    mutable.update { it.copy(selectedServerId = candidate.nodeId ?: server?.id.orEmpty(), running = true, verified = false,
+                    mutable.update { it.copy(selectedServerId = active.serverId.orEmpty(), running = true, verified = false,
                         connectionLabel = active.label, connectedAtMillis = active.startedAt, connectionSettings = resolvedSettings.copy(profile = profile)) }
                     // Naive's outer HTTP/2 handshake shares startup with the first DNS streams.
-                    val latency = runtime.probe(active, fastStartup = hops == null && !EndpointTransportPolicy.isNaive(candidate))
+                    val latency = profile.entryRouteExit()?.let { selectEntryRoute(active, it) }
+                        ?: runtime.probe(active, fastStartup = hops == null && !EndpointTransportPolicy.isNaive(candidate))
+                    check(networkSnapshot().signature == network.signature) { "entry_route_network_changed" }
                     val verifiedAt = monotonicMillis()
                     mutable.update { it.copy(verified = true) }
                     recordLatencySample(latency, sessionStarted = true)
@@ -1454,6 +1476,12 @@ class DesktopController internal constructor(
                         mutable.update { it.copy(settings = selectedSettings) }
                     }
                     rememberConnection(active, config, resolvedSettings.copy(profile = profile), network.kind)
+                    if (profile.entryRoute && profile.entryRouteExpiresAt?.let { it > System.currentTimeMillis() } == true) {
+                        val cache = JSONObject(checkNotNull(activeConnection).toString())
+                            .put("device_id", vault.deviceId).put("routing_hash", routingHash())
+                            .put("requested_hops", requestedSettings.advancedSettings.multiHop.toString())
+                        vault.writeEncrypted("entry-profile.dpapi", cache.toString())
+                    }
                     startWatchdog(active, initialEvidence = true)
                     transientRecoveryAttempt = 0
                     val finishedAt = monotonicMillis()
@@ -1517,10 +1545,11 @@ class DesktopController internal constructor(
         }
     }
 
-    private fun rememberConnection(active: SingBoxRuntime.Running, config: JSONObject, settings: StoredSettings, network: EndpointRankingPolicy.NetworkKind) {
-        activeConnection = JSONObject().put("version", 3).put("pid", active.pid).put("started_at", active.startedAt)
+    private fun rememberConnection(active: SingBoxRuntime.Running, config: JSONObject, settings: StoredSettings, network: EndpointRankingPolicy.NetworkKind, ruEntryExpiry: Long? = null) {
+        activeConnection = JSONObject().put("version", CONNECTION_CONFIG_VERSION).put("pid", active.pid).put("started_at", active.startedAt)
             .put("label", active.label).put("server_id", active.serverId).put("config", config)
             .put("settings", vault.encodeSettings(settings)).put("network", network.name).put("user_id", state.value.user?.id)
+            .put("ru_entry_expires_at", ruEntryExpiry)
         mutable.update { it.copy(connectionSettings = settings) }
         persistConnection()
         startYoutubeAccess()
@@ -1571,6 +1600,8 @@ class DesktopController internal constructor(
                         "Канал YouTube недоступен. YouTube заблокирован", "YouTube channel unavailable. YouTube is blocked")) }
                 }
             }
+            val exit = if (settings.advancedSettings.ruRelayEnabled) active.serverId else settings.profile.entryRouteExit()
+            if (exit != null) selectEntryRoute(active, exit)
             journal.put("pid", active.pid).put("started_at", active.startedAt).put("label", active.label).put("server_id", active.serverId)
             persistConnection()
             mutable.update { it.copy(running = true, verified = verified, connectionSettings = settings,
@@ -1618,6 +1649,7 @@ class DesktopController internal constructor(
         var grant: BackendYoutubeAccess? = null
         var leaseTimer: Job? = null
         var createAttempted = false
+        var nodeSamples: List<RuRelayRttSample>? = null
         val requestId = java.util.UUID.randomUUID().toString()
         var retryMillis = 2_000L
         suspend fun receive(previous: BackendYoutubeAccess?, renewal: Boolean = false,
@@ -1641,10 +1673,21 @@ class DesktopController internal constructor(
             response
         }
         suspend fun create(): BackendYoutubeAccess = receive(null) {
+            if (nodeSamples == null) {
+                nodeSamples = try {
+                    val network = networkSnapshot()
+                    val nodes = forAttempt(owner) { api.youtubeNodes(it, device.id, device.deviceKey) }
+                    measureSelectionNodes(nodes, network).mapNotNull { node -> node.latencyMs?.let { RuRelayRttSample(node.id, it) } }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    if (error is BackendException && error.statusCode != 404 && !BackendRetryPolicy.isTransient(error)) throw error
+                    emptyList()
+                }
+            }
             withDeviceProof(device.id) { token, nonce, signature ->
                 createAttempted = true
                 api.createYoutubeAccess(token, YoutubeAccessRequest(device.id, device.deviceKey, nonce, signature,
-                    requestId, checkNotNull(keyId)))
+                    requestId, checkNotNull(keyId), nodeSamples.orEmpty()))
             }
         }
         suspend fun apply(connection: YoutubeConnectionConfig?, message: String?, confirmed: BackendYoutubeAccess? = null) = operation.withLock {
@@ -1926,6 +1969,9 @@ class DesktopController internal constructor(
                             return@launch
                         }
                         runtime.rebindNetwork(active)
+                        val settings = activeSettings()
+                        val exit = if (settings.advancedSettings.ruRelayEnabled) active.serverId else settings.profile.entryRouteExit()
+                        if (exit != null) selectEntryRoute(active, exit)
                         rebound = true
                         break
                     } catch (cancelled: CancellationException) { throw cancelled }
@@ -1956,22 +2002,27 @@ class DesktopController internal constructor(
     }
 
     private suspend fun startCachedConnection(cached: JSONObject): Boolean {
-        if (cached.optInt("version") != 3) return false
+        if (cached.optInt("version") != CONNECTION_CONFIG_VERSION) return false
         val user = state.value.user?.id
         check(user == null || cached.optString("user_id").ifBlank { user } == user) { "Аккаунт соединения изменился" }
         val settings = vault.decodeSettings(cached.getString("settings"))
         if (!VpnProfileValidator.isUsable(settings.profile, settings.advancedSettings)) return false
+        if (settings.profile.entryRoute && (settings.profile.entryRouteExpiresAt ?: 0L) <= System.currentTimeMillis()) return false
         // RU authorization must be reissued by its control plane; never reuse a revoked lease.
         if (settings.advancedSettings.ruRelayEnabled) return false
         // An armed guard may outlive a failed write that left revoked credentials on disk.
         if (runtime.guardArmed() && runtime.restored() == null) return false
         val config = cached.getJSONObject("config")
         if (!SingBoxConfig.dnsSettingsMatch(config, dnsPolicySnapshot)) return false
+        val network = networkSnapshot()
         val active = startRuntime(config, settings, cached.getString("label"),
             cached.optString("server_id").ifBlank { null })
         mutable.update { it.copy(running = true, verified = false, connectionLabel = active.label, connectedAtMillis = active.startedAt,
             selectedServerId = active.serverId.orEmpty(), connectionSettings = settings) }
-        val latency = runtime.probe(active)
+        val latency = settings.profile.entryRouteExit()?.let { selectEntryRoute(active, it) } ?: runtime.probe(active)
+        if (settings.profile.entryRoute) {
+            check(networkSnapshot().signature == network.signature) { "entry_route_network_changed" }
+        }
         mutable.update { it.copy(verified = true) }
         recordLatencySample(latency, sessionStarted = true)
         recordEndpointResult(settings.profile.endpointCode, true, activeNetwork(), settings.profile.multiHop, latency)
@@ -1980,6 +2031,40 @@ class DesktopController internal constructor(
         transientRecoveryAttempt = 0
         return true
     }
+
+    private suspend fun startCachedEntryProfile(requested: StoredSettings): Boolean {
+        if (requested.userProfile.serverSelectionMode != ServerSelectionMode.SERVER ||
+            requested.advancedSettings.multiHop.let { it.enabled && (it.entry?.kind != ServerSelectionMode.SERVER || it.exit?.kind != ServerSelectionMode.SERVER) }) return false
+        val userId = state.value.user?.id ?: return false
+        val cached = vault.loadCache("entry-profile.dpapi") { it?.let(::JSONObject) } ?: return false
+        if (cached.optString("user_id") != userId || cached.optString("device_id") != vault.deviceId ||
+            cached.optString("routing_hash") != routingHash()
+        ) return false
+        val last = vault.decodeSettings(cached.getString("settings"))
+        if (!last.profile.entryRoute || (last.profile.entryRouteExpiresAt ?: 0L) <= System.currentTimeMillis()) return false
+        val desired = requested.advancedSettings
+        if (last.advancedSettings.copy(multiHop = desired.multiHop) != desired ||
+            last.userProfile.serverSelectionMode != requested.userProfile.serverSelectionMode ||
+            last.userProfile.selectedCountryCode != requested.userProfile.selectedCountryCode ||
+            last.userProfile.selectedNodeId != requested.userProfile.selectedNodeId ||
+            last.filterMode != requested.filterMode || last.selectedPackages != requested.selectedPackages ||
+            cached.optString("requested_hops") != desired.multiHop.toString()
+        ) return false
+        try {
+            return startCachedConnection(cached)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            withContext(NonCancellable) {
+                stopRuntime(restoreInternet = false, retainConnection = true)
+                clearConnectionState()
+                Files.deleteIfExists(vault.directory.resolve("entry-profile.dpapi"))
+            }
+            throw error
+        }
+    }
+
+    private fun routingHash(): String = configHash(JSONObject().put("rules", state.value.routingRules.toString()))
 
     private suspend fun recoverConnectedVpn(settings: StoredSettings, expectedOwner: ConnectedWatchdogPolicy.Owner? = null) {
         if (!state.value.autoRecoveryEnabled) return
@@ -2073,160 +2158,140 @@ class DesktopController internal constructor(
 
     private class EndpointAttemptFailure(cause: Exception) : java.io.IOException("Не удалось подключиться через доступные профили", cause)
 
-    private suspend fun loadGeosites(selectors: Set<String>): ByteArray = geositeOperation.withLock {
-        val path = vault.directory.resolve("geosite.dat")
-        val bytes = try {
-            val (hash, size) = api.geositeMetadata()
-            val cached = if (Files.isRegularFile(path) && Files.size(path) == size.toLong())
-                Files.readAllBytes(path).takeIf { GeositeAsset.sha256(it) == hash } else null
-            cached ?: api.downloadGeosite(size).also {
-                require(GeositeAsset.sha256(it) == hash) { "Контрольная сумма geosite не совпадает" }
-                GeositeAsset.resolveDomains(it, selectors)
+    private suspend fun loadGeosites(selectors: Set<String>, refresh: Boolean = true): GeositeAsset.Release = geositeOperation.withLock {
+        val path = vault.directory.resolve("geodata.zip")
+        val cached = runCatching {
+            if (Files.size(path) in 1L..GeositeAsset.MAX_RELEASE_BYTES.toLong()) GeositeAsset.readRelease(Files.readAllBytes(path)) else null
+        }.getOrNull()
+        val release = if (!refresh) cached ?: SingBoxConfig.bundledGeodata() else try {
+            val metadata = api.geodataMetadata()
+            if (metadata == null || cached?.version == metadata.first) cached ?: SingBoxConfig.bundledGeodata()
+            else {
+                val (version, size) = metadata
+                val bytes = api.downloadGeodata(version, size)
+                val downloaded = GeositeAsset.readRelease(bytes)
+                require(downloaded.version == version) { "geodata_version_mismatch" }
+                GeositeAsset.resolveDomains(downloaded.geosite, selectors)
                 currentCoroutineContext().ensureActive()
-                val temporary = vault.directory.resolve("geosite.dat.tmp")
-                Files.write(temporary, it); Files.move(temporary, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                val temporary = Files.createTempFile(path.parent, "geodata-", ".tmp")
+                try {
+                    Files.write(temporary, bytes)
+                    Files.move(temporary, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                } finally {
+                    Files.deleteIfExists(temporary)
+                }
+                downloaded
             }
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (error: Exception) {
-            if (!BackendRetryPolicy.isTransient(error)) throw error
-            SingBoxConfig.bundledGeosite()
+            cached ?: SingBoxConfig.bundledGeodata()
         }
-        GeositeAsset.resolveDomains(bytes, selectors)
-        bytes
+        GeositeAsset.resolveDomains(release.geosite, selectors)
+        release
     }
 
-    private suspend fun connectWireGuard(device: BackendDevice, requestedSettings: StoredSettings, geosites: Deferred<ByteArray>,
+    private suspend fun connectWireGuard(device: BackendDevice, requestedSettings: StoredSettings, geosites: Deferred<GeositeAsset.Release>,
         onlyNodeId: String?, excludedNodeIds: Set<String>, protectUntilVerified: Boolean = false, dnsPolicy: Deferred<WindowsDnsPolicy>) {
-        var privateKey: ByteArray? = null
-        var reserved: BackendRuWireGuardIdentity? = null
+        val keys = vault.wireGuardKeyPair()
         try {
-            val geositeBytes = geosites.await()
-            val (ready, exit, settings) = withTimeoutOrNull(30_000L) {
-                val requestedMultiHop = requestedSettings.advancedSettings.multiHop
-                val requestedHops = if (requestedMultiHop.entry?.kind == ServerSelectionMode.SERVER &&
-                    requestedMultiHop.exit?.kind == ServerSelectionMode.SERVER) requestedMultiHop.explicitNodeIds() else null
-                val requestedExit = requestedHops?.second ?: if (!requestedMultiHop.enabled)
-                    onlyNodeId ?: requestedSettings.userProfile.selectedNodeId.takeIf {
-                        requestedSettings.userProfile.serverSelectionMode == ServerSelectionMode.SERVER && it.isNotBlank()
-                    } else null
-                val firstCatalog = authorized { api.ruRelayCatalog(it, device.id, vault.deviceKey, requestedExit, requestedHops?.first) }
-                val foreign = firstCatalog.foreignNodes
-                mutable.update { it.copy(ruForeignNodes = foreign.map { node -> node.copy(latencyMs = null) }) }
-                val multiHop = resolveMultiHop(requestedSettings.advancedSettings.multiHop,
-                    ruServers(foreign, state.value.servers), true)
-                val settings = requestedSettings.copy(advancedSettings = requestedSettings.advancedSettings.copy(multiHop = multiHop))
-                val hops = multiHop.explicitNodeIds()
-                if (hops != null) check(foreign.any { it.id == hops.first }) { "Входная нода недоступна" }
-                var selectedExit: RuForeignNode? = null
-                var selectedCatalog: RuRelayCatalog? = null
-                var catalogFailure: Exception? = null
-                for (candidate in ruExits(settings, foreign, state.value.servers).filter { it.id !in excludedNodeIds && (onlyNodeId == null || it.id == onlyNodeId) }) {
-                    val catalog = try {
-                        if (candidate.id == requestedExit && hops?.first == requestedHops?.first) firstCatalog
-                        else authorized { api.ruRelayCatalog(it, device.id, vault.deviceKey, candidate.id, hops?.first) }
+            val network = networkSnapshot()
+            val inventory = authorized { api.ruRelayCatalog(it, device.id, vault.deviceKey) }
+            val permittedExits = ruExits(requestedSettings, inventory.foreignNodes)
+                .filter { it.id !in excludedNodeIds && (onlyNodeId == null || it.id == onlyNodeId) }
+            check(permittedExits.isNotEmpty()) { "ru_relay_pair_unavailable" }
+            val ingress = inventory.relays.filter { it.available && it.pairReady }.map { relay ->
+                VpnServer(relay.id, relay.name, "RU", "RU", relay.probeHost.orEmpty(), relay.probePort, true,
+                    weight = relay.weight, metricsAt = relay.metricsAt, probeHost = relay.probeHost, probeIp = relay.probeIp)
+            }
+            check(ingress.isNotEmpty()) { "ru_relay_pair_unavailable" }
+            val targets = ingress + if (requestedSettings.userProfile.serverSelectionMode == ServerSelectionMode.SERVER)
+                emptyList() else ruServers(permittedExits)
+            val measured = measureSelectionNodes(targets, network).associateBy { it.id }
+            val exits = ruExits(requestedSettings, permittedExits.map { it.copy(latencyMs = measured[it.id]?.latencyMs) })
+            val relays = EndpointRankingPolicy.rankServers(ingress.map { measured[it.id] ?: it }, UserProfile(serverSelectionMode = ServerSelectionMode.AUTO))
+            mutable.update { it.copy(ruForeignNodes = inventory.foreignNodes.map { node -> node.copy(latencyMs = measured[node.id]?.latencyMs) }) }
+            val cachedCredential = vault.readEncrypted("ru-entry.dpapi")?.let(::JSONObject)?.takeIf {
+                it.optString("device_id") == device.id && it.optString("public_key") == keys.second
+            }?.let { RuWireGuardSessionJsonParser.parseEntryCredential(it) }
+                ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() }
+            var keyId: String? = null
+            val geodata = geosites.await()
+            val policy = dnsPolicy.await()
+            var lastFailure: Exception = IllegalStateException("ru_relay_pair_unavailable")
+            for (relay in relays) {
+                val credential = try {
+                    if (cachedCredential?.relayNodeId == relay.id) cachedCredential else {
+                        if (keyId == null) keyId = withDeviceProof(device.id) { token, nonce, signature ->
+                            api.registerRuWireGuardKey(token, device.id, vault.deviceKey, nonce, signature, keys.second).id
+                        }
+                        withDeviceProof(device.id) { token, nonce, signature ->
+                            api.enrollRuEntry(token, device.id, vault.deviceKey, nonce, signature, checkNotNull(keyId), relay.id)
+                        }.also { enrolled ->
+                            check(enrolled.expiresAtEpochMillis > System.currentTimeMillis()) { "ru_entry_expired" }
+                            vault.writeEncrypted("ru-entry.dpapi", RuWireGuardSessionJsonParser.encodeEntryCredential(enrolled)
+                                .put("device_id", device.id).put("public_key", keys.second).toString())
+                        }
+                    }
+                } catch (error: BackendException) {
+                    if (error.statusCode !in setOf(404, 503)) throw error
+                    lastFailure = error
+                    continue
+                }
+                for (exit in exits) {
+                    currentCoroutineContext().ensureActive()
+                    check(networkSnapshot().signature == network.signature) { "entry_route_network_changed" }
+                    try {
+                        val controlPort = SingBoxRuntime.freePort()
+                        var probePort = SingBoxRuntime.freePort()
+                        while (controlPort == probePort) probePort = SingBoxRuntime.freePort()
+                        val secret = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32).also { SecureRandom().nextBytes(it) })
+                        val config = runInterruptible(Dispatchers.IO) {
+                            SingBoxConfig.generateRuEntry(credential, keys.first, controlPort, secret, probePort,
+                                NokiBackendConfig.apiBaseUrl, requestedSettings, geodata, state.value.routingRules, policy)
+                        }
+                        val active = startRuntime(config, requestedSettings, "RU-реле → ${exit.name}", exit.id, protectUntilVerified)
+                        val latency = selectEntryRoute(active, exit.id, credential !== cachedCredential)
+                        check(networkSnapshot().signature == network.signature) { "entry_route_network_changed" }
+                        check(credential.expiresAtEpochMillis > System.currentTimeMillis()) { "ru_entry_expired" }
+                        mutable.update { it.copy(running = true, verified = true, selectedServerId = exit.id, connectionLabel = active.label,
+                            connectedAtMillis = active.startedAt, connectionSettings = requestedSettings) }
+                        recordLatencySample(latency, sessionStarted = true)
+                        rememberConnection(active, config, requestedSettings, network.kind, credential.expiresAtEpochMillis)
+                        startWatchdog(active, initialEvidence = true)
+                        transientRecoveryAttempt = 0
+                        return
                     } catch (cancelled: CancellationException) { throw cancelled }
                     catch (error: Exception) {
-                        if (error is BackendException && error.statusCode !in setOf(404, 503)) throw error
-                        if (error !is BackendException && error !is java.io.IOException) throw error
-                        catalogFailure = error
-                        continue
+                        val backend = error as? BackendException ?: error.cause as? BackendException
+                        if (backend != null && backend.statusCode !in setOf(404, 503)) throw error
+                        lastFailure = error
+                        withContext(NonCancellable) { stopRuntime(restoreInternet = false, retainConnection = true) }
+                        if (networkSnapshot().signature != network.signature) throw error
                     }
-                    val exit = catalog.foreignNodes.firstOrNull { it.id == candidate.id } ?: continue
-                    if (hops != null && catalog.foreignNodes.none { it.id == hops.first }) continue
-                    if (catalog.relays.any { it.available }) { selectedExit = exit; selectedCatalog = catalog; break }
                 }
-                val exit = selectedExit ?: throw (catalogFailure ?: IllegalStateException("Нет доступного RU-маршрута для выбранного выхода"))
-                val catalog = checkNotNull(selectedCatalog)
-                val network = networkSnapshot()
-                val keys = vault.wireGuardKeyPair().also { privateKey = it.first }
-                val (samples, key) = coroutineScope {
-                    val samples = async { measureRuRelayRtt(catalog) { relay -> runInterruptible(Dispatchers.IO) {
-                        network.interfaceIndex?.let { index -> windowsTcpLatency(checkNotNull(relay.probeHost), checkNotNull(relay.probePort), 2_000, index) }
-                    } } }
-                    authorized { token ->
-                        val access = api.vpnAccess(token, device.id, vault.deviceKey)
-                        check(access.canConnect) { "VPN недоступен для текущей подписки или устройства" }
-                    }
-                    val key = withDeviceProof(device.id) { token, nonce, signature ->
-                        api.registerRuWireGuardKey(token, device.id, vault.deviceKey, nonce, signature, keys.second)
-                    }
-                    samples.await() to key
-                }
-                val requestId = java.util.UUID.randomUUID().toString()
-                var session = withDeviceProof(device.id) { token, nonce, signature ->
-                    api.createRuWireGuardSession(token, RuWireGuardSessionRequest(device.id, vault.deviceKey, nonce, signature,
-                        requestId, key.id, exit.id, RuRelaySelection.Auto, samples,
-                        entryNodeId = hops?.first, routeVersion = catalog.routeVersion))
-                }
-                reserved = session.identity
-                stageRuRevoke(session.identity)
-                val initial = session.identity
-                session = authorized { api.activateRuWireGuardSession(it, device.id, vault.deviceKey, initial) }
-                stageRuRevoke(session.identity)
-                val ready = awaitRuWireGuardReady(session, poll = {
-                    authorized { api.pollRuWireGuardSession(it, device.id, vault.deviceKey, initial) }.also { stageRuRevoke(it.identity) }
-                })
-                check(ready.identity.leaseExpiresAtEpochMillis == null) { "RU-сессия должна быть постоянной" }
-                stageRuRevoke(ready.identity, ready.wireguard)
-                Triple(ready, exit, settings)
-            } ?: throw java.net.SocketTimeoutException("Время ожидания RU-подключения истекло")
-            val controlPort = SingBoxRuntime.freePort(); var probePort = SingBoxRuntime.freePort()
-            while (controlPort == probePort) probePort = SingBoxRuntime.freePort()
-            val secret = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32).also { SecureRandom().nextBytes(it) })
-            val policy = dnsPolicy.await()
-            val config = runInterruptible(Dispatchers.IO) {
-                SingBoxConfig.generateWireGuard(ready, checkNotNull(privateKey), controlPort, secret, probePort,
-                    NokiBackendConfig.apiBaseUrl, settings, geositeBytes, state.value.routingRules, dnsPolicy = { policy })
             }
-            val active = startRuntime(config, settings, "${exit.name} · RU WireGuard", exit.id, protectUntilVerified)
-            lastRuStatusCheck = 0L
-            mutable.update { it.copy(running = true, selectedServerId = exit.id, connectionLabel = active.label, connectedAtMillis = active.startedAt, connectionSettings = settings) }
-            val latency = runtime.probe(active)
-            mutable.update { it.copy(verified = true) }
-            recordLatencySample(latency, sessionStarted = true)
-            rememberConnection(active, config, settings, networkSnapshot().kind)
-            startWatchdog(active, initialEvidence = true)
-            transientRecoveryAttempt = 0
+            throw lastFailure
         } catch (error: Exception) {
             withContext(NonCancellable) {
                 runCatching { stopRuntime(restoreInternet = false, retainConnection = true) }.onFailure { error.addSuppressed(it) }
-                runCatching {
-                    if (vault.readEncrypted("ru-revoke.dpapi") == null) reserved?.let { stageRuRevoke(it) }
-                    revokeRu()
-                }.onFailure { error.addSuppressed(it) }
                 val active = runtime.restored()
                 mutable.update { it.copy(running = active != null, verified = false,
                     connectedAtMillis = active?.startedAt, connectionLabel = active?.label.orEmpty()) }
             }
             throw error
-        } finally { privateKey?.fill(0) }
+        } finally { keys.first.fill(0) }
     }
 
-    private suspend fun stageRuRevoke(identity: BackendRuWireGuardIdentity, wireguard: BackendRuWireGuardConfig? = null) = ruRevokes.withLock {
-        vault.writeEncrypted("ru-revoke.dpapi", ruJournal(identity).put("wireguard_hash", wireguard?.let(::wireguardHash)).toString())
-    }
-    private fun wireguardHash(config: BackendRuWireGuardConfig) = java.security.MessageDigest.getInstance("SHA-256")
-        .digest(config.toString().toByteArray(Charsets.UTF_8)).let { Base64.getEncoder().encodeToString(it) }
-
-    private suspend fun checkRuAuthorization() {
-        if (!state.value.running || !state.value.displayedSettings.advancedSettings.ruRelayEnabled) return
-        val journal = vault.readEncrypted("ru-revoke.dpapi")?.let(::JSONObject) ?: return
-        if (!journal.has("wireguard_hash")) return
-        val valid = try {
-            val identity = ruIdentity(journal)
-            val response = withTimeoutOrNull(15_000) { authorized { api.pollRuWireGuardSession(it, vault.deviceId, vault.deviceKey, identity) } } ?: return
-            response is BackendRuWireGuardSession.Ready && response.identity.hasSameAuthorization(identity) &&
-                response.identity.leaseExpiresAtEpochMillis == null &&
-                wireguardHash(response.wireguard) == journal.getString("wireguard_hash")
-        } catch (cancelled: CancellationException) { throw cancelled }
-        catch (error: Exception) { if (BackendRetryPolicy.isTransient(error)) return else false }
-        if (!valid) {
-            stopRuntime(restoreInternet = false); runCatching { revokeRu() }
-            mutable.update { it.copy(running = false, verified = false, networkBlocked = runtime.guardArmed(),
-                message = "RU-сессия отозвана или изменена. Подключитесь снова", messageRevision = it.messageRevision + 1) }
-            recordLog("ru_session_invalid", error = true)
+    private suspend fun selectEntryRoute(active: SingBoxRuntime.Running, exit: String, enrollment: Boolean = false): Long {
+        val generation = synchronized(accountLocalLock) {
+            val previous = vault.readEncrypted("entry-route-generation.dpapi")?.toLong() ?: 0L
+            val next = maxOf(System.currentTimeMillis(), previous + 1L)
+            vault.writeEncrypted("entry-route-generation.dpapi", next.toString())
+            next
         }
+        return runtime.selectEntryRoute(active, exit, generation, enrollment)
     }
+
     private suspend fun revokeRu(expectedSessionId: String? = null) = ruRevokes.withLock {
         val pending = vault.readEncrypted("ru-revoke.dpapi")?.let(::JSONObject) ?: return@withLock
         if (expectedSessionId != null && pending.getString("session_id") != expectedSessionId) return@withLock
@@ -2426,6 +2491,14 @@ class DesktopController internal constructor(
 
     suspend fun refreshServerLatencies() = withContext(Dispatchers.IO) { refreshClientLatencies(force = true) }
 
+    private suspend fun measureSelectionNodes(nodes: List<VpnServer>, network: WindowsNetworkSnapshot): List<VpnServer> {
+        if (!network.available || nodes.isEmpty()) return nodes.map { it.copy(latencyMs = null) }
+        val locations = listOf(ServerLocation("selection", country = "", city = "", host = "", isOnline = true, servers = nodes))
+        val samples = latencySampler(network).measureForStartup(locations)
+            .takeIf { networkSnapshot().signature == network.signature }.orEmpty()
+        return nodes.map { node -> node.copy(latencyMs = ServerLocationMapper.latencyTargetKey(node)?.let(samples::get)) }
+    }
+
     @Synchronized private fun refreshClientLatencies(force: Boolean = false) {
         if (latencyJob?.isActive == true) return
         if (!windowVisible && !force) return
@@ -2445,25 +2518,7 @@ class DesktopController internal constructor(
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val ownJob = currentCoroutineContext()[Job]
             try {
-                val relayTargets = if (!ruRelay) null else coroutineScope {
-                    val slots = kotlinx.coroutines.sync.Semaphore(4)
-                    locations.flatMap { it.servers }.filter { it.isOnline }.distinctBy { it.id }.map { server -> async {
-                        val key = ServerLocationMapper.latencyTargetKey(server) ?: return@async null
-                        val relays = withTimeoutOrNull(8_000) {
-                            slots.withPermit {
-                                try { authorized { api.ruRelayCatalog(it, vault.deviceId, vault.deviceKey, server.id) }.relays }
-                                catch (cancelled: CancellationException) { throw cancelled }
-                                catch (_: Exception) { emptyList() }
-                            }
-                        }.orEmpty()
-                        key to relays.filter { it.available }.mapNotNull { relay ->
-                            val host = relay.probeHost ?: return@mapNotNull null
-                            val port = relay.probePort ?: return@mapNotNull null
-                            host to port
-                        }
-                    } }.awaitAll().filterNotNull().toMap()
-                }
-                val samples = latencySampler(network).measure(locations, relayTargets)
+                val samples = latencySampler(network).measure(locations)
                 currentCoroutineContext().ensureActive()
                 synchronized(this@DesktopController) {
                     if (latencyJob !== ownJob || !current(owner) || state.value.connecting ||
@@ -2538,6 +2593,8 @@ class DesktopController internal constructor(
         Files.deleteIfExists(vault.directory.resolve("connection.dpapi"))
         avatarJob?.cancel()
         authEpoch.incrementAndGet()
+        Files.deleteIfExists(vault.directory.resolve("ru-entry.dpapi"))
+        Files.deleteIfExists(vault.directory.resolve("entry-profile.dpapi"))
         vault.saveTokens(null); tokens = null; registered = null; catalogLocations = emptyList()
         mutable.value = DesktopState(loading = true, settings = state.value.settings, dailyStats = state.value.dailyStats,
             reducedMotion = state.value.reducedMotion, earthDisabled = state.value.earthDisabled,
@@ -2553,6 +2610,7 @@ class DesktopController internal constructor(
         }
 
     companion object {
+        private const val CONNECTION_CONFIG_VERSION = 5
         internal fun accessExpired(token: String, nowMillis: Long = System.currentTimeMillis()): Boolean = runCatching {
             val payload = JSONObject(Base64.getUrlDecoder().decode(token.split('.')[1]).toString(Charsets.UTF_8))
             // Expiry is a refresh hint only; the server still authenticates every request.
@@ -2571,9 +2629,9 @@ class DesktopController internal constructor(
             if (hops.entry?.kind == ServerSelectionMode.SERVER && hops.exit?.kind == ServerSelectionMode.SERVER) hops.explicitNodeIds()
         }
 
-        internal fun multiHopServers(selection: HopSelection?, servers: List<VpnServer>, entry: Boolean, ruRelay: Boolean): List<VpnServer> =
+        internal fun multiHopServers(selection: HopSelection?, servers: List<VpnServer>, entry: Boolean): List<VpnServer> =
             servers.filter { server ->
-                server.isOnline && server.weight > 0 && (ruRelay || if (entry) server.multiHopEntryAvailable else server.multiHopExitAvailable) &&
+                server.isOnline && server.weight > 0 && (if (entry) server.multiHopEntryAvailable else server.multiHopExitAvailable) &&
                     when (selection?.kind) {
                         ServerSelectionMode.COUNTRY -> server.countryCode.equals(selection.countryCode, true)
                         ServerSelectionMode.SERVER -> server.id == selection.nodeId
@@ -2581,12 +2639,12 @@ class DesktopController internal constructor(
                     }
             }
 
-        internal fun resolveMultiHop(hops: MultiHopSettings, servers: List<VpnServer>, ruRelay: Boolean,
+        internal fun resolveMultiHop(hops: MultiHopSettings, servers: List<VpnServer>,
             random: () -> Double = { kotlin.random.Random.nextDouble() }): MultiHopSettings {
             validateMultiHop(hops)
             if (!hops.enabled) return hops
-            val exits = multiHopServers(hops.exit, servers, false, ruRelay)
-            val entries = multiHopServers(hops.entry, servers, true, ruRelay).filter { entry -> exits.any { it.id != entry.id } }
+            val exits = multiHopServers(hops.exit, servers, false)
+            val entries = multiHopServers(hops.entry, servers, true).filter { entry -> exits.any { it.id != entry.id } }
             fun choose(candidates: List<VpnServer>) = EndpointRankingPolicy.rankServers(candidates, UserProfile(serverSelectionMode = ServerSelectionMode.AUTO), random = random).firstOrNull()
                 ?: error("Нет доступной пары серверов для выбранных локаций")
             val entry = choose(entries)
@@ -2595,29 +2653,24 @@ class DesktopController internal constructor(
                 exit = HopSelection(ServerSelectionMode.SERVER, nodeId = exit.id)).also { it.explicitNodeIds() }
         }
 
-        internal fun ruExits(settings: StoredSettings, nodes: List<RuForeignNode>, servers: List<VpnServer> = emptyList(),
+        internal fun ruExits(settings: StoredSettings, nodes: List<RuForeignNode>,
             random: () -> Double = { kotlin.random.Random.nextDouble() }): List<RuForeignNode> {
-            val hops = settings.advancedSettings.multiHop.explicitNodeIds()
             val selected = settings.userProfile
             val eligible = nodes.filter { node ->
-                if (hops != null) node.id == hops.second else when (selected.serverSelectionMode) {
+                when (selected.serverSelectionMode) {
                     ServerSelectionMode.AUTO -> true
                     ServerSelectionMode.COUNTRY -> node.countryCode.equals(selected.selectedCountryCode, true)
                     ServerSelectionMode.SERVER -> node.id == selected.selectedNodeId
                 }
             }
-            val ranked = ruServers(eligible, servers)
-            val scope = if (hops == null) selected else selected.copy(serverSelectionMode = ServerSelectionMode.SERVER, selectedNodeId = hops.second)
+            val ranked = ruServers(eligible)
             val byId = eligible.associateBy { it.id }
-            return EndpointRankingPolicy.rankServers(ranked, scope, random = random).mapNotNull { byId[it.id] }
+            return EndpointRankingPolicy.rankServers(ranked, selected, random = random).mapNotNull { byId[it.id] }
         }
 
-        private fun ruServers(nodes: List<RuForeignNode>, servers: List<VpnServer>): List<VpnServer> {
-            val physical = servers.associateBy { it.id }
-            return nodes.map { node ->
-                physical[node.id]?.copy(latencyMs = node.latencyMs ?: physical[node.id]?.latencyMs)
-                    ?: VpnServer(node.id, node.name, node.countryCode, node.countryCode, "", null, true, latencyMs = node.latencyMs)
-            }
+        private fun ruServers(nodes: List<RuForeignNode>): List<VpnServer> = nodes.map { node ->
+            VpnServer(node.id, node.name, node.countryCode, node.countryCode, node.probeHost.orEmpty(), node.probePort, true,
+                latencyMs = node.latencyMs, weight = node.weight, metricsAt = node.metricsAt, probeHost = node.probeHost, probeIp = node.probeIp)
         }
 
         internal fun ruJournal(identity: BackendRuWireGuardIdentity): JSONObject = JSONObject()
@@ -2657,10 +2710,13 @@ class DesktopController internal constructor(
             catch (error: Exception) {
                 val running = runtime.restored()
                 val backendError = error as? BackendException ?: error.cause as? BackendException
-                val message = when (error) {
-                    is BackendException -> if (auth) AppErrorMapper.readableAuthError(state.value.language, error)
+                val message = when {
+                    error.message == "entry_route_unavailable" -> tr(state.value, "Выбранный маршрут недоступен", "The selected route is unavailable")
+                    error.message == "entry_route_not_confirmed" || error.cause?.message == "entry_route_not_confirmed" ->
+                        tr(state.value, "Входная нода не подтвердила маршрут", "The entry node did not confirm the route")
+                    error is BackendException -> if (auth) AppErrorMapper.readableAuthError(state.value.language, error)
                         else AppErrorMapper.readableNetworkError(state.value.language, error)
-                    is java.io.IOException -> AppErrorMapper.readableNetworkError(state.value.language, error)
+                    error is java.io.IOException -> AppErrorMapper.readableNetworkError(state.value.language, error)
                     else -> if (error.message in listOf("avatar_file_too_large", "avatar_open_failed", "avatar_dimensions_too_large", "avatar_format_unsupported")) avatarFileError(state.value.language, error)
                     else if (error.message in listOf("multihop_selector_missing", "multihop_selector_invalid", "ru_route_identity_invalid", "ru_wireguard_uuid_invalid"))
                         "Для мультихопа выберите две разные конкретные ноды"

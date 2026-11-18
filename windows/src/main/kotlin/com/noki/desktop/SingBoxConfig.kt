@@ -15,12 +15,18 @@ import java.util.UUID
 /** Shared native VPN policy with Windows TUN, local control and process routing. */
 object SingBoxConfig {
     const val DEFAULT_PROBE_PORT = 20808
+    private const val ENTRY_ROUTE_HOST = "entry-route.invalid"
+    private const val ENTRY_ROUTE_PORT = 62101
     private val fingerprints = setOf("chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized")
     private val hostnameLabel = Regex("[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
-    fun bundledGeosite(): ByteArray = checkNotNull(SingBoxConfig::class.java.getResourceAsStream("/noki/vpn/geosite.dat")) {
-        "Bundled geosite is missing"
-    }.use { it.readBytes() }
+    private val bundledRelease by lazy {
+        checkNotNull(SingBoxConfig::class.java.getResourceAsStream("/noki/vpn/geodata.zip")) {
+            "Bundled geodata is missing"
+        }.use { GeositeAsset.readRelease(it.readBytes()) }
+    }
+    internal fun bundledGeodata(): GeositeAsset.Release = bundledRelease
+    fun bundledGeosite(): ByteArray = bundledGeodata().geosite
 
     fun supportedCandidates(session: BackendVpnSession): List<BackendEndpointCandidate> {
         if (!session.canConnect) return emptyList()
@@ -37,7 +43,7 @@ object SingBoxConfig {
     internal fun generate(session: BackendVpnSession, candidate: BackendEndpointCandidate, controlPort: Int, controlSecret: String,
                   probePort: Int = DEFAULT_PROBE_PORT, apiOrigin: String? = null, settings: StoredSettings? = null,
                   geositeBytes: ByteArray = bundledGeosite(), routingRules: List<DesktopRoutingRule> = emptyList(),
-                  dnsPolicy: () -> WindowsDnsPolicy = ::windowsDnsPolicy): JSONObject {
+                  dnsPolicy: () -> WindowsDnsPolicy = ::windowsDnsPolicy, russianIp: List<String> = bundledGeodata().russianIp): JSONObject {
         val current = settings ?: DesktopState().settings
         val supported = supportedCandidates(session)
         val allowed = if (!current.advancedSettings.gamingModeEnabled && current.advancedSettings.endpointSelectionMode == EndpointSelectionMode.MANUAL)
@@ -45,19 +51,46 @@ object SingBoxConfig {
         require(candidate in allowed) { "sing_box_endpoint_unsupported" }
         val profile = EndpointSelector.profileFromCandidate(session, candidate).copy(
             nokinvMode = if (current.advancedSettings.gamingModeEnabled) "gaming" else "balanced")
-        val config = JSONObject(VpnConfigFactory.build(profile, current.advancedSettings, geositeBytes))
+        val config = JSONObject(VpnConfigFactory.build(profile, current.advancedSettings, geositeBytes, russianIp))
         return windowsConfig(config, controlPort, controlSecret, probePort, apiOrigin, current, geositeBytes, routingRules, dnsPolicy)
+            .also { if (profile.entryRoute) blockUntilEntryRoute(it) }
     }
 
     internal fun generateWireGuard(ready: BackendRuWireGuardSession.Ready, privateKey: ByteArray, controlPort: Int, secret: String,
                           probePort: Int, apiOrigin: String, settings: StoredSettings, geositeBytes: ByteArray = bundledGeosite(),
-                          routingRules: List<DesktopRoutingRule> = emptyList(), dnsPolicy: () -> WindowsDnsPolicy = ::windowsDnsPolicy): JSONObject {
-        val expectedHops = settings.advancedSettings.multiHop.explicitNodeIds()
+                          routingRules: List<DesktopRoutingRule> = emptyList(), dnsPolicy: () -> WindowsDnsPolicy = ::windowsDnsPolicy,
+                          russianIp: List<String> = bundledGeodata().russianIp): JSONObject {
         require(ready.identity.routeVersion == 1 && ready.identity.leaseExpiresAtEpochMillis == null &&
-            ready.identity.exitNodeId == (expectedHops?.second ?: ready.identity.exitNodeId) &&
-            ready.identity.entryNodeId == expectedHops?.first) { "ru_route_mismatch" }
-        val config = JSONObject(VpnConfigFactory.buildWireGuard(ready.wireguard, privateKey, settings.advancedSettings, geositeBytes))
+            ready.identity.entryNodeId == null && !settings.advancedSettings.multiHop.enabled) { "ru_route_mismatch" }
+        val config = JSONObject(VpnConfigFactory.buildWireGuard(ready.wireguard, privateKey, settings.advancedSettings, geositeBytes, russianIp))
         return windowsConfig(config, controlPort, secret, probePort, apiOrigin, settings, geositeBytes, routingRules, dnsPolicy)
+    }
+
+    internal fun generateRuEntry(credential: RuEntryCredential, privateKey: ByteArray, controlPort: Int, secret: String,
+                                probePort: Int, apiOrigin: String, settings: StoredSettings, geodata: GeositeAsset.Release,
+                                routingRules: List<DesktopRoutingRule>, dnsPolicy: WindowsDnsPolicy): JSONObject {
+        val config = JSONObject(VpnConfigFactory.buildWireGuard(credential.wireguard, privateKey, settings.advancedSettings,
+            geodata.geosite, geodata.russianIp))
+        return windowsConfig(config, controlPort, secret, probePort, apiOrigin, settings, geodata.geosite, routingRules) { dnsPolicy }
+            .also { blockUntilEntryRoute(it, credential.routeGateway) }
+    }
+
+    private fun blockUntilEntryRoute(config: JSONObject, gateway: String? = null) {
+        val route = config.getJSONObject("route")
+        val rules = route.getJSONArray("rules")
+        val protected = JSONArray()
+            .put(JSONObject().put("type", "logical").put("mode", "and").put("invert", true)
+                .put("rules", JSONArray().put(JSONObject().put("clash_mode", "NokiRouteReady"))).put("action", "reject"))
+        gateway?.let {
+            protected.put(JSONObject().put("inbound", "probe").put("port", ENTRY_ROUTE_PORT).put("action", "resolve"))
+            protected.put(JSONObject().put("ip_cidr", JSONArray().put("$it/32"))
+                .put("port", ENTRY_ROUTE_PORT).put("action", "reject"))
+        }
+        protected.put(rules.getJSONObject(0)) // Sniff HTTP Host and TLS SNI before testing the reserved name.
+        protected.put(JSONObject().put("domain", JSONArray().put(ENTRY_ROUTE_HOST).put("$ENTRY_ROUTE_HOST."))
+            .put("action", "reject"))
+        for (index in 1 until rules.length()) protected.put(rules.getJSONObject(index))
+        route.put("rules", protected)
     }
 
     fun withYoutube(baseConfig: JSONObject, settings: StoredSettings, connection: YoutubeConnectionConfig?,
@@ -130,7 +163,7 @@ object SingBoxConfig {
             if (index == 0 && api != null) rules.put(JSONObject().put("inbound", "tun").put("domain", JSONArray().put(api.host))
                 .put("port", if (api.port == -1) 443 else api.port).put("action", "route").put("outbound", "direct"))
         }
-        val activeRules = routingRules.filter { it.enabled }.map(DesktopRoutingRule::normalized)
+        val activeRules = routingRules.filter { it.enabled && it.id != DesktopRoutingRule.RUSSIAN_RESOURCES.id }.map(DesktopRoutingRule::normalized)
         for (row in activeRules) require(row.ips.filter { it.startsWith("geoip:") }.all { selector -> row.ruleSets.any { it.name == selector } }) { "Не найден локальный список geoip. Сохраните правило заново." }
         val sources = JSONArray()
         for (source in activeRules.flatMap { it.ruleSets }.distinctBy { it.path }) {
@@ -162,11 +195,12 @@ object SingBoxConfig {
 
     internal fun dnsBypassMatch(settings: StoredSettings, routingRules: List<DesktopRoutingRule>, geositeBytes: ByteArray): JSONObject? {
         val advanced = DomainRulePolicy.normalizeSettings(settings.advancedSettings)
-        val rows = routingRules.filter { it.enabled }.map(DesktopRoutingRule::normalized)
-        val selectors = advanced.bypassDomains + advanced.alwaysOnDomains + rows.flatMap { it.serverDomains() }
+        val rows = routingRules.filter { it.enabled && it.id != DesktopRoutingRule.RUSSIAN_RESOURCES.id }.map(DesktopRoutingRule::normalized)
+        val directDomains = (listOf(DomainRulePolicy.RUSSIAN_RESOURCES_RULE) + advanced.bypassDomains).distinct()
+        val selectors = directDomains + advanced.alwaysOnDomains + rows.flatMap { it.serverDomains() }
         val geosites = GeositeAsset.resolveDomains(geositeBytes, selectors.filter { it.startsWith("geosite:") }.toSet())
         val direct = mutableListOf<JSONObject>()
-        VpnConfigFactory.domainMatch(advanced.bypassDomains, geosites)?.let(direct::add)
+        VpnConfigFactory.domainMatch(directDomains, geosites)?.let(direct::add)
         val protected = mutableListOf<JSONObject>()
         VpnConfigFactory.domainMatch(advanced.alwaysOnDomains, geosites)?.let(protected::add)
         for (row in rows) {
@@ -245,9 +279,13 @@ object SingBoxConfig {
         dns.put("ipv4_only_servers", JSONArray().put(dns.getString("final")))
         val protectedAAAA = JSONObject().put("query_type", "AAAA").put("action", "predefined").put("rcode", "NOERROR")
         val originalDnsRules = dns.getJSONArray("rules")
-        val rules = JSONArray((0 until originalDnsRules.length()).map(originalDnsRules::getJSONObject).filterNot { it.similar(protectedAAAA) })
+        val rules = JSONArray((0 until originalDnsRules.length()).map(originalDnsRules::getJSONObject)
+            .takeWhile { it.optString("server") == "bootstrap" && !it.has("action") })
         dns.put("rules", rules)
         val servers = dns.getJSONArray("servers")
+        for (index in servers.length() - 1 downTo 0) {
+            if (servers.getJSONObject(index).optString("tag").startsWith("system-dns-")) servers.remove(index)
+        }
         val tags = linkedMapOf<Pair<String, String>, String>()
         fun query(match: JSONObject, resolvers: List<WindowsDnsServer>, blocked: Boolean = false) {
             if (!blocked) for (resolver in resolvers) {

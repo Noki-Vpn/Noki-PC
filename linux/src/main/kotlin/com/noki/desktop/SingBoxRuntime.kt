@@ -106,6 +106,10 @@ open class SingBoxRuntime(private val vault: WindowsVault,
     private var metricSample: Triple<Running, Metrics, Long>? = null
     private val coreLogHttp = http.newBuilder().proxy(Proxy.NO_PROXY).followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).build()
+    private val entryRouteHttp = coreLogHttp.newBuilder().callTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS).build()
+    private val entryEnrollmentHttp = entryRouteHttp.newBuilder().callTimeout(13, TimeUnit.SECONDS)
+        .readTimeout(13, TimeUnit.SECONDS).build()
     private val binary: Path = findBinary()
     internal suspend fun ruleSetCommand(command: String, source: Path, output: Path) = withContext(Dispatchers.IO) {
         require(command in setOf("compile", "decompile"))
@@ -284,6 +288,26 @@ open class SingBoxRuntime(private val vault: WindowsVault,
         }
         currentCoroutineContext().ensureActive()
         check(restored() == current) { "VPN-ядро было заменено" }
+    }
+
+    internal open suspend fun selectEntryRoute(current: Running, exitNodeId: String, generation: Long, enrollment: Boolean = false): Long {
+        check(restored() == current) { "entry_route_runtime_changed" }
+        val body = JSONObject().put("exit_node_id", exitNodeId).put("generation", generation).put("enrollment", enrollment)
+        val client = if (enrollment) entryEnrollmentHttp else entryRouteHttp
+        val delay = client.newCall(Request.Builder()
+            .url("http://127.0.0.1:${current.controlPort}/noki/entry/route")
+            .header("Authorization", "Bearer ${current.controlSecret}")
+            .post(body.toString().toRequestBody()).build()).await { response ->
+            if (response.code != 200) throw IOException("entry_route_not_confirmed")
+            val ack = JSONObject(checkNotNull(response.body).string())
+            check(ack.getString("exit_node_id") == exitNodeId && ack.getLong("generation") == generation) {
+                "entry_route_ack_mismatch"
+            }
+            ack.getLong("delay_ms").also { check(it in 1L..12_000L) { "entry_route_ack_mismatch" } }
+        }
+        currentCoroutineContext().ensureActive()
+        check(restored() == current) { "entry_route_runtime_changed" }
+        return delay
     }
 
     internal suspend fun probeTargets(port: Int, targets: List<VpnProbePlanPolicy.ProbeTarget>, fastStartup: Boolean = false): Long {
@@ -710,8 +734,8 @@ open class SingBoxRuntime(private val vault: WindowsVault,
                 }
             })
         }
-        const val BINARY_HASH = "6058ec64bf5240f64dd2dca13f6aea60ee4f542ec3649c518a082824be9defff"
-        const val BINARY_VERSION = "1.14.1-extended-2.7.2-nokinv-30-pc"
+        const val BINARY_HASH = "700b0f56c205c162cb40dec1bef2cbc7b51be0b83b53640a2ee9a6a85e4286fb"
+        const val BINARY_VERSION = "1.14.1-extended-2.7.2-nokinv-32-pc"
         const val CRONET_HASH = "3217c6260fbca5f16072e0b79735742f40109a63bb0ff88fd6b96dd6b54a2928"
         internal fun persistIdentity(vault: WindowsVault, current: Running) = vault.writeEncrypted("runtime.dpapi", JSONObject()
             .put("pid", current.pid).put("started_at", current.startedAt).put("control_port", current.controlPort)

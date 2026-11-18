@@ -639,20 +639,26 @@ internal fun windowsTcpLatency(host: String, port: Int, timeoutMs: Int, interfac
     else DeviceLatency.measureTcpConnectMs(host, port, timeoutMs, onDiagnostic = {},
         socketFactory = { WindowsProbeSocket(interfaceIndex) })
 
-/** Connect-only socket: no payload leaves the device; cancellation is checked at most every 25 ms. */
+/** A raw ICMP socket has the same mandatory physical-interface binding as TCP. */
+internal fun windowsIcmpLatency(host: String, timeoutMs: Int, interfaceIndex: Int): Int? = runCatching {
+    if (DesktopBuild.IS_LINUX || interfaceIndex <= 0 || !host.matches(Regex("[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+"))) return null
+    val address = DeviceLatency.resolveAddress(host, 1) as? Inet4Address ?: return null
+    if (address.isAnyLocalAddress || address.isLoopbackAddress || address.isSiteLocalAddress || address.isLinkLocalAddress || address.isMulticastAddress) return null
+    WindowsProbeSocket(interfaceIndex).use { it.ping(address, timeoutMs.coerceIn(1, 3000)) }
+}.getOrNull()
+
+/** TCP connect or fixed ICMP echo only; cancellation is checked at most every 25 ms. */
 private class WindowsProbeSocket(private val interfaceIndex: Int) : Socket() {
     private val functions = listOf("WSAStartup", "WSACleanup", "socket", "setsockopt", "ioctlsocket",
-        "connect", "WSAPoll", "getsockopt", "closesocket").associateWith { Function.getFunction("ws2_32", it, Function.ALT_CONVENTION) }
+        "connect", "send", "recv", "WSAPoll", "getsockopt", "closesocket").associateWith { Function.getFunction("ws2_32", it, Function.ALT_CONVENTION) }
     private var handle = -1L
     private var initialized = false
     private fun winsock(name: String, vararg args: Any?) =
         functions.getValue(name).invokeInt(args)
     private fun checkSocket(result: Int) { if (result != 0) throw SocketException("Winsock ${Native.getLastError()}") }
-    override fun connect(endpoint: SocketAddress, timeout: Int) {
-        val address = endpoint as? InetSocketAddress ?: throw SocketException("Invalid probe endpoint")
-        val bytes = address.address?.address?.takeIf { it.size == 4 } ?: throw SocketException("No physical IPv4 address")
+    private fun open(protocol: Int) {
         Memory(512).use { data -> checkSocket(winsock("WSAStartup", 0x202, data)) }; initialized = true
-        handle = functions.getValue("socket").invokeLong(arrayOf(2, 1, 6))
+        handle = functions.getValue("socket").invokeLong(arrayOf(2, if (protocol == 1) 3 else 1, protocol))
         if (handle == -1L) throw SocketException("Could not create probe socket")
         Memory(4).use { option ->
             option.setInt(0, Integer.reverseBytes(interfaceIndex))
@@ -660,6 +666,11 @@ private class WindowsProbeSocket(private val interfaceIndex: Int) : Socket() {
             option.setInt(0, 1)
             checkSocket(winsock("ioctlsocket", handle, 0x8004667e.toInt(), option))
         }
+    }
+    override fun connect(endpoint: SocketAddress, timeout: Int) {
+        val address = endpoint as? InetSocketAddress ?: throw SocketException("Invalid probe endpoint")
+        val bytes = address.address?.address?.takeIf { it.size == 4 } ?: throw SocketException("No physical IPv4 address")
+        open(6)
         Memory(16).use { target ->
             target.clear(); target.setShort(0, 2)
             target.setByte(2, (address.port ushr 8).toByte()); target.setByte(3, address.port.toByte()); target.write(4, bytes, 0, 4)
@@ -684,6 +695,52 @@ private class WindowsProbeSocket(private val interfaceIndex: Int) : Socket() {
                 return
             }
         } } }
+    }
+    fun ping(address: Inet4Address, timeout: Int): Int? {
+        open(1)
+        val identity = java.security.SecureRandom().nextInt(65536)
+        val packet = ByteArray(16).apply {
+            this[0] = 8; this[4] = (identity ushr 8).toByte(); this[5] = identity.toByte(); this[7] = 1
+            "NokiRTT1".toByteArray(Charsets.US_ASCII).copyInto(this, 8)
+        }
+        var sum = packet.indices.step(2).sumOf { ((packet[it].toInt() and 255) shl 8) or (packet[it + 1].toInt() and 255) }
+        sum = (sum and 65535) + (sum ushr 16)
+        val checksum = ((sum and 65535) + (sum ushr 16)).inv() and 65535
+        packet[2] = (checksum ushr 8).toByte(); packet[3] = checksum.toByte()
+        Memory(16).use { target ->
+            target.clear(); target.setShort(0, 2); target.write(4, address.address, 0, 4)
+            checkSocket(winsock("connect", handle, target, 16))
+        }
+        val started = System.nanoTime()
+        val deadline = started + timeout * 1_000_000L
+        Memory(packet.size.toLong()).use { request ->
+            request.write(0, packet, 0, packet.size)
+            if (winsock("send", handle, request, packet.size, 0) != packet.size) throw SocketException("ICMP probe send failed")
+        }
+        Memory(16).use { poll -> Memory(4096).use { reply ->
+            poll.clear(); poll.setLong(0, handle); poll.setShort(8, 0x100)
+            while (true) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedIOException("Probe cancelled")
+                val remaining = ((deadline - System.nanoTime()) / 1_000_000L).toInt()
+                if (remaining <= 0) return null
+                val ready = winsock("WSAPoll", poll, 1, minOf(remaining, 25))
+                if (ready < 0) throw SocketException("ICMP probe poll failed")
+                if (ready == 0) continue
+                val length = winsock("recv", handle, reply, 4096, 0)
+                if (length < 0) {
+                    if (Native.getLastError() == 10035) continue
+                    throw SocketException("ICMP probe receive failed")
+                }
+                val header = (reply.getByte(0).toInt() and 15) * 4
+                if (header >= 20 && length >= header + 16 && reply.getByte(header.toLong()).toInt() == 0 &&
+                    reply.getByte((header + 1).toLong()).toInt() == 0 &&
+                    reply.getByteArray(12, 4).contentEquals(address.address) &&
+                    reply.getByte((header + 4).toLong()) == packet[4] && reply.getByte((header + 5).toLong()) == packet[5] &&
+                    reply.getByte((header + 7).toLong()).toInt() == 1 &&
+                    reply.getByteArray((header + 8).toLong(), 8).contentEquals(packet.copyOfRange(8, 16)))
+                    return ((System.nanoTime() - started) / 1_000_000L).toInt().coerceIn(1, 3000)
+            }
+        } }
     }
     override fun close() {
         if (handle != -1L) { winsock("closesocket", handle); handle = -1L }

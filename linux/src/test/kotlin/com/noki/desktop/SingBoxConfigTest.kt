@@ -19,6 +19,29 @@ import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
 class SingBoxConfigTest {
+    @Test fun `local route uses the normal entry endpoint and blocks TUN before ACK`() {
+        val entry = "00000000-0000-4000-8000-000000000001"
+        val exit = "00000000-0000-4000-8000-000000000002"
+        val hops = MultiHopSettings(enabled = true, entry = HopSelection(ServerSelectionMode.SERVER, nodeId = entry),
+            exit = HopSelection(ServerSelectionMode.SERVER, nodeId = exit))
+        val endpoint = candidate().copy(nodeId = entry)
+        val response = session(endpoint).copy(entryRoute = true, multiHop = BackendMultiHopSession.atEntry(hops))
+        val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings(multiHop = hops))
+        val profile = EndpointSelector.profileFromCandidate(response, endpoint)
+        assertEquals(exit, profile.entryRouteExit())
+        assertEquals(endpoint.entryPort.toString(), profile.port)
+        val config = SingBoxConfig.generate(response, endpoint, 20909, SECRET, settings = settings, dnsPolicy = { unitDnsPolicy })
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        val gate = rules.getJSONObject(0)
+        assertEquals("reject", gate.getString("action"))
+        assertTrue(gate.getBoolean("invert"))
+        assertEquals("NokiRouteReady", gate.getJSONArray("rules").getJSONObject(0).getString("clash_mode"))
+        assertEquals("sniff", rules.getJSONObject(1).getString("action"))
+        assertEquals("reject", rules.getJSONObject(2).getString("action"))
+        assertEquals(listOf("entry-route.invalid", "entry-route.invalid."), rules.getJSONObject(2).getJSONArray("domain").toList())
+        checkWithCore(config)
+    }
+
     @Test fun `NaiveProxy uses session credentials in the native outbound and remains a separate manual family`() {
         val naive = hysteria().copy(code = "ro-naive", locationCode = "ro", locationName = "Romania",
             proxyType = "naive", transport = "naive", alpn = null, connectIp = "203.0.113.10")
@@ -120,8 +143,8 @@ class SingBoxConfigTest {
         assertTrue(match.toString().contains("invert"))
         assertFalse(match.toString().contains("ip_cidr"))
         assertFalse(match.toString().contains("process_path"))
-        assertNull(SingBoxConfig.dnsBypassMatch(settings.copy(filterMode = AppFilterMode.ALL_APPS,
-            advancedSettings = AdvancedSettings()), emptyList(), geosite))
+        assertTrue(SingBoxConfig.dnsBypassMatch(settings.copy(filterMode = AppFilterMode.ALL_APPS,
+            advancedSettings = AdvancedSettings()), emptyList(), geosite).toString().contains("koronapay.com"))
     }
 
     @Test fun `application DNS bypass requires an identified executable and keeps shared Windows DNS protected`() {
@@ -131,7 +154,7 @@ class SingBoxConfigTest {
         for (mode in listOf(AppFilterMode.ALL_EXCEPT_SELECTED, AppFilterMode.ONLY_SELECTED)) {
             val settings = DesktopState().settings.copy(filterMode = mode, selectedPackages = setOf(path), advancedSettings = AdvancedSettings())
             val bypass = requireNotNull(SingBoxConfig.dnsBypassMatch(settings, emptyList(), geosite))
-            val matches = bypass.getJSONArray("rules").objects()
+            val matches = bypass.getJSONArray("rules").getJSONObject(1).getJSONArray("rules").objects()
             val knownPath = matches[1].getString("process_path_regex").toRegex()
             assertTrue(knownPath.matches("C:\\Apps\\Rdp.exe"))
             assertFalse(knownPath.matches(""))
@@ -389,7 +412,8 @@ class SingBoxConfigTest {
                 youtube.forEach { assertEquals("tun", it.getJSONArray("rules").getJSONObject(0).getString("inbound")) }
                 assertEquals("reject", youtube[0].getString("action"))
                 assertEquals(6, youtube[0].getJSONArray("rules").getJSONObject(2).getInt("ip_version"))
-                assertEquals("reject", youtube[1].getString("action"))
+                assertEquals("route", youtube[1].getString("action"))
+                assertEquals("youtube-ru", youtube[1].getString("outbound"))
                 assertEquals("udp", youtube[1].getJSONArray("rules").getJSONObject(2).getString("network"))
                 assertFalse(youtube[1].getJSONArray("rules").getJSONObject(2).has("port"))
                 assertEquals("tcp", youtube[2].getJSONArray("rules").getJSONObject(2).getString("network"))
@@ -477,13 +501,12 @@ class SingBoxConfigTest {
         val multiSettings = settings.copy(advancedSettings = settings.advancedSettings.copy(multiHop = hops))
         val multi = SingBoxConfig.generate(session(entry).copy(multiHop = hop), entry, 20909, SECRET, settings = multiSettings, routingRules = rules, dnsPolicy = { unitDnsPolicy })
         val ruSettings = settings.copy(advancedSettings = settings.advancedSettings.copy(ruRelayEnabled = true))
-        val ruMultiSettings = ruSettings.copy(advancedSettings = ruSettings.advancedSettings.copy(multiHop = hops))
         val identity = BackendRuWireGuardIdentity("request", "session", 1, "key", RuRelaySelection.Auto, "relay", EXIT,
             routeVersion = 1, routeId = "route", routeGeneration = 1, entryNodeId = null, leaseExpiresAtEpochMillis = null, revokeToken = "x".repeat(32))
         fun ru(current: StoredSettings, entryNodeId: String?) = SingBoxConfig.generateWireGuard(
             BackendRuWireGuardSession.Ready(identity.copy(entryNodeId = entryNodeId), youtubeWireGuard().copy(endpoint = "203.0.113.25:51820")),
             ByteArray(32) { (it + 2).toByte() }, 20909, SECRET, 20808, "https://api.noki.example", current, routingRules = rules, dnsPolicy = { unitDnsPolicy })
-        return listOf(direct to settings, multi to multiSettings, ru(ruSettings, null) to ruSettings, ru(ruMultiSettings, ENTRY) to ruMultiSettings)
+        return listOf(direct to settings, multi to multiSettings, ru(ruSettings, null) to ruSettings)
     }
 
     private fun youtubeConnection(): YoutubeConnectionConfig = YoutubeConnectionConfig.fromReady(
@@ -569,8 +592,8 @@ class SingBoxConfigTest {
             val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings())
             val config = SingBoxConfig.generate(session(endpoint), endpoint, 20909, SECRET, settings = settings, routingRules = listOf(rule), dnsPolicy = { unitDnsPolicy })
             assertEquals(3, config.getJSONObject("route").getJSONArray("rule_set").length())
-            assertEquals(source.tag + "-dns", SingBoxConfig.dnsBypassMatch(settings, listOf(rule), SingBoxConfig.bundledGeosite())!!.getJSONArray("rule_set").getString(0))
-            assertNull(SingBoxConfig.dnsBypassMatch(settings, listOf(rule.copy(ruleSets = listOf(source.copy(dnsPath = null)))), SingBoxConfig.bundledGeosite()))
+            assertTrue(SingBoxConfig.dnsBypassMatch(settings, listOf(rule), SingBoxConfig.bundledGeosite()).toString().contains(source.tag + "-dns"))
+            assertFalse(SingBoxConfig.dnsBypassMatch(settings, listOf(rule.copy(ruleSets = listOf(source.copy(dnsPath = null)))), SingBoxConfig.bundledGeosite()).toString().contains(source.tag + "-dns"))
             assertTrue(runCatching { SingBoxConfig.generate(session(endpoint), endpoint, 20909, SECRET,
                 settings = settings, routingRules = listOf(rule.copy(ruleSets = listOf(source))), dnsPolicy = { unitDnsPolicy }) }.isFailure)
             checkWithCore(config)
@@ -603,7 +626,7 @@ class SingBoxConfigTest {
         val saved = MultiHopSettings(true, HopSelection(ServerSelectionMode.COUNTRY, "PL"), HopSelection(ServerSelectionMode.COUNTRY, "RO"))
         val resolved = DesktopController.resolveMultiHop(saved, listOf(
             VpnServer(ENTRY, "Poland", "PL", "pl", "example.invalid", null, true, multiHopEntryAvailable = true),
-            VpnServer(EXIT, "Romania", "RO", "ro", "example.invalid", null, true, multiHopExitAvailable = true)), false)
+            VpnServer(EXIT, "Romania", "RO", "ro", "example.invalid", null, true, multiHopExitAvailable = true)))
         val payload = javaClass.getResourceAsStream("/contracts/multihop_session_v2.json")!!.use {
             JSONObject(it.reader(Charsets.UTF_8).readText())
         }
@@ -648,7 +671,7 @@ class SingBoxConfigTest {
         val selection = DesktopController.resolveMultiHop(MultiHopSettings(true,
             HopSelection(ServerSelectionMode.COUNTRY, "NL"), HopSelection(ServerSelectionMode.COUNTRY, "PL")), listOf(
             VpnServer(ENTRY, "Entry", "NL", "nl", "example.invalid", null, true, multiHopEntryAvailable = true),
-            VpnServer(EXIT, "Exit", "PL", "pl", "example.invalid", null, true, multiHopExitAvailable = true)), false)
+            VpnServer(EXIT, "Exit", "PL", "pl", "example.invalid", null, true, multiHopExitAvailable = true)))
         val hop = BackendMultiHopSession(selection, ENTRY, EXIT, "203.0.113.20", "a".repeat(64))
         val endpoint = candidate().copy(nodeId = EXIT, entryHost = hop.entryIp, entryPort = 20443, connectIp = hop.entryIp)
         val session = session(endpoint).copy(multiHop = hop)
@@ -675,7 +698,7 @@ class SingBoxConfigTest {
         val rows = (0 until rules.length()).map { rules.getJSONObject(it) }
         val russianDirect = rows.indexOfFirst { it.optString("outbound") == "direct" && it.toString().contains("koronapay.com") }
         assertTrue(russianDirect >= 0)
-        val russianRule = rows[russianDirect].getJSONArray("rules").getJSONObject(1)
+        val russianRule = rows[russianDirect]
         val dns = config.getJSONObject("dns")
         assertEquals("noki-node-dns", dns.getString("final"))
         assertTrue(dns.getJSONArray("rules").objects().any { it.optString("action") == "evaluate" && it.toString().contains("koronapay.com") })
@@ -691,19 +714,16 @@ class SingBoxConfigTest {
         checkWithCore(config)
     }
 
-    @Test fun `editing or deleting Russian traffic rule removes its DNS exceptions`() {
+    @Test fun `old editable Russian rule cannot override the shared release policy`() {
         val endpoint = candidate()
-        val throughVpn = SingBoxConfig.generate(session(endpoint), endpoint, 20909, SECRET,
+        val config = SingBoxConfig.generate(session(endpoint), endpoint, 20909, SECRET,
             routingRules = listOf(DesktopRoutingRule.RUSSIAN_RESOURCES.copy(bypass = false)), dnsPolicy = { unitDnsPolicy })
-        val rules = throughVpn.getJSONObject("route").getJSONArray("rules")
-        val russian = (0 until rules.length()).map { rules.getJSONObject(it) }.single { it.optString("action") == "route" && it.toString().contains("koronapay.com") }
-        assertEquals("proxy", russian.getString("outbound"))
-        assertEquals(1, throughVpn.getJSONObject("dns").getJSONArray("rules").length())
-        checkWithCore(throughVpn)
-        val deleted = generate(session(endpoint), endpoint)
-        assertFalse(deleted.toString().contains("koronapay.com"))
-        assertEquals(2, deleted.getJSONObject("dns").getJSONArray("rules").length())
-        checkWithCore(deleted)
+        val rules = config.getJSONObject("route").getJSONArray("rules").objects()
+        assertTrue(rules.any { it.optString("outbound") == "direct" && it.toString().contains("koronapay.com") })
+        val networks = SingBoxConfig.bundledGeodata().russianIp
+        assertTrue(rules.any { it.optString("outbound") == "direct" && it.optJSONArray("ip_cidr")?.length() == networks.size })
+        assertTrue(config.getJSONObject("dns").getJSONArray("rules").objects().any { it.optString("action") == "evaluate" && it.toString().contains("koronapay.com") })
+        checkWithCore(config)
     }
 
     @Test fun `RU WireGuard uses native endpoint and the supplied DNS through the tunnel`() {
@@ -724,11 +744,29 @@ class SingBoxConfigTest {
         assertTrue(config.getJSONObject("dns").getJSONArray("rules").length() > 1)
         checkWithCore(config)
         val hops = MultiHopSettings(true, HopSelection(ServerSelectionMode.SERVER, nodeId = ENTRY), HopSelection(ServerSelectionMode.SERVER, nodeId = EXIT))
-        val multi = SingBoxConfig.generateWireGuard(BackendRuWireGuardSession.Ready(identity.copy(entryNodeId = ENTRY), wireguard), ByteArray(32) { (it + 2).toByte() },
+        rejected { SingBoxConfig.generateWireGuard(BackendRuWireGuardSession.Ready(identity.copy(entryNodeId = ENTRY), wireguard), ByteArray(32) { (it + 2).toByte() },
             20909, SECRET, 20808, "https://api.noki.example", DesktopState().settings.copy(advancedSettings = AdvancedSettings(ruRelayEnabled = true, multiHop = hops)),
-            routingRules = listOf(DesktopRoutingRule.RUSSIAN_RESOURCES), dnsPolicy = { unitDnsPolicy })
-        assertEquals(endpoint.toString(), multi.getJSONArray("endpoints").getJSONObject(0).toString())
-        checkWithCore(multi)
+            routingRules = listOf(DesktopRoutingRule.RUSSIAN_RESOURCES), dnsPolicy = { unitDnsPolicy }) }
+    }
+
+    @Test fun `RU entry rejects the enrolled control gateway before sniffing`() {
+        val wireguard = BackendRuWireGuardConfig("203.0.113.25:51820",
+            java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 1).toByte() }),
+            "10.240.7.2/32", listOf("10.240.7.1"), 1400, listOf("0.0.0.0/0"))
+        val credential = RuEntryCredential("relay", wireguard, "10.240.7.1", Long.MAX_VALUE)
+        val settings = DesktopState().settings.copy(advancedSettings = AdvancedSettings(ruRelayEnabled = true))
+        val config = SingBoxConfig.generateRuEntry(credential, ByteArray(32) { (it + 2).toByte() }, 20909, SECRET,
+            20808, "https://api.noki.example", settings, SingBoxConfig.bundledGeodata(), emptyList(), unitDnsPolicy)
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        assertEquals("resolve", rules.getJSONObject(1).getString("action"))
+        assertEquals("probe", rules.getJSONObject(1).getString("inbound"))
+        assertEquals(62101, rules.getJSONObject(1).getInt("port"))
+        assertEquals("reject", rules.getJSONObject(2).getString("action"))
+        assertEquals("10.240.7.1/32", rules.getJSONObject(2).getJSONArray("ip_cidr").getString(0))
+        assertEquals(62101, rules.getJSONObject(2).getInt("port"))
+        assertEquals("sniff", rules.getJSONObject(3).getString("action"))
+        assertEquals("reject", rules.getJSONObject(4).getString("action"))
+        checkWithCore(config)
     }
     @Test fun `only selected apps cannot redirect the protected probe inbound`() {
         val candidate = candidate()
@@ -863,9 +901,9 @@ class SingBoxConfigTest {
         assertEquals("198.18.0.1", remote.getString("server"))
         val bootstrap = dns.getJSONArray("servers").getJSONObject(1)
         assertEquals("local", bootstrap.getString("type"))
-        assertEquals(2, dns.getJSONArray("rules").length())
+        assertTrue(dns.getJSONArray("rules").objects().any { it.optString("action") == "evaluate" && it.toString().contains("koronapay.com") })
         assertEquals("api.noki.example", dns.getJSONArray("rules").getJSONObject(0).getJSONArray("domain").getString(0))
-        val protectedIpv6 = dns.getJSONArray("rules").getJSONObject(1)
+        val protectedIpv6 = dns.getJSONArray("rules").objects().last()
         assertEquals("AAAA", protectedIpv6.getString("query_type"))
         assertEquals("predefined", protectedIpv6.getString("action"))
         assertEquals("NOERROR", protectedIpv6.getString("rcode"))

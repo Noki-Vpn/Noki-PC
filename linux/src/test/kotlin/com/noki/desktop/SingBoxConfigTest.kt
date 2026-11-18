@@ -266,6 +266,31 @@ class SingBoxConfigTest {
         assertFalse(SingBoxConfig.dnsSettingsMatch(protected) { policy })
     }
 
+    @Test fun `public Google and Cloudflare HTTPS resolvers cannot bypass Noki DNS`() {
+        val endpoint = candidate()
+        val config = SingBoxConfig.generate(session(endpoint), endpoint, 20909, SECRET, dnsPolicy = { unitDnsPolicy })
+        val route = config.getJSONObject("route").getJSONArray("rules")
+        val rules = route.objects()
+        val block = rules.single { it.optString("action") == "reject" && it.toString().contains("dns.google") }
+        assertTrue(rules.indexOf(block) > rules.indexOfFirst { it.optString("action") == "hijack-dns" })
+        assertTrue(rules.indexOf(block) < rules.indexOfFirst { it.optString("outbound") == "direct" })
+        val checks = block.getJSONArray("rules")
+        assertEquals(listOf(443), checks.getJSONObject(0).getJSONArray("port").toList())
+        assertEquals(setOf("tcp", "udp"), checks.getJSONObject(0).getJSONArray("network").toList().toSet())
+        val destinations = checks.getJSONObject(1).getJSONArray("rules")
+        assertEquals(listOf("dns.google"), destinations.getJSONObject(0).getJSONArray("domain").toList())
+        assertEquals(setOf("8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844",
+            "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"),
+            destinations.getJSONObject(2).getJSONArray("ip_cidr").toList().toSet())
+        val dns = config.getJSONObject("dns")
+        val resolver = dns.getJSONArray("servers").objects().single { it.optString("tag") == dns.getString("final") }
+        assertEquals("proxy", resolver.getString("detour"))
+        assertEquals(53, resolver.getInt("server_port"))
+        checkWithCore(config)
+        route.remove(rules.indexOf(block))
+        assertFalse(SingBoxConfig.dnsSettingsMatch(config) { unitDnsPolicy })
+    }
+
     @Test fun `NokiNV balanced and gaming keep credentials and Windows DNS policy on one TUN`() {
         val endpoint = nokiNv().copy(connectIp = "203.0.113.10")
         for (gaming in listOf(false, true)) {
@@ -608,7 +633,8 @@ class SingBoxConfigTest {
         val config = SingBoxConfig.generate(session(endpoint), endpoint, 20909, SECRET, settings = settings, routingRules = listOf(rule), dnsPolicy = { unitDnsPolicy })
         val rules = config.getJSONObject("route").getJSONArray("rules")
         val scoped = (0 until rules.length()).map { rules.getJSONObject(it) }.first {
-            it.optString("mode") == "and" && it.optJSONArray("rules")?.optJSONObject(1)?.optString("mode") == "or"
+            it.optString("outbound") == "direct" && it.optString("mode") == "and" &&
+                it.optJSONArray("rules")?.optJSONObject(1)?.optString("mode") == "or"
         }
         assertEquals("direct", scoped.getString("outbound"))
         assertEquals("tun", scoped.getJSONArray("rules").getJSONObject(0).getString("inbound"))

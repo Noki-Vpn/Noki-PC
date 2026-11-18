@@ -199,27 +199,46 @@ class DesktopConnectionTest {
         }
     }
 
-    @Test fun `RU physical refresh measures the selected foreign node and keeps YouTube independent`() = runBlocking {
+    @Test fun `RU refresh measures the selected active relay route and keeps YouTube independent`() = runBlocking {
         Fixture().use { f ->
             f.ready(); f.app.setWindowVisible(false)
             f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true, errorLogsEnabled = true)) }.join()
             f.connect(); f.enableYoutube(); f.awaitYoutubeReady()
             val starts = f.runtime.starts.size
             val grants = f.youtubeCreateCalls.get()
+            val routes = f.runtime.routeSelections.toList()
             f.probedHosts.clear()
-            f.probeLatencies["9.9.9.9"] = 31
             f.app.refreshServerLatencies(selectedNodeOnly = true)
-            assertEquals(31L, f.app.state.value.latencyMs)
-            assertEquals(31, f.app.state.value.connectionLocations.single().latencyMs)
-            assertEquals(setOf("9.9.9.9"), f.probedHosts.toSet())
-            f.ruForeignProbeAvailable = false
-            f.probedHosts.clear()
+            assertEquals(30L, f.app.state.value.latencyMs)
+            assertEquals(30, f.app.state.value.connectionLocations.single().latencyMs)
+            assertTrue(f.probedHosts.isEmpty())
+            f.runtime.failProbes.set(1)
             f.app.refreshServerLatencies(selectedNodeOnly = true)
             assertNull(f.app.state.value.latencyMs)
             assertTrue(f.probedHosts.isEmpty())
             assertEquals(starts, f.runtime.starts.size)
             assertEquals(grants, f.youtubeCreateCalls.get())
+            assertEquals(routes, f.runtime.routeSelections.toList())
             assertTrue(f.app.state.value.verified)
+        }
+    }
+
+    @Test fun `RU catalog pings the exit scoped forwarder and never the foreign address`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.ruLegacyProbeAvailable = true
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            f.app.refresh().await()
+            f.probedHosts.clear()
+            f.probeLatencies["8.8.8.8"] = 48
+            assertTrue(f.app.refreshServerLatencies())
+            assertEquals(48, f.app.state.value.connectionLocations.single().latencyMs)
+            assertEquals(setOf("8.8.8.8"), f.probedHosts.toSet())
+            f.ruLegacyProbeAvailable = false
+            f.probedHosts.clear()
+            assertTrue(f.app.refreshServerLatencies())
+            assertNull(f.app.state.value.connectionLocations.single().latencyMs)
+            assertTrue(f.probedHosts.isEmpty())
         }
     }
 
@@ -271,6 +290,21 @@ class DesktopConnectionTest {
             if (status == 503) assertEquals(listOf(f.foreignId), f.runtime.routeSelections.toList())
             else assertTrue(f.runtime.routeSelections.isEmpty())
             assertEquals(f.foreignId, f.app.state.value.settings.userProfile.selectedNodeId)
+        }
+    }
+
+    @Test fun `one eligible RU relay connects without an ingress or exit latency probe`() = runBlocking {
+        Fixture().use { f ->
+            f.ruRelayCount = 1
+            f.ready()
+            f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            f.probedHosts.clear()
+            f.connect()
+            assertTrue(f.app.state.value.message, f.app.state.value.verified)
+            assertEquals(f.relayIds.first(), f.ruEntryRequests.single().getString("relay_node_id"))
+            assertEquals(listOf(f.foreignId), f.runtime.routeSelections.toList())
+            assertFalse(f.probedHosts.any { it == "8.8.8.8" || it == "9.9.9.9" })
         }
     }
 
@@ -1340,19 +1374,21 @@ class DesktopConnectionTest {
             val nodes = f.bootstrap.getJSONArray("locations").getJSONObject(0).getJSONArray("servers")
             nodes.getJSONObject(0).put("probe_host", "slow.invalid")
             nodes.getJSONObject(1).put("probe_host", "fast.invalid")
+            assertTrue(f.app.refresh().await())
             f.probeLatencies["slow.invalid"] = 90; f.probeLatencies["fast.invalid"] = 20
             val before = f.tcpCalls.get()
             val catalogs = f.locationsCalls.get()
             withContext(Dispatchers.Main) { assertTrue(f.app.refreshServerLatencies()) }
             val measured = f.app.state.value
-            assertEquals(catalogs + 1, f.locationsCalls.get())
+            assertEquals(catalogs, f.locationsCalls.get())
             assertEquals(before + 6, f.tcpCalls.get())
             assertEquals(20, measured.locations.single().latencyMs)
             assertEquals(listOf(90, 20), measured.servers.map { it.latencyMs })
             assertTrue(measured.running)
             assertEquals("Completed or hidden sampling must retain its results", listOf(90, 20), f.app.state.value.servers.map { it.latencyMs })
-            assertTrue(f.app.refreshServerLatencies())
+            assertTrue(f.app.refreshServerLatencies(refreshCatalog = true))
             assertEquals("Reopening must take fresh samples", before + 12, f.tcpCalls.get())
+            assertEquals(catalogs + 1, f.locationsCalls.get())
             assertEquals(active, f.runtime.active)
             assertEquals(starts, f.runtime.starts.size)
         }
@@ -2333,7 +2369,8 @@ class DesktopConnectionTest {
         val ruReleaseCoreStopped = CopyOnWriteArrayList<Boolean>()
         val ruReleaseActivePids = CopyOnWriteArrayList<Int?>()
         val ruEnrollStatus = java.util.concurrent.ConcurrentHashMap<String, Int>()
-        @Volatile var ruForeignProbeAvailable = true
+        @Volatile var ruLegacyProbeAvailable = false
+        @Volatile var ruRelayCount = 2
         @Volatile var ruEndpoint = "8.8.4.4:51820"
         @Volatile var ruEndpointConfirmed = true
         val relayIds = listOf("33333333-3333-4333-8333-333333333331", "33333333-3333-4333-8333-333333333332")
@@ -2449,13 +2486,19 @@ class DesktopConnectionTest {
                 }
                 "/v1/vpn/ru-relays" -> {
                     ruCatalogCalls.incrementAndGet()
-                    JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL).put("exit_node_id", JSONObject.NULL)
+                    val exit = request.url.queryParameter("exit_node_id")
+                    val legacyProbe = ruLegacyProbeAvailable && exit != null
+                    JSONObject().put("route_version", 1).put("entry_node_id", JSONObject.NULL).put("exit_node_id", exit ?: JSONObject.NULL)
                         .put("foreign_nodes", JSONArray().put(JSONObject().put("id", foreignId).put("name", "DE exit").put("country_code", "DE")
-                            .put("probe_host", if (ruForeignProbeAvailable) "9.9.9.9" else JSONObject.NULL).put("probe_port", if (ruForeignProbeAvailable) 443 else JSONObject.NULL)
+                            .put("probe_host", "9.9.9.9").put("probe_port", 443)
                             .put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString())))
-                        .put("relays", JSONArray(relayIds.mapIndexed { index, id -> JSONObject().put("id", id).put("name", "RU $index")
+                        .put("relays", JSONArray((when {
+                            legacyProbe -> relayIds.take(1)
+                            ruLegacyProbeAvailable -> emptyList()
+                            else -> relayIds.take(ruRelayCount)
+                        }).mapIndexed { index, id -> JSONObject().put("id", id).put("name", "RU $index")
                             .put("country_code", "RU").put("available", true).put("pair_ready", true)
-                            .put("probe_host", if (index == 0) "8.8.8.8" else "1.1.1.1").put("probe_port", 443)
+                            .put("probe_host", if (index == 0) "8.8.8.8" else "1.1.1.1").put("probe_port", if (legacyProbe) 19500 else 443)
                             .put("wireguard_endpoint", if (ruEndpointConfirmed) ruEndpoint else JSONObject.NULL)
                             .put("selection_weight", 100).put("metrics_at", java.time.Instant.now().toString()) }))
                 }

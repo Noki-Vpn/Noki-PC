@@ -132,10 +132,7 @@ object VpnConfigFactory {
             .put(JSONObject().put("port", JSONArray().put(53)).put("action", "hijack-dns"))
             .put(JSONObject().put("port", JSONArray().put(853)).put("network", JSONArray().put("tcp").put("udp"))
                 .put("action", "reject"))
-            .put(JSONObject().put("type", "logical").put("mode", "and").put("rules", JSONArray()
-                .put(JSONObject().put("domain_suffix", JSONArray().put("cloudflare-dns.com").put("one.one.one.one")))
-                .put(JSONObject().put("port", JSONArray().put(443)))
-                .put(JSONObject().put("network", JSONArray().put("tcp")))).put("action", "reject"))
+            .put(publicDnsHttpsRejectRule())
             .put(route(JSONObject().put("domain_suffix", JSONArray().put("googleapis.cn")), "direct"))
         domainMatch(defaultDirect, resolved)?.let { rules.put(route(it, "direct")) }
         if (russianIp.isNotEmpty()) rules.put(route(JSONObject().put("ip_cidr", JSONArray(russianIp)), "direct"))
@@ -168,6 +165,20 @@ object VpnConfigFactory {
                 }))
             .put("route", JSONObject().put("rules", rules).put("final", "proxy").put("auto_detect_interface", true)
                 .put("default_domain_resolver", resolver(DNS_TAG)))
+    }
+
+    internal fun publicDnsHttpsRejectRule(): JSONObject {
+        val resolverAddresses = listOf(
+            "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844",
+            "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001",
+        )
+        val endpoints = JSONObject().put("type", "logical").put("mode", "or").put("rules", JSONArray()
+            .put(JSONObject().put("domain", JSONArray().put("dns.google")))
+            .put(JSONObject().put("domain_suffix", JSONArray().put("cloudflare-dns.com").put("one.one.one.one")))
+            .put(JSONObject().put("ip_cidr", JSONArray(resolverAddresses))))
+        val https = JSONObject().put("port", JSONArray().put(443)).put("network", JSONArray().put("tcp").put("udp"))
+        return JSONObject().put("type", "logical").put("mode", "and")
+            .put("rules", JSONArray().put(https).put(endpoints)).put("action", "reject")
     }
 
     private fun route(match: JSONObject, outbound: String): JSONObject = match.put("action", "route").put("outbound", outbound)

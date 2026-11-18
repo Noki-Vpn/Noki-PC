@@ -305,7 +305,7 @@ internal enum class DesktopPage { HOME, PROFILE, SETTINGS, SERVERS, DEVICES, EXT
                                         Box(Modifier.weight(1f)) {
                                             PcPageHeading(tr(state, "Локации", "Locations")) { navigate(DesktopPage.HOME) }
                                         }
-                                        ServerRefreshButton(state, earthVisible, reducedMotion || state.reducedMotion) { app.refreshServerLatencies() }
+                                        ServerRefreshButton(state, earthVisible, reducedMotion || state.reducedMotion) { app.refreshServerLatencies(refreshCatalog = true) }
                                     }
                                     CountryCatalog(state, Modifier.weight(1f).fillMaxWidth(),
                                         HopSelection(state.settings.userProfile.serverSelectionMode, state.settings.userProfile.selectedCountryCode, state.selectedServerId),
@@ -1872,36 +1872,16 @@ internal fun desktopProtocolLabel(state: DesktopState): String {
             val selectedCountry = selection.kind == ServerSelectionMode.COUNTRY && selection.countryCode == country.countryCode ||
                 selection.kind == ServerSelectionMode.SERVER && country.servers.any { it.id == selection.nodeId }
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(Modifier.fillMaxWidth().height(48.dp)
-                    .pcCard(if (selectedCountry) accent.copy(alpha = .1f) else DesktopUiKit.Surface, DesktopUiKit.MenuShape)
-                    .border(.5.dp, if (selectedCountry) accent.copy(alpha = .3f) else Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape)
-                    .pcClickable(enabled = country.isOnline && !state.loading, shape = DesktopUiKit.MenuShape) {
-                        onSelect(HopSelection(ServerSelectionMode.COUNTRY, countryCode = country.countryCode))
-                    },
-                    verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(Modifier.width(12.dp))
-                    CountryFlagMarker(country, 1f, 28f)
-                    Spacer(Modifier.width(20.dp))
-                    PcText(country.country, Modifier.weight(1f), size = 14, color = if (country.isOnline) DesktopUiKit.Text else DesktopUiKit.Muted, maxLines = 1)
-                    PcText("${country.latencyMs ?: "--"} " + tr(state, "мс", "ms"), size = 12, color = DesktopUiKit.Muted, maxLines = 1)
-                    Box(Modifier.width(44.dp).fillMaxHeight().clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null,
-                        role = Role.Button, onClick = { expandedCountry = if (expanded) null else country.code })
-                        .semantics { stateDescription = tr(state, if (expanded) "Развернуто" else "Свернуто", if (expanded) "Expanded" else "Collapsed") }, contentAlignment = Alignment.Center) {
-                        PcIcon("chevron", tr(state, if (expanded) "Свернуть серверы" else "Раскрыть серверы", if (expanded) "Collapse servers" else "Expand servers"),
-                            Modifier.size(11.dp, 8.dp).graphicsLayer { rotationZ = if (expanded) 180f else 0f })
-                    }
+                CountryTile(state, country, expanded, selectedCountry, country.isOnline && !state.loading,
+                    onExpand = { expandedCountry = if (expanded) null else country.code }) {
+                    onSelect(HopSelection(ServerSelectionMode.COUNTRY, countryCode = country.countryCode))
                 }
                 AnimatedVisibility(expanded) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         for (server in country.servers) {
                             val selected = selection.kind == ServerSelectionMode.SERVER && server.id == selection.nodeId
-                            Row(Modifier.fillMaxWidth().heightIn(min = 40.dp).pcCard(if (selected) accent.copy(alpha = .2f) else DesktopUiKit.Surface, DesktopUiKit.MenuShape)
-                                .then(if (selected) Modifier.border(.5.dp, accent.copy(alpha = .3f), DesktopUiKit.MenuShape) else Modifier)
-                                .pcClickable(enabled = server.isOnline && !state.loading, shape = DesktopUiKit.MenuShape, onClick = { onSelect(HopSelection(ServerSelectionMode.SERVER, nodeId = server.id)) })
-                                .padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                PcText(server.name, Modifier.weight(1f), size = 12, color = if (server.isOnline) DesktopUiKit.Text else DesktopUiKit.Muted, maxLines = 1)
-                                PcText(if (server.isOnline) "${server.latencyMs ?: "--"} " + tr(state, "мс", "ms") else tr(state, "Не доступен", "Offline"),
-                                    size = 12, color = if (selected) accent else DesktopUiKit.Muted)
+                            ServerTile(state, server, selected, server.isOnline && !state.loading) {
+                                onSelect(HopSelection(ServerSelectionMode.SERVER, nodeId = server.id))
                             }
                         }
                     }
@@ -1911,26 +1891,90 @@ internal fun desktopProtocolLabel(state: DesktopState): String {
     }
 }
 
+private val CountryChevronWidth = 44.dp
+
+@Composable private fun CountryTile(state: DesktopState, country: ServerLocation, expanded: Boolean,
+    selected: Boolean = false, enabled: Boolean = true, included: Boolean? = null, onExpand: () -> Unit, onClick: () -> Unit) {
+    val accent = LocalDesktopStyle.current.accent
+    Row(Modifier.fillMaxWidth().height(48.dp)
+        .pcCard(if (selected) accent.copy(alpha = .1f) else DesktopUiKit.Surface, DesktopUiKit.MenuShape)
+        .border(.5.dp, if (selected) accent.copy(alpha = .3f) else Color.White.copy(alpha = .08f), DesktopUiKit.MenuShape)
+        .pcClickable(enabled = enabled, role = if (included == null) Role.Button else Role.Switch,
+            shape = DesktopUiKit.MenuShape, onClick = onClick).inclusionSemantics(included),
+        verticalAlignment = Alignment.CenterVertically) {
+        Spacer(Modifier.width(12.dp))
+        CountryFlagMarker(country, 1f, 28f)
+        Spacer(Modifier.width(20.dp))
+        PcText(country.country, Modifier.weight(1f), size = 14, color = if (country.isOnline) DesktopUiKit.Text else DesktopUiKit.Muted, maxLines = 1)
+        PcText("${country.latencyMs ?: "--"} " + tr(state, "мс", "ms"), size = 12, color = DesktopUiKit.Muted, maxLines = 1)
+        if (included != null) {
+            Spacer(Modifier.width(12.dp))
+            PcSwitchIndicator(included)
+        }
+        Box(Modifier.width(CountryChevronWidth).fillMaxHeight().clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+            indication = null, role = Role.Button, onClick = onExpand)
+            .semantics { stateDescription = tr(state, if (expanded) "Развернуто" else "Свернуто", if (expanded) "Expanded" else "Collapsed") },
+            contentAlignment = Alignment.Center) {
+            PcIcon("chevron", tr(state, if (expanded) "Свернуть серверы" else "Раскрыть серверы", if (expanded) "Collapse servers" else "Expand servers"),
+                Modifier.size(11.dp, 8.dp).graphicsLayer { rotationZ = if (expanded) 180f else 0f })
+        }
+    }
+}
+
+@Composable private fun ServerTile(state: DesktopState, server: VpnServer, selected: Boolean = false,
+    enabled: Boolean = true, included: Boolean? = null, onClick: () -> Unit) {
+    val accent = LocalDesktopStyle.current.accent
+    Row(Modifier.fillMaxWidth().heightIn(min = 40.dp)
+        .pcCard(if (selected) accent.copy(alpha = .2f) else DesktopUiKit.Surface, DesktopUiKit.MenuShape)
+        .then(if (selected) Modifier.border(.5.dp, accent.copy(alpha = .3f), DesktopUiKit.MenuShape) else Modifier)
+        .pcClickable(enabled = enabled, role = if (included == null) Role.Button else Role.Switch,
+            shape = DesktopUiKit.MenuShape, onClick = onClick).inclusionSemantics(included)
+        .padding(start = 20.dp, end = if (included == null) 20.dp else CountryChevronWidth, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        PcText(server.name, Modifier.weight(1f), size = 12, color = if (server.isOnline) DesktopUiKit.Text else DesktopUiKit.Muted, maxLines = 1)
+        PcText(if (server.isOnline) "${server.latencyMs ?: "--"} " + tr(state, "мс", "ms") else tr(state, "Не доступен", "Offline"),
+            size = 12, color = if (selected) accent else DesktopUiKit.Muted)
+        if (included != null) {
+            Spacer(Modifier.width(12.dp))
+            PcSwitchIndicator(included)
+        }
+    }
+}
+
+private fun Modifier.inclusionSemantics(included: Boolean?): Modifier = if (included == null) this else semantics {
+    toggleableState = ToggleableState(included)
+}
+
 @Composable private fun AutoSelectionDialog(state: DesktopState, app: DesktopController, dismiss: () -> Unit) {
     val profile = state.settings.userProfile
     var countries by remember { mutableStateOf(profile.autoExcludedCountryCodes) }
     var nodes by remember { mutableStateOf(profile.autoExcludedNodeIds) }
+    var expandedCountries by remember { mutableStateOf(emptySet<String>()) }
     val catalog = state.connectionLocations
     PcDialog(tr(state, "Настроить автовыбор", "Configure automatic selection"), dismiss,
         tr(state, "Сохранить", "Save"), onConfirm = {
             app.updateSettings { it.copy(userProfile = it.userProfile.copy(autoExcludedCountryCodes = countries, autoExcludedNodeIds = nodes)) }
             dismiss()
         }, spacing = 10.dp) {
-        PcText(tr(state, "Исключения действуют только для «Автовыбор». Ручной выбор и YouTube не меняются.",
-            "Exclusions apply only to Automatic. Manual selection and YouTube are unchanged."), size = 12, color = DesktopUiKit.Muted)
         PcButton(tr(state, "Вернуть все", "Restore all"), Modifier.fillMaxWidth(), compact = true, onClick = { countries = emptySet(); nodes = emptySet() })
         for (country in catalog) {
-            PcToggle(country.country, country.countryCode !in countries) { included ->
-                countries = if (included) countries - country.countryCode else countries + country.countryCode
-            }
-            for (server in country.servers) Box(Modifier.padding(start = 16.dp)) {
-                PcToggle(server.name, server.id !in nodes, enabled = country.countryCode !in countries) { included ->
-                    nodes = if (included) nodes - server.id else nodes + server.id
+            val expanded = country.code in expandedCountries
+            val included = country.countryCode !in countries
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                CountryTile(state, country, expanded, included = included, onExpand = {
+                    expandedCountries = if (expanded) expandedCountries - country.code else expandedCountries + country.code
+                }) {
+                    countries = if (included) countries + country.countryCode else countries - country.countryCode
+                }
+                AnimatedVisibility(expanded) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        for (server in country.servers) {
+                            val nodeIncluded = server.id !in nodes
+                            ServerTile(state, server, enabled = included, included = nodeIncluded) {
+                                nodes = if (nodeIncluded) nodes + server.id else nodes - server.id
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -331,7 +331,6 @@ internal fun Modifier.pcConnectionShadow(): Modifier = drawWithCache {
 
 @Composable internal fun PcToggle(label: String, value: Boolean, enabled: Boolean = true, detail: String? = null,
     help: String? = null, onChange: (Boolean) -> Unit) {
-    val style = LocalDesktopStyle.current
     val russian = LocalDesktopLanguage.current == AppLanguage.RU
     Row(Modifier.fillMaxWidth().heightIn(min = if (detail == null) 64.dp else 76.dp).pcCard(shape = DesktopUiKit.MenuShape)
         .pcClickable(enabled = enabled, role = Role.Switch, shape = DesktopUiKit.MenuShape, onClick = { onChange(!value) })
@@ -346,10 +345,15 @@ internal fun Modifier.pcConnectionShadow(): Modifier = drawWithCache {
             detail?.let { PcText(it, size = 12, lineHeight = 16, color = Color(0xFFB9B9B9)) }
         }
         Spacer(Modifier.width(16.dp))
-        Box(Modifier.size(34.dp, 20.dp).background(if (value) style.selected else DesktopUiKit.Muted, CircleShape)) {
-            Box(Modifier.align(if (value) Alignment.CenterEnd else Alignment.CenterStart)
-                .padding(horizontal = 3.dp).size(14.dp).background(DesktopUiKit.Text, CircleShape))
-        }
+        PcSwitchIndicator(value)
+    }
+}
+
+@Composable internal fun PcSwitchIndicator(value: Boolean) {
+    val style = LocalDesktopStyle.current
+    Box(Modifier.size(34.dp, 20.dp).background(if (value) style.selected else DesktopUiKit.Muted, CircleShape)) {
+        Box(Modifier.align(if (value) Alignment.CenterEnd else Alignment.CenterStart)
+            .padding(horizontal = 3.dp).size(14.dp).background(DesktopUiKit.Text, CircleShape))
     }
 }
 

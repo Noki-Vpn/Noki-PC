@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import org.json.JSONArray
 import java.nio.file.Files
@@ -2243,20 +2244,19 @@ class DesktopController internal constructor(
         try {
             val network = networkSnapshot()
             val inventory = authorized { api.ruRelayCatalog(it, device.id, vault.deviceKey) }
-            val permittedExits = ruExits(requestedSettings, inventory.foreignNodes)
+            val previousLatencies = state.value.ruForeignNodes.associate { it.id to it.latencyMs }
+            val foreign = inventory.foreignNodes.map { it.copy(latencyMs = previousLatencies[it.id]) }
+            val exits = ruExits(requestedSettings, foreign)
                 .filter { it.id !in excludedNodeIds && (onlyNodeId == null || it.id == onlyNodeId) }
-            check(permittedExits.isNotEmpty()) { unavailableSelection(requestedSettings) }
+            check(exits.isNotEmpty()) { unavailableSelection(requestedSettings) }
             val ingress = inventory.relays.filter { it.available && it.pairReady }.map { relay ->
                 VpnServer(relay.id, relay.name, "RU", "RU", relay.probeHost.orEmpty(), relay.probePort, true,
                     weight = relay.weight, metricsAt = relay.metricsAt, probeHost = relay.probeHost, probeIp = relay.probeIp)
             }
             check(ingress.isNotEmpty()) { "ru_relay_pair_unavailable" }
-            val targets = ingress + if (requestedSettings.userProfile.serverSelectionMode == ServerSelectionMode.SERVER)
-                emptyList() else ruServers(permittedExits)
-            val measured = measureSelectionNodes(targets, network).associateBy { it.id }
-            val exits = ruExits(requestedSettings, permittedExits.map { it.copy(latencyMs = measured[it.id]?.latencyMs) })
-            val relays = EndpointRankingPolicy.rankServers(ingress.map { measured[it.id] ?: it }, UserProfile(serverSelectionMode = ServerSelectionMode.AUTO))
-            mutable.update { it.copy(ruForeignNodes = inventory.foreignNodes.map { node -> node.copy(latencyMs = measured[node.id]?.latencyMs) }) }
+            val measuredIngress = if (ingress.size > 1) measureSelectionNodes(ingress, network) else ingress
+            val relays = EndpointRankingPolicy.rankServers(measuredIngress, UserProfile(serverSelectionMode = ServerSelectionMode.AUTO))
+            mutable.update { it.copy(ruForeignNodes = foreign) }
             val cachedCredential = vault.readEncrypted("ru-entry.dpapi")?.let(::JSONObject)?.takeIf {
                 it.optString("device_id") == device.id && it.optString("public_key") == keys.second
             }?.let { RuWireGuardSessionJsonParser.parseEntryCredential(it) }
@@ -2621,11 +2621,12 @@ class DesktopController internal constructor(
             "Для автовыбора не осталось серверов. Верните хотя бы один сервер и его страну в настройках автовыбора."
         else "Нет доступных серверов для выбранного маршрута"
 
-    suspend fun refreshServerLatencies(selectedNodeOnly: Boolean = false) = withContext(Dispatchers.IO) {
+    suspend fun refreshServerLatencies(selectedNodeOnly: Boolean = false, refreshCatalog: Boolean = false) = withContext(Dispatchers.IO) {
         latencyJob?.cancelAndJoin()
-        val job = refreshClientLatencies(force = true, selectedNodeOnly = selectedNodeOnly)
-        job?.join()
-        job != null && !job.isCancelled
+        val job = refreshClientLatencies(force = true, selectedNodeOnly = selectedNodeOnly, refreshCatalog = refreshCatalog)
+            ?: return@withContext false
+        job.join()
+        !job.isCancelled && job.await()
     }
 
     private suspend fun measureSelectionNodes(nodes: List<VpnServer>, network: WindowsNetworkSnapshot): List<VpnServer> {
@@ -2636,7 +2637,51 @@ class DesktopController internal constructor(
         return nodes.map { node -> node.copy(latencyMs = ServerLocationMapper.latencyTargetKey(node)?.let(samples::get)) }
     }
 
-    @Synchronized private fun refreshClientLatencies(force: Boolean = false, selectedNodeOnly: Boolean = false): Job? {
+    private suspend fun measureRelayedLatencies(targets: List<ServerLocation>, inventory: RuRelayCatalog?,
+        network: WindowsNetworkSnapshot): Map<String, Int> = coroutineScope {
+        val servers = targets.flatMap { it.servers }.filter { it.isOnline }.distinctBy { it.id }
+        val current = state.value
+        val active = if (current.hasEstablishedTunnel && current.displayedSettings.advancedSettings.ruRelayEnabled)
+            runtime.restored() else null
+        val activeTarget = servers.firstOrNull { it.id == active?.serverId }?.let(ServerLocationMapper::latencyTargetKey)
+        val activeSample = async {
+            if (active == null || activeTarget == null) return@async emptyMap()
+            try {
+                val latency = runtime.probe(active, fastStartup = true)
+                if (runtime.restored() == active) mapOf(activeTarget to latency.toInt()) else emptyMap()
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                recordDiagnosticFailure("ru_active_latency_failed", error, "network")
+                emptyMap()
+            }
+        }
+        // A catalog with overlay entries has no per-exit TCP forwarders. Legacy catalogs expose them only per exit.
+        val legacy = if (inventory != null && inventory.relays.isEmpty()) {
+            val slots = kotlinx.coroutines.sync.Semaphore(4)
+            val relayTargets = withTimeoutOrNull(2_000) {
+                servers.mapNotNull { server ->
+                    val key = ServerLocationMapper.latencyTargetKey(server)?.takeUnless { it == activeTarget } ?: return@mapNotNull null
+                    async {
+                        val relays = slots.withPermit {
+                            try { authorized { api.ruRelayCatalog(it, vault.deviceId, vault.deviceKey, server.id) }.relays }
+                            catch (cancelled: CancellationException) { throw cancelled }
+                            catch (error: BackendException) { if (error.statusCode == 404) emptyList() else throw error }
+                        }
+                        key to relays.filter { it.available && it.pairReady }.mapNotNull { relay ->
+                            val host = relay.probeHost ?: return@mapNotNull null
+                            val port = relay.probePort ?: return@mapNotNull null
+                            host to port
+                        }
+                    }
+                }.awaitAll().toMap()
+            }.orEmpty()
+            latencySampler(network).measure(targets, relayTargets)
+        } else emptyMap()
+        legacy + activeSample.await()
+    }
+
+    @Synchronized private fun refreshClientLatencies(force: Boolean = false, selectedNodeOnly: Boolean = false,
+        refreshCatalog: Boolean = false): Deferred<Boolean>? {
         if (latencyJob?.isActive == true) { if (!force) return null else latencyJob?.cancel() }
         if (!windowVisible && !force) return null
         if (state.value.connecting) return null
@@ -2648,13 +2693,16 @@ class DesktopController internal constructor(
         val ruRelay = ruMode(state.value)
         val locations = state.value.locationsFor(ruRelay)
         val selectedId = state.value.selectedServerId
+        val catalogMissing = locations.isEmpty() || selectedNodeOnly && locations.none { location ->
+            location.servers.any { it.id == selectedId }
+        }
         fun target(state: DesktopState) = state.locationsFor(ruMode(state)).filter { it.isOnline }.flatMap { location ->
             if (location.servers.isEmpty()) listOf(ServerLocationMapper.latencyTargetKey(location))
             else location.servers.filter { it.isOnline && (!selectedNodeOnly || it.id == state.selectedServerId) }.map { ServerLocationMapper.latencyTargetKey(it) }
         }.toSet()
         val requestedTarget = target(state.value)
         if (!network.available || (!force && locations.isEmpty())) return null
-        val job = scope.launch(start = CoroutineStart.LAZY) {
+        val job = scope.async(start = CoroutineStart.LAZY) {
             val ownJob = currentCoroutineContext()[Job]
             mutable.update { old ->
                 if (!force) old.copy(latencyRefreshing = true) else old.copy(latencyRefreshing = true,
@@ -2669,24 +2717,31 @@ class DesktopController internal constructor(
                     })
             }
             try {
-                var foreign = state.value.ruForeignNodes
+                val inventory = if (ruRelay && (!selectedNodeOnly || catalogMissing)) withTimeoutOrNull(2_000) {
+                    authorized { api.ruRelayCatalog(it, vault.deviceId, vault.deviceKey) }
+                } else null
+                val foreign = inventory?.foreignNodes ?: state.value.ruForeignNodes
                 var catalog: List<BackendLocation>? = null
-                val freshLocations = if (!force) locations else if (ruRelay) {
-                    foreign = authorized { api.ruRelayCatalog(it, vault.deviceId, vault.deviceKey) }.foreignNodes
-                    state.value.copy(ruForeignNodes = foreign).locationsFor(true)
-                } else {
-                    catalog = authorized { api.serverLocations(it, vault.deviceId, vault.deviceKey) }
-                    ServerLocationMapper.mapLocations(checkNotNull(catalog), state.value.language, emptyMap())
+                val freshLocations = when {
+                    inventory != null -> state.value.copy(ruForeignNodes = foreign).locationsFor(true)
+                    !ruRelay && (catalogMissing || refreshCatalog) -> {
+                        val fetched = withTimeoutOrNull(2_000) {
+                            authorized { api.serverLocations(it, vault.deviceId, vault.deviceKey) }
+                        } ?: return@async false
+                        catalog = fetched
+                        ServerLocationMapper.mapLocations(fetched, state.value.language, emptyMap())
+                    }
+                    else -> locations
                 }
                 val targets = if (!selectedNodeOnly) freshLocations else freshLocations.map {
                     it.copy(servers = it.servers.filter { server -> server.id == selectedId })
                 }.filter { it.servers.isNotEmpty() }
-                val samples = latencySampler(network).measure(targets)
+                val samples = if (ruRelay) measureRelayedLatencies(targets, inventory, network) else latencySampler(network).measure(targets)
                 currentCoroutineContext().ensureActive()
                 synchronized(this@DesktopController) {
                     if (latencyJob !== ownJob || !current(owner) || state.value.connecting ||
                         ruMode(state.value) != ruRelay ||
-                        networkSnapshot().signature != network.signature || target(state.value) != requestedTarget) return@launch
+                        networkSnapshot().signature != network.signature || target(state.value) != requestedTarget) return@async false
                     val serverKeys = freshLocations.flatMap { it.servers }.associate { it.id to ServerLocationMapper.latencyTargetKey(it) }
                     catalog?.let { catalogLocations = it }
                     mutable.update { old ->
@@ -2698,16 +2753,21 @@ class DesktopController internal constructor(
                                 server.latencyMs?.let { latency -> ServerLocationMapper.latencyTargetKey(server)?.let { it to latency } }
                             }.toMap() + samples
                             old.copy(
-                                locations = if (ruRelay) old.locations else freshLocations.map { ServerLocationMapper.withLatencies(it, measured) },
-                                ruForeignNodes = if (!ruRelay) old.ruForeignNodes else foreign.map { node ->
+                                locations = if (ruRelay) old.locations else (if (catalog == null) old.locations else freshLocations)
+                                    .map { ServerLocationMapper.withLatencies(it, measured) },
+                                ruForeignNodes = if (!ruRelay) old.ruForeignNodes else (inventory?.foreignNodes ?: old.ruForeignNodes).map { node ->
                                     node.copy(latencyMs = serverKeys[node.id]?.let(measured::get))
                                 })
                         }
                     }
                     latencyMeasuredAt = System.currentTimeMillis()
                 }
+                !ruRelay || !refreshCatalog || inventory != null
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { recordDiagnosticFailure("client_latency_refresh_failed", error, "network") }
+            catch (error: Exception) {
+                recordDiagnosticFailure("client_latency_refresh_failed", error, "network")
+                false
+            }
             finally {
                 synchronized(this@DesktopController) { if (latencyJob === ownJob) {
                     latencyJob = null

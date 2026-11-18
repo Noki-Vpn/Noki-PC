@@ -63,24 +63,39 @@ class DesktopUiTest {
     @Test fun autoSelectionDialogSavesExclusionsAndRestoresThemWithoutChangingManualSelection() = connectionUiFixture { app ->
         val node = VpnServer("11111111-1111-4111-8111-111111111111", "Germany 1", "DE", "de", "example.invalid", null, true)
         val country = ServerLocation("DE", "DE", "Germany", "", node.host, isOnline = true, servers = listOf(node))
+        val otherNode = node.copy(id = "22222222-2222-4222-8222-222222222222", name = "France 1", countryCode = "FR", locationCode = "fr")
+        val otherCountry = country.copy(code = "FR", countryCode = "FR", country = "France", servers = listOf(otherNode))
         runBlocking { app.updateSettings { it.copy(userProfile = it.userProfile.copy(serverSelectionMode = ServerSelectionMode.SERVER,
             selectedNodeId = node.id), advancedSettings = it.advancedSettings.copy(ruRelayEnabled = false)) }.join() }
         val scene = ImageComposeScene(1050, 674) {
             val state by app.state.collectAsState()
             DesktopWorkspace(state.copy(user = BackendUser("fixture", "Fixture", "fixture@example.invalid", null, true, false),
-                locations = listOf(country)), app, DesktopPage.SERVERS, earthVisible = false)
+                locations = listOf(country, otherCountry)), app, DesktopPage.SERVERS, earthVisible = false)
         }
         fun nodes(node: SemanticsNode): Sequence<SemanticsNode> = sequence { yield(node); node.children.forEach { yieldAll(nodes(it)) } }
-        fun text(label: String) = scene.semanticsOwners.asSequence().flatMap { nodes(it.rootSemanticsNode) }
-            .lastOrNull { it.config.getOrNull(SemanticsProperties.Text)?.any { t -> t.text == label } == true }
+        fun text(label: String, dialogOnly: Boolean = false): SemanticsNode? {
+            val owners = if (dialogOnly) sequenceOf(scene.semanticsOwners.last()) else scene.semanticsOwners.asSequence()
+            return owners.flatMap { nodes(it.rootSemanticsNode) }
+                .lastOrNull { it.config.getOrNull(SemanticsProperties.Text)?.any { t -> t.text == label } == true }
+        }
         var frame = 0L
         fun render() { repeat(4) { frame += 100_000_000L; scene.render(frame).close() } }
-        fun click(label: String, secondary: Boolean = false) {
-            val point = checkNotNull(text(label)) { label }.boundsInWindow.center
+        fun click(point: Offset, secondary: Boolean = false) {
             val button = if (secondary) PointerButton.Secondary else PointerButton.Primary
             scene.sendPointerEvent(PointerEventType.Press, point, buttons = PointerButtons(isPrimaryPressed = !secondary, isSecondaryPressed = secondary), button = button)
             scene.sendPointerEvent(PointerEventType.Release, point, buttons = PointerButtons(), button = button)
             render()
+        }
+        fun click(label: String, secondary: Boolean = false) = click(checkNotNull(text(label)) { label }.boundsInWindow.center, secondary)
+        fun toggleExpansion(country: String) {
+            val owner = scene.semanticsOwners.last()
+            val countryText = checkNotNull(text(country, dialogOnly = true))
+            val chevron = nodes(owner.rootSemanticsNode).single { candidate ->
+                val labels = candidate.config.getOrNull(SemanticsProperties.ContentDescription).orEmpty()
+                labels.any { it == "Раскрыть серверы" || it == "Свернуть серверы" } &&
+                    kotlin.math.abs(candidate.boundsInWindow.center.y - countryText.boundsInWindow.center.y) < 3f
+            }
+            click(chevron.boundsInWindow.center)
         }
         fun configure() { click("Автовыбор", true); click("Настроить"); assertNotNull(text("Настроить автовыбор")) }
         fun saved(predicate: () -> Boolean) {
@@ -90,13 +105,22 @@ class DesktopUiTest {
         }
         try {
             render(); configure()
-            click("Germany 1"); click("Germany")
+            assertNull(text("Germany 1", dialogOnly = true))
+            assertNull(text("France 1", dialogOnly = true))
+            toggleExpansion("Germany"); toggleExpansion("France")
+            assertNotNull(text("Germany 1", dialogOnly = true)); assertNotNull(text("France 1", dialogOnly = true))
+            toggleExpansion("France"); render(); render()
+            assertNull(text("France 1", dialogOnly = true)); assertNotNull(text("Germany 1", dialogOnly = true))
+            click("France"); click("Отмена")
+            assertTrue(app.state.value.settings.userProfile.autoExcludedCountryCodes.isEmpty())
+            configure(); toggleExpansion("Germany")
+            click("Germany 1"); click("Germany"); click("France")
             assertNotNull(text("Для автовыбора не осталось серверов. Верните хотя бы один сервер и его страну."))
             val output = java.nio.file.Path.of("build/screenshots/auto-selection-dialog.png")
             Files.createDirectories(output.parent)
             scene.render(frame).use { image -> image.encodeToData(EncodedImageFormat.PNG)!!.use { Files.write(output, it.bytes) } }
             click("Сохранить")
-            saved { app.state.value.settings.userProfile.autoExcludedCountryCodes == setOf("DE") &&
+            saved { app.state.value.settings.userProfile.autoExcludedCountryCodes == setOf("DE", "FR") &&
                 app.state.value.settings.userProfile.autoExcludedNodeIds == setOf(node.id) }
             assertEquals(ServerSelectionMode.SERVER, app.state.value.settings.userProfile.serverSelectionMode)
             assertEquals(node.id, app.state.value.settings.userProfile.selectedNodeId)

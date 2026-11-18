@@ -337,7 +337,11 @@ object SingBoxConfig {
     internal fun dnsSettingsMatch(config: JSONObject, dnsPolicy: () -> WindowsDnsPolicy = ::windowsDnsPolicy): Boolean {
         val tun = config.getJSONArray("inbounds").getJSONObject(0)
         if (tun.optString("dns_mode") != "hijack" || tun.has("route_exclude_address")) return false
-        if (!DesktopBuild.IS_LINUX && !config.getJSONObject("route").optBoolean("windows_ipv6_direct_only")) return false
+        val route = config.getJSONObject("route")
+        if (!DesktopBuild.IS_LINUX && !route.optBoolean("windows_ipv6_direct_only")) return false
+        val publicDnsBlock = VpnConfigFactory.publicDnsHttpsRejectRule()
+        val routeRules = route.getJSONArray("rules")
+        if ((0 until routeRules.length()).none { routeRules.getJSONObject(it).similar(publicDnsBlock) }) return false
         val dns = config.getJSONObject("dns")
         val rules = dns.getJSONArray("rules")
         val last = (rules.length() - 1 downTo 0).map(rules::getJSONObject)

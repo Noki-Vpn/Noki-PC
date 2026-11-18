@@ -1330,60 +1330,50 @@ class DesktopConnectionTest {
     }
 
     @Test fun `opening servers refreshes device TCP medians during an active connection`() = runBlocking {
-        val vault = WindowsVault(Files.createTempDirectory("noki-device-latencies"))
-        val calls = AtomicInteger()
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(baseUrl = "http://127.0.0.1:9"),
-            networkSnapshot = {
+        Fixture(nodeCount = 2, networkThreadCheck = {
                 assertFalse("Adapter discovery must not block the event-dispatch thread", javax.swing.SwingUtilities.isEventDispatchThread())
-                WindowsNetworkSnapshot("wifi", EndpointRankingPolicy.NetworkKind.WIFI, true, 1)
-            },
-            latencySampler = { ClientLatencySampler(tcpConnect = { host, _, _ ->
-                calls.incrementAndGet(); if (host == "fast.invalid") 20 else 90
-            }, icmpPing = { _, _, _ -> error("No ICMP fallback on a bound device network") }) })
-        try {
-            withTimeout(5_000) { app.state.first { !it.loading } }
-            DesktopController::class.java.getDeclaredField("tokens").apply { isAccessible = true }.set(app, BackendAuthTokens("access", null))
-            @Suppress("UNCHECKED_CAST")
-            val mutable = DesktopController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(app) as MutableStateFlow<DesktopState>
-            mutable.value = mutable.value.copy(user = BackendUser("preview", "Preview", "preview@example.invalid", null, true, false), running = true,
-                locations = listOf(ServerLocation("DE", "DE", "Germany", "", "slow.invalid", isOnline = true,
-                    servers = listOf("slow.invalid", "fast.invalid").map { VpnServer(it, it, "DE", "DE", it, 443, true) })))
-            withContext(Dispatchers.Main) { app.refreshServerLatencies() }
-            val measured = withTimeout(3_000) { app.state.first { it.locations.singleOrNull()?.latencyMs == 20 } }
-            assertEquals(6, calls.get())
+            }).use { f ->
+            f.ready(); f.app.setWindowVisible(false); f.connect()
+            assertTrue(f.app.state.value.verified)
+            val active = f.runtime.active
+            val starts = f.runtime.starts.size
+            val nodes = f.bootstrap.getJSONArray("locations").getJSONObject(0).getJSONArray("servers")
+            nodes.getJSONObject(0).put("probe_host", "slow.invalid")
+            nodes.getJSONObject(1).put("probe_host", "fast.invalid")
+            f.probeLatencies["slow.invalid"] = 90; f.probeLatencies["fast.invalid"] = 20
+            val before = f.tcpCalls.get()
+            val catalogs = f.locationsCalls.get()
+            withContext(Dispatchers.Main) { assertTrue(f.app.refreshServerLatencies()) }
+            val measured = f.app.state.value
+            assertEquals(catalogs + 1, f.locationsCalls.get())
+            assertEquals(before + 6, f.tcpCalls.get())
+            assertEquals(20, measured.locations.single().latencyMs)
             assertEquals(listOf(90, 20), measured.servers.map { it.latencyMs })
             assertTrue(measured.running)
-            withTimeout(3_000) {
-                (DesktopController::class.java.getDeclaredField("latencyJob").apply { isAccessible = true }.get(app) as Job?)?.join()
-            }
-            app.setWindowVisible(false)
-            assertEquals("Completed or hidden sampling must retain its results", listOf(90, 20), app.state.value.servers.map { it.latencyMs })
-            app.refreshServerLatencies()
-            withTimeout(3_000) { while (calls.get() < 12) delay(10) }
-            assertEquals("Reopening must take fresh samples", 12, calls.get())
-        } finally { app.closeAndJoin(); app.close() }
+            assertEquals("Completed or hidden sampling must retain its results", listOf(90, 20), f.app.state.value.servers.map { it.latencyMs })
+            assertTrue(f.app.refreshServerLatencies())
+            assertEquals("Reopening must take fresh samples", before + 12, f.tcpCalls.get())
+            assertEquals(active, f.runtime.active)
+            assertEquals(starts, f.runtime.starts.size)
+        }
     }
 
     @Test fun `network changes discard a late catalog ping result`() = runBlocking {
-        val vault = WindowsVault(Files.createTempDirectory("noki-device-latency-network"))
-        var signature = "wifi"
-        val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
-        val app = DesktopController(vault, SingBoxRuntime(vault), BackendApiClient(baseUrl = "http://127.0.0.1:9"),
-            networkSnapshot = { WindowsNetworkSnapshot(signature, EndpointRankingPolicy.NetworkKind.WIFI, true, 1) },
-            latencySampler = { ClientLatencySampler(tcpConnect = { _, _, _ -> entered.countDown(); release.await(); 20 }, icmpPing = { _, _, _ -> null }) })
-        try {
-            withTimeout(5_000) { app.state.first { !it.loading } }
-            DesktopController::class.java.getDeclaredField("tokens").apply { isAccessible = true }.set(app, BackendAuthTokens("access", null))
-            @Suppress("UNCHECKED_CAST")
-            val mutable = DesktopController::class.java.getDeclaredField("mutable").apply { isAccessible = true }.get(app) as MutableStateFlow<DesktopState>
-            mutable.value = mutable.value.copy(locations = listOf(ServerLocation("DE", "DE", "Germany", "", "example.invalid", isOnline = true)))
-            app.refreshServerLatencies()
-            assertTrue(entered.await(3, java.util.concurrent.TimeUnit.SECONDS))
-            signature = "ethernet"; release.countDown()
-            delay(100)
-            assertNull(app.state.value.locations.single().latencyMs)
-        } finally { release.countDown(); app.closeAndJoin(); app.close() }
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.tcpProbeGate = release
+            val before = f.tcpCalls.get()
+            val refresh = async { f.app.refreshServerLatencies() }
+            try {
+                withTimeout(3_000) { while (f.tcpCalls.get() == before) delay(10) }
+                f.networkSignature = "ethernet"; release.countDown()
+                withTimeout(3_000) { refresh.await() }
+                assertNull(f.app.state.value.locations.single().latencyMs)
+                assertNull(f.app.state.value.servers.single().latencyMs)
+                assertTrue(f.runtime.starts.isEmpty())
+            } finally { release.countDown(); refresh.cancelAndJoin() }
+        }
     }
 
     @Test fun `website login retries an offline saved session without discarding credentials`() = runBlocking {
@@ -1540,7 +1530,7 @@ class DesktopConnectionTest {
         }
     }
 
-    @Test fun `failed connected samples retain a last successful ping until the network changes`() = runBlocking {
+    @Test fun `failed manual connected samples clear old ping and reject the previous network`() = runBlocking {
         Fixture().use { f ->
             f.ready(); f.measureLatencies(); f.app.connect()
             withTimeout(15_000) { f.app.state.first { !it.loading && it.verified } }
@@ -1550,8 +1540,8 @@ class DesktopConnectionTest {
             }
             f.tcpLatency.set(-1)
             measure()
-            assertEquals(54L, f.app.state.value.latencyMs)
-            assertEquals(54, f.app.state.value.locations.single().latencyMs)
+            assertNull(f.app.state.value.latencyMs)
+            assertNull(f.app.state.value.locations.single().latencyMs)
             f.tcpLatency.set(79)
             measure()
             assertEquals(79L, f.app.state.value.latencyMs)
@@ -2033,8 +2023,8 @@ class DesktopConnectionTest {
             withTimeout(5_000) {
                 (DesktopController::class.java.getDeclaredField("latencyJob").apply { isAccessible = true }.get(f.app) as Job?)?.join()
             }
-            assertEquals("An unavailable sample must retain the previous ping on the same active network", 77L, f.app.state.value.latencyMs)
-            assertEquals(77, f.app.state.value.servers.single().latencyMs)
+            assertNull("A failed manual refresh must show unknown instead of the previous sample", f.app.state.value.latencyMs)
+            assertNull(f.app.state.value.servers.single().latencyMs)
             assertEquals(probesBefore, f.runtime.probeCalls.get())
             assertEquals(statsBefore.sumOf { it.pingSamples }, f.app.state.value.dailyStats.sumOf { it.pingSamples })
             assertTrue(f.app.state.value.running && f.app.state.value.verified)
@@ -2306,7 +2296,8 @@ class DesktopConnectionTest {
 
     private class Fixture(nodeCount: Int = 1, private val failFirstSession: Boolean = false, trafficPool: String = "primary", automaticLogs: Boolean = true,
         private val nvCandidates: Boolean = false, private val hy2Candidates: Boolean = false,
-        private val nodeCountries: List<String> = List(nodeCount) { "DE" }) : AutoCloseable {
+        private val nodeCountries: List<String> = List(nodeCount) { "DE" },
+        private val networkThreadCheck: () -> Unit = {}) : AutoCloseable {
         val vault = WindowsVault(Files.createTempDirectory("noki-connection-flow"))
         val runtime = FakeRuntime(vault)
         val sessionNodes = CopyOnWriteArrayList<String>()
@@ -2380,7 +2371,7 @@ class DesktopConnectionTest {
         @Volatile var networkSignature = "fixture"
         @Volatile var dnsSnapshot: () -> WindowsDnsPolicy = { WindowsDnsPolicy(emptyList(), emptyList()) }
         @Volatile var networkAvailable = true
-        val network: () -> WindowsNetworkSnapshot = { WindowsNetworkSnapshot(networkSignature, EndpointRankingPolicy.NetworkKind.WIFI, networkAvailable,
+        val network: () -> WindowsNetworkSnapshot = { networkThreadCheck(); WindowsNetworkSnapshot(networkSignature, EndpointRankingPolicy.NetworkKind.WIFI, networkAvailable,
             java.net.NetworkInterface.getByInetAddress(java.net.InetAddress.getByName("127.0.0.1")).index) }
         private val listener = java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"))
         private val acceptor = Thread {

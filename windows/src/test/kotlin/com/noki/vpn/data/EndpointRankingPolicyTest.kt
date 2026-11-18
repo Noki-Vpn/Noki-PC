@@ -32,6 +32,18 @@ class EndpointRankingPolicyTest {
     }
 
     @Test
+    fun coldBootstrapKeepsNokiNvLastWithoutOverridingMeasuredHealthOrManualSelection() {
+        val nv = hysteriaCandidate("nv").copy(proxyType = "nokinv", transport = "nokinv", path = "/tunnel")
+        val candidates = listOf(nv, hysteriaCandidate("hy2"), tcpCandidate("reality"))
+        for (network in EndpointRankingPolicy.NetworkKind.entries) {
+            assertEquals(listOf("reality", "hy2", "nv"), EndpointRankingPolicy.rankCandidates(candidates, emptyMap(), network, 1_000).map { it.code })
+            assertEquals("nv", EndpointRankingPolicy.select(candidates, mapOf("nv" to EndpointHealth(score = 100)),
+                network, 1_000, { 0 })!!.candidate.code)
+            assertEquals(nv, EndpointRankingPolicy.select(listOf(nv), emptyMap(), network, 1_000, { 0 })!!.candidate)
+        }
+    }
+
+    @Test
     fun releaseAutoRespectsNokiNvCooldownAndHealth() {
         val nv = hysteriaCandidate("nv").copy(proxyType = "nokinv", transport = "nokinv", path = "/tunnel")
         val candidates = listOf(nv, nv.copy(code = "nv-other", nodeId = "other"), hysteriaCandidate("hy2"), tcpCandidate("xhttp"))

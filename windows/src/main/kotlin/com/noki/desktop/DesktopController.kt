@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import org.json.JSONArray
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicLong
@@ -545,7 +546,14 @@ class DesktopController internal constructor(
         val country = if (mode == ServerSelectionMode.COUNTRY) state.value.connectionLocations.first { it.code == id }.countryCode else server?.countryCode.orEmpty()
         if (mode == ServerSelectionMode.SERVER) require(server?.isOnline == true) { "Сервер недоступен" }
         val reconnect = state.value.running
+        val stoppedRuEntry = if (reconnect && activeSettings().advancedSettings.ruRelayEnabled &&
+            !state.value.settings.advancedSettings.ruRelayEnabled)
+            synchronized(accountLocalLock) { vault.readEncrypted("ru-entry.dpapi")?.let(::JSONObject) } else null
         if (reconnect) stopRuntime(restoreInternet = false)
+        if (stoppedRuEntry != null) {
+            stageRuEntryReleaseAfterStop(stoppedRuEntry)
+            scope.launch { retryPendingRuEntryReleases() }
+        }
         val previous = state.value.settings
         invalidatePreparation()
         val changed = previous.copy(endpointOptions = emptyList(), userProfile = previous.userProfile.copy(
@@ -1190,6 +1198,14 @@ class DesktopController internal constructor(
         if (state.value.loading || state.value.running || connectionJob?.isActive == true) return
         stopWatchdog()
         connectionJob = action {
+            val stoppedRuEntry = if (!state.value.settings.advancedSettings.ruRelayEnabled)
+                synchronized(accountLocalLock) { vault.readEncrypted("ru-entry.dpapi")?.let(::JSONObject) } else null
+            if (stoppedRuEntry != null) {
+                // A missing UI/journal state does not prove the owned core stopped.
+                stopRuntime(restoreInternet = false)
+                stageRuEntryReleaseAfterStop(stoppedRuEntry)
+                scope.launch { retryPendingRuEntryReleases() }
+            }
             activeConnection = null
             Files.deleteIfExists(vault.directory.resolve("connection.dpapi"))
             connectNow()
@@ -2223,6 +2239,7 @@ class DesktopController internal constructor(
     private suspend fun connectWireGuard(device: BackendDevice, requestedSettings: StoredSettings, geosites: Deferred<GeositeAsset.Release>,
         onlyNodeId: String?, excludedNodeIds: Set<String>, protectUntilVerified: Boolean = false, dnsPolicy: Deferred<WindowsDnsPolicy>) {
         val keys = vault.wireGuardKeyPair()
+        val recoveringConnection = activeConnection != null
         try {
             val network = networkSnapshot()
             val inventory = authorized { api.ruRelayCatalog(it, device.id, vault.deviceKey) }
@@ -2243,7 +2260,7 @@ class DesktopController internal constructor(
             val cachedCredential = vault.readEncrypted("ru-entry.dpapi")?.let(::JSONObject)?.takeIf {
                 it.optString("device_id") == device.id && it.optString("public_key") == keys.second
             }?.let { RuWireGuardSessionJsonParser.parseEntryCredential(it) }
-                ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() }
+                ?.takeIf { it.expiresAtEpochMillis > System.currentTimeMillis() && it.publicKeyId != null && it.leaseGeneration != null }
             var keyId: String? = null
             val geodata = geosites.await()
             val policy = dnsPolicy.await()
@@ -2260,7 +2277,7 @@ class DesktopController internal constructor(
                         }.also { enrolled ->
                             check(enrolled.expiresAtEpochMillis > System.currentTimeMillis()) { "ru_entry_expired" }
                             vault.writeEncrypted("ru-entry.dpapi", RuWireGuardSessionJsonParser.encodeEntryCredential(enrolled)
-                                .put("device_id", device.id).put("public_key", keys.second).toString())
+                                .put("user_id", state.value.user?.id).put("device_id", device.id).put("public_key", keys.second).toString())
                         }
                     }
                 } catch (error: BackendException) {
@@ -2288,6 +2305,7 @@ class DesktopController internal constructor(
                             connectedAtMillis = active.startedAt, connectionSettings = requestedSettings) }
                         recordLatencySample(latency, sessionStarted = true)
                         rememberConnection(active, config, requestedSettings, network.kind, credential.expiresAtEpochMillis)
+                        scope.launch { retryPendingRuEntryReleases() }
                         startWatchdog(active, initialEvidence = true)
                         transientRecoveryAttempt = 0
                         return
@@ -2300,11 +2318,19 @@ class DesktopController internal constructor(
                         if (networkSnapshot().signature != network.signature) throw error
                     }
                 }
+                // This relay was not activated; its enrollment must not occupy an idle slot.
+                if (!recoveringConnection) stageRuEntryReleaseAfterStop()
             }
             throw lastFailure
         } catch (error: Exception) {
             withContext(NonCancellable) {
-                runCatching { stopRuntime(restoreInternet = false, retainConnection = true) }.onFailure { error.addSuppressed(it) }
+                runCatching {
+                    stopRuntime(restoreInternet = false, retainConnection = true)
+                    if (!recoveringConnection) {
+                        stageRuEntryReleaseAfterStop()
+                        scope.launch { retryPendingRuEntryReleases() }
+                    }
+                }.onFailure { error.addSuppressed(it) }
                 val active = runtime.restored()
                 mutable.update { it.copy(running = active != null, verified = false,
                     connectedAtMillis = active?.startedAt, connectionLabel = active?.label.orEmpty()) }
@@ -2321,6 +2347,64 @@ class DesktopController internal constructor(
             next
         }
         return runtime.selectEntryRoute(active, exit, generation, enrollment)
+    }
+
+    private fun ruEntryReleaseOwner(entry: JSONObject): List<String> = listOf(
+        entry.optString("user_id"), entry.optString("device_id"), entry.optString("relay_node_id"),
+        entry.optString("public_key_id"), entry.getJSONObject("wireguard").getString("address"),
+    )
+
+    private fun pendingRuEntryReleases(): List<JSONObject> = vault.readEncrypted("ru-entry-releases.dpapi")?.let { value ->
+        val array = JSONArray(value)
+        (0 until array.length()).map(array::getJSONObject)
+    }.orEmpty()
+
+    private fun savePendingRuEntryReleases(entries: List<JSONObject>) {
+        if (entries.isEmpty()) Files.deleteIfExists(vault.directory.resolve("ru-entry-releases.dpapi"))
+        else vault.writeEncrypted("ru-entry-releases.dpapi", JSONArray(entries).toString())
+    }
+
+    private fun stageRuEntryReleaseAfterStop(stoppedEntry: JSONObject? = null) = synchronized(accountLocalLock) {
+        val cached = vault.readEncrypted("ru-entry.dpapi")?.let(::JSONObject)
+        val entry = stoppedEntry ?: cached ?: return@synchronized
+        val credential = runCatching { RuWireGuardSessionJsonParser.parseEntryCredential(entry) }.getOrNull()
+        if (credential?.publicKeyId != null && credential.leaseGeneration != null && entry.optString("user_id").isNotBlank()) {
+            val owner = ruEntryReleaseOwner(entry)
+            val pending = pendingRuEntryReleases()
+            val newer = pending.any { ruEntryReleaseOwner(it) == owner && it.getLong("lease_generation") > credential.leaseGeneration }
+            if (!newer) savePendingRuEntryReleases(pending.filterNot { ruEntryReleaseOwner(it) == owner } + entry)
+        }
+        if (stoppedEntry == null || cached?.similar(stoppedEntry) == true)
+            Files.deleteIfExists(vault.directory.resolve("ru-entry.dpapi"))
+    }
+
+    private fun completeRuEntryRelease(entry: JSONObject) = synchronized(accountLocalLock) {
+        savePendingRuEntryReleases(pendingRuEntryReleases().filterNot {
+            ruEntryReleaseOwner(it) == ruEntryReleaseOwner(entry) && it.getLong("lease_generation") == entry.getLong("lease_generation")
+        })
+    }
+
+    private suspend fun retryPendingRuEntryReleases() = ruRevokes.withLock {
+        withTimeoutOrNull(5_000L) {
+            val userId = state.value.user?.id ?: return@withTimeoutOrNull
+            val device = registered ?: return@withTimeoutOrNull
+            val pending = synchronized(accountLocalLock) { pendingRuEntryReleases() }.filter {
+                it.optString("user_id") == userId && it.optString("device_id") == device.id
+            }
+            for (entry in pending) {
+                try {
+                    if (state.value.user?.id != userId || registered?.id != device.id) return@withTimeoutOrNull
+                    val credential = RuWireGuardSessionJsonParser.parseEntryCredential(entry)
+                    withDeviceProof(device.id) { token, nonce, signature ->
+                        check(state.value.user?.id == userId && registered?.id == device.id) { "account_changed" }
+                        api.releaseRuEntry(token, device.id, vault.deviceKey, nonce, signature, credential)
+                    }
+                    completeRuEntryRelease(entry)
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) { recordLog("ru_entry_release_pending", error = true, cause = error) }
+            }
+        }
+        Unit
     }
 
     private suspend fun revokeRu(expectedSessionId: String? = null) = ruRevokes.withLock {
@@ -2409,6 +2493,7 @@ class DesktopController internal constructor(
       youtubeJob?.cancel()
       action(interruptible = false) {
         stopRuntime()
+        stageRuEntryReleaseAfterStop()
         val pendingRuId = vault.readEncrypted("ru-revoke.dpapi")?.let(::JSONObject)?.getString("session_id")
         recordLog("disconnected")
             mutable.update { it.copy(running = false, verified = false, nokiNvCarrier = "", connectedAtMillis = null, connectionLabel = "",
@@ -2427,6 +2512,7 @@ class DesktopController internal constructor(
             }
         }
         refreshClientLatencies()
+        scope.launch { retryPendingRuEntryReleases() }
         prepareConnectionInAdvance()
       }
     }
@@ -2434,6 +2520,8 @@ class DesktopController internal constructor(
     fun logout() = action {
         avatarJob?.cancel()
         stopRuntime()
+        stageRuEntryReleaseAfterStop()
+        retryPendingRuEntryReleases()
         val ruRevoked = runCatching { revokeRu() }.isSuccess
         val revoked = try {
             tokens?.refreshToken?.let { refresh -> api.revokeRefreshToken(refresh) }
@@ -2451,6 +2539,8 @@ class DesktopController internal constructor(
         return action {
             avatarJob?.cancel()
             stopRuntime()
+            stageRuEntryReleaseAfterStop()
+            retryPendingRuEntryReleases()
             runCatching { revokeRu() }.onFailure { recordLog("ru_revoke_pending", error = true, cause = it) }
             withContext(Dispatchers.Main) { onStopped() }
             close()

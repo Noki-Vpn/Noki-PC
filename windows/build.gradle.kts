@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "com.noki"
-version = "1.9.8"
+version = "1.9.9"
 
 val desktopTarget = providers.gradleProperty("desktopTarget").orElse("windows").get()
 require(desktopTarget in setOf("linux", "windows")) { "desktopTarget must be linux or windows" }

@@ -79,7 +79,7 @@ class DesktopConnectionTest {
         }
     }
 
-    @Test fun `RU cached credential needs the same confirmed endpoint and old catalogs still enroll`() = runBlocking {
+    @Test fun `explicit RU disconnect releases the exact lease and reconnect enrolls with the persistent key`() = runBlocking {
         Fixture().use { f ->
             f.ready(); f.app.setWindowVisible(false)
             f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
@@ -89,14 +89,76 @@ class DesktopConnectionTest {
                 f.app.disconnect(); withTimeout(5_000) { f.app.state.first { !it.loading && !it.running } }
             }
             cycle(); cycle()
-            assertEquals(1, f.ruEntryRequests.size)
+            assertEquals(2, f.ruEntryRequests.size)
+            withTimeout(5_000) { while (f.ruReleaseRequests.size < 2) delay(10) }
+            assertEquals(listOf(1L, 2L), f.ruReleaseRequests.map { it.getLong("lease_generation") })
+            assertTrue(f.ruReleaseCoreStopped.all { it })
+            assertTrue(f.ruReleaseRequests.all { it.getString("client_address") == "10.240.3.2" && it.has("device_signature") })
+            assertNull(f.vault.readEncrypted("ru-entry.dpapi"))
             f.ruEndpoint = "1.0.0.1:51820"
             cycle()
-            assertEquals(2, f.ruEntryRequests.size)
-            assertEquals(f.ruEndpoint, JSONObject(checkNotNull(f.vault.readEncrypted("ru-entry.dpapi"))).getJSONObject("wireguard").getString("endpoint"))
+            assertEquals(3, f.ruEntryRequests.size)
+            assertNull(f.vault.readEncrypted("ru-entry.dpapi"))
             f.ruEndpointConfirmed = false
             cycle()
-            assertEquals(3, f.ruEntryRequests.size)
+            assertEquals(4, f.ruEntryRequests.size)
+        }
+    }
+
+    @Test fun `manual direct transitions release a captured RU lease only after its core stops`() = runBlocking {
+        for (transition in listOf("select", "connect_missing_state", "connect_stopped")) {
+            Fixture().use { f ->
+                f.ready(); f.app.setWindowVisible(false)
+                f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+                f.connect(); assertTrue(f.app.state.value.message, f.app.state.value.verified)
+                val captured = checkNotNull(f.vault.readEncrypted("ru-entry.dpapi"))
+                val stoppedPid = checkNotNull(f.runtime.active).pid
+                f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = false)) }.join()
+                assertNotNull(f.runtime.active)
+                assertTrue(f.ruReleaseRequests.isEmpty())
+                suspend fun switchToDirect() {
+                    if (transition == "select") f.app.selectServer(f.app.state.value.servers.first().id) else f.app.connect()
+                    withTimeout(15_000) { (DesktopController::class.java.getDeclaredField("connectionJob")
+                        .apply { isAccessible = true }.get(f.app) as Job?)?.join() }
+                }
+                if (transition == "select") {
+                    f.runtime.failStops.set(1)
+                    switchToDirect()
+                    assertNotNull(f.runtime.active)
+                    assertTrue(f.ruReleaseRequests.isEmpty())
+                    assertEquals(captured, f.vault.readEncrypted("ru-entry.dpapi"))
+                } else {
+                    if (transition == "connect_stopped") f.runtime.stop(false)
+                    DesktopController::class.java.getDeclaredMethod("clearConnectionState")
+                        .apply { isAccessible = true }.invoke(f.app)
+                }
+                switchToDirect()
+                assertTrue(f.app.state.value.message, f.app.state.value.verified)
+                assertFalse(f.app.state.value.displayedSettings.advancedSettings.ruRelayEnabled)
+                withTimeout(5_000) { while (f.ruReleaseRequests.isEmpty()) delay(10) }
+                assertEquals(1, f.ruReleaseRequests.size)
+                assertNotEquals(stoppedPid, f.ruReleaseActivePids.single())
+                assertEquals(JSONObject(captured).getString("relay_node_id"), f.ruReleaseRequests.single().getString("relay_node_id"))
+                assertEquals(JSONObject(captured).getLong("lease_generation"), f.ruReleaseRequests.single().getLong("lease_generation"))
+                assertNull(f.vault.readEncrypted("ru-entry.dpapi"))
+            }
+        }
+    }
+
+    @Test fun `an older RU cache enrolls once before its first upgraded disconnect`() = runBlocking {
+        Fixture().use { f ->
+            f.ready(); f.app.setWindowVisible(false)
+            f.app.updateSettings { it.copy(advancedSettings = it.advancedSettings.copy(ruRelayEnabled = true)) }.join()
+            f.connect()
+            val legacy = JSONObject(checkNotNull(f.vault.readEncrypted("ru-entry.dpapi"))).apply {
+                remove("public_key_id"); remove("lease_generation")
+            }
+            f.app.disconnect(); withTimeout(5_000) { f.app.state.first { !it.loading && !it.running } }
+            f.vault.writeEncrypted("ru-entry.dpapi", legacy.toString())
+            f.connect()
+            assertEquals(2, f.ruEntryRequests.size)
+            f.app.disconnect(); withTimeout(5_000) { f.app.state.first { !it.loading && !it.running } }
+            withTimeout(5_000) { while (f.ruReleaseRequests.none { it.getLong("lease_generation") == 2L }) delay(10) }
         }
     }
 
@@ -2276,6 +2338,9 @@ class DesktopConnectionTest {
         val youtubeCatalogStatus = AtomicInteger(404)
         val ruCatalogCalls = AtomicInteger()
         val ruEntryRequests = CopyOnWriteArrayList<JSONObject>()
+        val ruReleaseRequests = CopyOnWriteArrayList<JSONObject>()
+        val ruReleaseCoreStopped = CopyOnWriteArrayList<Boolean>()
+        val ruReleaseActivePids = CopyOnWriteArrayList<Int?>()
         val ruEnrollStatus = java.util.concurrent.ConcurrentHashMap<String, Int>()
         @Volatile var ruForeignProbeAvailable = true
         @Volatile var ruEndpoint = "8.8.4.4:51820"
@@ -2408,10 +2473,18 @@ class DesktopConnectionTest {
                     status = ruEnrollStatus[payload.getString("relay_node_id")] ?: 200
                     if (!consumeProof(payload.getString("device_nonce"))) status = 403
                     JSONObject().put("relay_node_id", payload.getString("relay_node_id")).put("route_gateway", "10.240.3.1")
+                        .put("public_key_id", payload.getString("public_key_id")).put("lease_generation", ruEntryRequests.size)
                         .put("expires_at", java.time.Instant.now().plusSeconds(600).toString()).put("wireguard", JSONObject()
                             .put("endpoint", ruEndpoint).put("address", "10.240.3.2/32")
                             .put("server_public_key", java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 }))
                             .put("mtu", 1280).put("dns", JSONArray().put("1.1.1.1")).put("allowed_ips", JSONArray().put("0.0.0.0/0")))
+                }
+                "/v1/vpn/ru-entry/release" -> {
+                    ruReleaseRequests += JSONObject(payload.toString())
+                    ruReleaseCoreStopped += runtime.active == null
+                    ruReleaseActivePids += runtime.active?.pid
+                    if (!consumeProof(payload.getString("device_nonce"))) status = 403
+                    JSONObject().put("released", true)
                 }
                 "/v1/vpn/youtube-nodes" -> {
                     youtubeCatalogCalls.incrementAndGet()
